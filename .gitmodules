@@ -1,0 +1,3 @@
+[submodule "acorn_benchmark/ACORN_lib"]
+	path = acorn_benchmark/ACORN_lib
+	url = https://github.com/stanford-futuredata/ACORN.git

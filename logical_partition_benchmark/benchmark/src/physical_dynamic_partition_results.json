@@ -1,0 +1,84 @@
+{
+  "config": {
+    "M": 32,
+    "efConstruction": 200,
+    "efSearch": 70,
+    "num_partitions": 14
+  },
+  "performance": {
+    "avg_recall": 0.9316666666666672,
+    "avg_time_ms": 0.3060025366666668,
+    "num_queries": 300,
+    "p50_ms": 0.30799699999999997,
+    "p90_ms": 0.401787,
+    "p95_ms": 0.425183,
+    "p99_ms": 0.48692399999999997
+  },
+  "storage": {
+    "graph_breakdown": [
+      {
+        "nodes": 298000,
+        "partition": "documentblocks_partition_0"
+      },
+      {
+        "nodes": 128800,
+        "partition": "documentblocks_partition_1"
+      },
+      {
+        "nodes": 71100,
+        "partition": "documentblocks_partition_10"
+      },
+      {
+        "nodes": 71600,
+        "partition": "documentblocks_partition_11"
+      },
+      {
+        "nodes": 86500,
+        "partition": "documentblocks_partition_12"
+      },
+      {
+        "nodes": 72800,
+        "partition": "documentblocks_partition_13"
+      },
+      {
+        "nodes": 287500,
+        "partition": "documentblocks_partition_2"
+      },
+      {
+        "nodes": 257700,
+        "partition": "documentblocks_partition_3"
+      },
+      {
+        "nodes": 143800,
+        "partition": "documentblocks_partition_4"
+      },
+      {
+        "nodes": 279600,
+        "partition": "documentblocks_partition_5"
+      },
+      {
+        "nodes": 100500,
+        "partition": "documentblocks_partition_6"
+      },
+      {
+        "nodes": 103400,
+        "partition": "documentblocks_partition_7"
+      },
+      {
+        "nodes": 70400,
+        "partition": "documentblocks_partition_8"
+      },
+      {
+        "nodes": 71600,
+        "partition": "documentblocks_partition_9"
+      }
+    ],
+    "graph_bytes": 0,
+    "graph_mb": 0.0,
+    "total_bytes": 1602696408,
+    "total_mb": 1528.4504013061523,
+    "vector_bytes": 1602696408,
+    "vector_mb": 1528.4504013061523
+  },
+  "strategy": "physical_dynamic_partition"
+}

@@ -1,0 +1,14 @@
+{
+    "condition": "prefilter_partition_combination",
+    "iterations": 1,
+    "enable_index": true,
+    "average_results": {
+        "avg_recall": 0.9552999999999963,
+        "avg_query_time": 0.001266322000000001,
+        "avg_block_selectivity": 0
+    },
+    "space_used_mb": 2973.65625,
+    "index_type": "hnsw",
+    "statistics_type": "sql",
+    "generator_type": ""
+}

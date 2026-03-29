@@ -1,0 +1,82 @@
+[
+  {
+    "ef_search": 20,
+    "avg_query_time": 1284048.0,
+    "predicted_query_time": 1531846.033071583,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 1.284048,
+    "predicted_query_time_ms": 1.5318460330715828
+  },
+  {
+    "ef_search": 40,
+    "avg_query_time": 1807536.0,
+    "predicted_query_time": 2002361.2034030026,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 1.807536,
+    "predicted_query_time_ms": 2.0023612034030025
+  },
+  {
+    "ef_search": 60,
+    "avg_query_time": 2733058.0,
+    "predicted_query_time": 2472876.3737344225,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 2.733058,
+    "predicted_query_time_ms": 2.4728763737344224
+  },
+  {
+    "ef_search": 80,
+    "avg_query_time": 3321428.0,
+    "predicted_query_time": 2943391.5440658424,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 3.321428,
+    "predicted_query_time_ms": 2.9433915440658422
+  },
+  {
+    "ef_search": 100,
+    "avg_query_time": 3678840.0,
+    "predicted_query_time": 3413906.7143972623,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 3.67884,
+    "predicted_query_time_ms": 3.413906714397262
+  },
+  {
+    "ef_search": 120,
+    "avg_query_time": 4039855.0,
+    "predicted_query_time": 3884421.884728682,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 4.039855,
+    "predicted_query_time_ms": 3.8844218847286824
+  },
+  {
+    "ef_search": 140,
+    "avg_query_time": 3714008.0,
+    "predicted_query_time": 4354937.055060102,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 3.714008,
+    "predicted_query_time_ms": 4.354937055060102
+  },
+  {
+    "ef_search": 160,
+    "avg_query_time": 4643117.0,
+    "predicted_query_time": 4825452.225391522,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 4.643117,
+    "predicted_query_time_ms": 4.825452225391522
+  },
+  {
+    "ef_search": 180,
+    "avg_query_time": 5336320.0,
+    "predicted_query_time": 5295967.395722942,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 5.33632,
+    "predicted_query_time_ms": 5.2959673957229425
+  },
+  {
+    "ef_search": 200,
+    "avg_query_time": 5933433.0,
+    "predicted_query_time": 5766482.566054362,
+    "avg_total_rows": 36070.0,
+    "avg_query_time_ms": 5.933433,
+    "predicted_query_time_ms": 5.7664825660543615
+  }
+]

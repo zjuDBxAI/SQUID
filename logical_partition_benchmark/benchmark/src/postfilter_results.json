@@ -1,0 +1,26 @@
+{
+  "config": {
+    "M": 32,
+    "efConstruction": 200,
+    "efSearch": 500
+  },
+  "performance": {
+    "avg_recall": 0.9546666666666673,
+    "avg_time_ms": 4.335840536666666,
+    "num_queries": 300,
+    "p50_ms": 4.009855,
+    "p90_ms": 6.8889499999999995,
+    "p95_ms": 7.725740999999999,
+    "p99_ms": 9.915689
+  },
+  "storage": {
+    "graph_bytes": 272129364,
+    "graph_mb": 259.5227851867676,
+    "graph_nodes": 1000000,
+    "total_bytes": 784129364,
+    "total_mb": 747.8040351867676,
+    "vector_bytes": 512000000,
+    "vector_mb": 488.28125
+  },
+  "strategy": "postfilter"
+}

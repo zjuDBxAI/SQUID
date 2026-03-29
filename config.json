@@ -1,0 +1,11 @@
+{
+    "dbname": "rbacdatabase_treebase",
+    "user": "x",
+    "password": "123",
+    "host": "localhost",
+    "port": "5432",
+    "maintenance_work_mem_gb": 2,
+    "max_parallel_maintenance_workers": 10,
+    "dataset_path": "/data/Multitenanthakes/dataset",
+    "use_gpu_groundtruth": false
+}

@@ -1,0 +1,628 @@
+{
+  "config": {
+    "M": 32,
+    "efConstruction": 200,
+    "efSearch": 30,
+    "num_partitions": 100
+  },
+  "performance": {
+    "avg_recall": 0.936,
+    "avg_time_ms": 0.37322476,
+    "num_queries": 300,
+    "p50_ms": 0.344371,
+    "p90_ms": 0.574529,
+    "p95_ms": 0.619354,
+    "p99_ms": 0.7107549999999999
+  },
+  "storage": {
+    "graph_breakdown": [
+      {
+        "neighbor_bytes": 5228288,
+        "nodes": 20100,
+        "partition": "documentblocks_role_1",
+        "total_bytes": 5469572
+      },
+      {
+        "neighbor_bytes": 19252480,
+        "nodes": 74000,
+        "partition": "documentblocks_role_10",
+        "total_bytes": 20140564
+      },
+      {
+        "neighbor_bytes": 18053888,
+        "nodes": 69400,
+        "partition": "documentblocks_role_100",
+        "total_bytes": 18886772
+      },
+      {
+        "neighbor_bytes": 19122176,
+        "nodes": 73500,
+        "partition": "documentblocks_role_11",
+        "total_bytes": 20004260
+      },
+      {
+        "neighbor_bytes": 18992256,
+        "nodes": 73000,
+        "partition": "documentblocks_role_12",
+        "total_bytes": 19868340
+      },
+      {
+        "neighbor_bytes": 14467712,
+        "nodes": 55600,
+        "partition": "documentblocks_role_13",
+        "total_bytes": 15134996
+      },
+      {
+        "neighbor_bytes": 18626560,
+        "nodes": 71600,
+        "partition": "documentblocks_role_14",
+        "total_bytes": 19485844
+      },
+      {
+        "neighbor_bytes": 18548864,
+        "nodes": 71300,
+        "partition": "documentblocks_role_15",
+        "total_bytes": 19404548
+      },
+      {
+        "neighbor_bytes": 18809600,
+        "nodes": 72300,
+        "partition": "documentblocks_role_16",
+        "total_bytes": 19677284
+      },
+      {
+        "neighbor_bytes": 19018112,
+        "nodes": 73100,
+        "partition": "documentblocks_role_17",
+        "total_bytes": 19895396
+      },
+      {
+        "neighbor_bytes": 9680128,
+        "nodes": 37200,
+        "partition": "documentblocks_role_18",
+        "total_bytes": 10126612
+      },
+      {
+        "neighbor_bytes": 13999232,
+        "nodes": 53800,
+        "partition": "documentblocks_role_19",
+        "total_bytes": 14644916
+      },
+      {
+        "neighbor_bytes": 10329856,
+        "nodes": 39700,
+        "partition": "documentblocks_role_2",
+        "total_bytes": 10806340
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_role_20",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18496384,
+        "nodes": 71100,
+        "partition": "documentblocks_role_21",
+        "total_bytes": 19349668
+      },
+      {
+        "neighbor_bytes": 18183552,
+        "nodes": 69900,
+        "partition": "documentblocks_role_22",
+        "total_bytes": 19022436
+      },
+      {
+        "neighbor_bytes": 14519552,
+        "nodes": 55800,
+        "partition": "documentblocks_role_23",
+        "total_bytes": 15189236
+      },
+      {
+        "neighbor_bytes": 18704384,
+        "nodes": 71900,
+        "partition": "documentblocks_role_24",
+        "total_bytes": 19567268
+      },
+      {
+        "neighbor_bytes": 18652288,
+        "nodes": 71700,
+        "partition": "documentblocks_role_25",
+        "total_bytes": 19512772
+      },
+      {
+        "neighbor_bytes": 18600832,
+        "nodes": 71500,
+        "partition": "documentblocks_role_26",
+        "total_bytes": 19458916
+      },
+      {
+        "neighbor_bytes": 14260352,
+        "nodes": 54800,
+        "partition": "documentblocks_role_27",
+        "total_bytes": 14918036
+      },
+      {
+        "neighbor_bytes": 18444544,
+        "nodes": 70900,
+        "partition": "documentblocks_role_28",
+        "total_bytes": 19295428
+      },
+      {
+        "neighbor_bytes": 18574976,
+        "nodes": 71400,
+        "partition": "documentblocks_role_29",
+        "total_bytes": 19431860
+      },
+      {
+        "neighbor_bytes": 14779136,
+        "nodes": 56800,
+        "partition": "documentblocks_role_3",
+        "total_bytes": 15460820
+      },
+      {
+        "neighbor_bytes": 18496384,
+        "nodes": 71100,
+        "partition": "documentblocks_role_30",
+        "total_bytes": 19349668
+      },
+      {
+        "neighbor_bytes": 14519552,
+        "nodes": 55800,
+        "partition": "documentblocks_role_31",
+        "total_bytes": 15189236
+      },
+      {
+        "neighbor_bytes": 18730624,
+        "nodes": 72000,
+        "partition": "documentblocks_role_32",
+        "total_bytes": 19594708
+      },
+      {
+        "neighbor_bytes": 18756736,
+        "nodes": 72100,
+        "partition": "documentblocks_role_33",
+        "total_bytes": 19622020
+      },
+      {
+        "neighbor_bytes": 18548864,
+        "nodes": 71300,
+        "partition": "documentblocks_role_34",
+        "total_bytes": 19404548
+      },
+      {
+        "neighbor_bytes": 9889152,
+        "nodes": 38000,
+        "partition": "documentblocks_role_35",
+        "total_bytes": 10345236
+      },
+      {
+        "neighbor_bytes": 14649472,
+        "nodes": 56300,
+        "partition": "documentblocks_role_36",
+        "total_bytes": 15325156
+      },
+      {
+        "neighbor_bytes": 18913920,
+        "nodes": 72700,
+        "partition": "documentblocks_role_37",
+        "total_bytes": 19786404
+      },
+      {
+        "neighbor_bytes": 18939904,
+        "nodes": 72800,
+        "partition": "documentblocks_role_38",
+        "total_bytes": 19813588
+      },
+      {
+        "neighbor_bytes": 18783104,
+        "nodes": 72200,
+        "partition": "documentblocks_role_39",
+        "total_bytes": 19649588
+      },
+      {
+        "neighbor_bytes": 18730624,
+        "nodes": 72000,
+        "partition": "documentblocks_role_4",
+        "total_bytes": 19594708
+      },
+      {
+        "neighbor_bytes": 19252480,
+        "nodes": 74000,
+        "partition": "documentblocks_role_40",
+        "total_bytes": 20140564
+      },
+      {
+        "neighbor_bytes": 14260352,
+        "nodes": 54800,
+        "partition": "documentblocks_role_41",
+        "total_bytes": 14918036
+      },
+      {
+        "neighbor_bytes": 18496384,
+        "nodes": 71100,
+        "partition": "documentblocks_role_42",
+        "total_bytes": 19349668
+      },
+      {
+        "neighbor_bytes": 18626560,
+        "nodes": 71600,
+        "partition": "documentblocks_role_43",
+        "total_bytes": 19485844
+      },
+      {
+        "neighbor_bytes": 18574976,
+        "nodes": 71400,
+        "partition": "documentblocks_role_44",
+        "total_bytes": 19431860
+      },
+      {
+        "neighbor_bytes": 14312320,
+        "nodes": 55000,
+        "partition": "documentblocks_role_45",
+        "total_bytes": 14972404
+      },
+      {
+        "neighbor_bytes": 18574976,
+        "nodes": 71400,
+        "partition": "documentblocks_role_46",
+        "total_bytes": 19431860
+      },
+      {
+        "neighbor_bytes": 18939904,
+        "nodes": 72800,
+        "partition": "documentblocks_role_47",
+        "total_bytes": 19813588
+      },
+      {
+        "neighbor_bytes": 18470528,
+        "nodes": 71000,
+        "partition": "documentblocks_role_48",
+        "total_bytes": 19322612
+      },
+      {
+        "neighbor_bytes": 9836928,
+        "nodes": 37800,
+        "partition": "documentblocks_role_49",
+        "total_bytes": 10290612
+      },
+      {
+        "neighbor_bytes": 18836096,
+        "nodes": 72400,
+        "partition": "documentblocks_role_5",
+        "total_bytes": 19704980
+      },
+      {
+        "neighbor_bytes": 14364416,
+        "nodes": 55200,
+        "partition": "documentblocks_role_50",
+        "total_bytes": 15026900
+      },
+      {
+        "neighbor_bytes": 18652288,
+        "nodes": 71700,
+        "partition": "documentblocks_role_51",
+        "total_bytes": 19512772
+      },
+      {
+        "neighbor_bytes": 18470528,
+        "nodes": 71000,
+        "partition": "documentblocks_role_52",
+        "total_bytes": 19322612
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_role_53",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_role_54",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 14233984,
+        "nodes": 54700,
+        "partition": "documentblocks_role_55",
+        "total_bytes": 14890468
+      },
+      {
+        "neighbor_bytes": 18522752,
+        "nodes": 71200,
+        "partition": "documentblocks_role_56",
+        "total_bytes": 19377236
+      },
+      {
+        "neighbor_bytes": 18287488,
+        "nodes": 70300,
+        "partition": "documentblocks_role_57",
+        "total_bytes": 19131172
+      },
+      {
+        "neighbor_bytes": 18470528,
+        "nodes": 71000,
+        "partition": "documentblocks_role_58",
+        "total_bytes": 19322612
+      },
+      {
+        "neighbor_bytes": 18836096,
+        "nodes": 72400,
+        "partition": "documentblocks_role_59",
+        "total_bytes": 19704980
+      },
+      {
+        "neighbor_bytes": 19122176,
+        "nodes": 73500,
+        "partition": "documentblocks_role_6",
+        "total_bytes": 20004260
+      },
+      {
+        "neighbor_bytes": 14312320,
+        "nodes": 55000,
+        "partition": "documentblocks_role_60",
+        "total_bytes": 14972404
+      },
+      {
+        "neighbor_bytes": 18626560,
+        "nodes": 71600,
+        "partition": "documentblocks_role_61",
+        "total_bytes": 19485844
+      },
+      {
+        "neighbor_bytes": 18287488,
+        "nodes": 70300,
+        "partition": "documentblocks_role_62",
+        "total_bytes": 19131172
+      },
+      {
+        "neighbor_bytes": 18783104,
+        "nodes": 72200,
+        "partition": "documentblocks_role_63",
+        "total_bytes": 19649588
+      },
+      {
+        "neighbor_bytes": 14493440,
+        "nodes": 55700,
+        "partition": "documentblocks_role_64",
+        "total_bytes": 15161924
+      },
+      {
+        "neighbor_bytes": 19096064,
+        "nodes": 73400,
+        "partition": "documentblocks_role_65",
+        "total_bytes": 19976948
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_role_66",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18652288,
+        "nodes": 71700,
+        "partition": "documentblocks_role_67",
+        "total_bytes": 19512772
+      },
+      {
+        "neighbor_bytes": 5020544,
+        "nodes": 19300,
+        "partition": "documentblocks_role_68",
+        "total_bytes": 5252228
+      },
+      {
+        "neighbor_bytes": 9680128,
+        "nodes": 37200,
+        "partition": "documentblocks_role_69",
+        "total_bytes": 10126612
+      },
+      {
+        "neighbor_bytes": 19096064,
+        "nodes": 73400,
+        "partition": "documentblocks_role_7",
+        "total_bytes": 19976948
+      },
+      {
+        "neighbor_bytes": 14233984,
+        "nodes": 54700,
+        "partition": "documentblocks_role_70",
+        "total_bytes": 14890468
+      },
+      {
+        "neighbor_bytes": 18574976,
+        "nodes": 71400,
+        "partition": "documentblocks_role_71",
+        "total_bytes": 19431860
+      },
+      {
+        "neighbor_bytes": 18287488,
+        "nodes": 70300,
+        "partition": "documentblocks_role_72",
+        "total_bytes": 19131172
+      },
+      {
+        "neighbor_bytes": 18496384,
+        "nodes": 71100,
+        "partition": "documentblocks_role_73",
+        "total_bytes": 19349668
+      },
+      {
+        "neighbor_bytes": 18235776,
+        "nodes": 70100,
+        "partition": "documentblocks_role_74",
+        "total_bytes": 19077060
+      },
+      {
+        "neighbor_bytes": 14103296,
+        "nodes": 54200,
+        "partition": "documentblocks_role_75",
+        "total_bytes": 14753780
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_role_76",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18600832,
+        "nodes": 71500,
+        "partition": "documentblocks_role_77",
+        "total_bytes": 19458916
+      },
+      {
+        "neighbor_bytes": 18183552,
+        "nodes": 69900,
+        "partition": "documentblocks_role_78",
+        "total_bytes": 19022436
+      },
+      {
+        "neighbor_bytes": 18339968,
+        "nodes": 70500,
+        "partition": "documentblocks_role_79",
+        "total_bytes": 19186052
+      },
+      {
+        "neighbor_bytes": 14935808,
+        "nodes": 57400,
+        "partition": "documentblocks_role_8",
+        "total_bytes": 15624692
+      },
+      {
+        "neighbor_bytes": 13895680,
+        "nodes": 53400,
+        "partition": "documentblocks_role_80",
+        "total_bytes": 14536564
+      },
+      {
+        "neighbor_bytes": 18366208,
+        "nodes": 70600,
+        "partition": "documentblocks_role_81",
+        "total_bytes": 19213492
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_role_82",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18470528,
+        "nodes": 71000,
+        "partition": "documentblocks_role_83",
+        "total_bytes": 19322612
+      },
+      {
+        "neighbor_bytes": 18470528,
+        "nodes": 71000,
+        "partition": "documentblocks_role_84",
+        "total_bytes": 19322612
+      },
+      {
+        "neighbor_bytes": 14233984,
+        "nodes": 54700,
+        "partition": "documentblocks_role_85",
+        "total_bytes": 14890468
+      },
+      {
+        "neighbor_bytes": 18418816,
+        "nodes": 70800,
+        "partition": "documentblocks_role_86",
+        "total_bytes": 19268500
+      },
+      {
+        "neighbor_bytes": 18470528,
+        "nodes": 71000,
+        "partition": "documentblocks_role_87",
+        "total_bytes": 19322612
+      },
+      {
+        "neighbor_bytes": 18444544,
+        "nodes": 70900,
+        "partition": "documentblocks_role_88",
+        "total_bytes": 19295428
+      },
+      {
+        "neighbor_bytes": 9550208,
+        "nodes": 36700,
+        "partition": "documentblocks_role_89",
+        "total_bytes": 9990692
+      },
+      {
+        "neighbor_bytes": 19200640,
+        "nodes": 73800,
+        "partition": "documentblocks_role_9",
+        "total_bytes": 20086324
+      },
+      {
+        "neighbor_bytes": 14025344,
+        "nodes": 53900,
+        "partition": "documentblocks_role_90",
+        "total_bytes": 14672228
+      },
+      {
+        "neighbor_bytes": 18392448,
+        "nodes": 70700,
+        "partition": "documentblocks_role_91",
+        "total_bytes": 19240932
+      },
+      {
+        "neighbor_bytes": 18339968,
+        "nodes": 70500,
+        "partition": "documentblocks_role_92",
+        "total_bytes": 19186052
+      },
+      {
+        "neighbor_bytes": 17975680,
+        "nodes": 69100,
+        "partition": "documentblocks_role_93",
+        "total_bytes": 18804964
+      },
+      {
+        "neighbor_bytes": 18183552,
+        "nodes": 69900,
+        "partition": "documentblocks_role_94",
+        "total_bytes": 19022436
+      },
+      {
+        "neighbor_bytes": 13714432,
+        "nodes": 52700,
+        "partition": "documentblocks_role_95",
+        "total_bytes": 14346916
+      },
+      {
+        "neighbor_bytes": 18131968,
+        "nodes": 69700,
+        "partition": "documentblocks_role_96",
+        "total_bytes": 18968452
+      },
+      {
+        "neighbor_bytes": 17949696,
+        "nodes": 69000,
+        "partition": "documentblocks_role_97",
+        "total_bytes": 18777780
+      },
+      {
+        "neighbor_bytes": 18079872,
+        "nodes": 69500,
+        "partition": "documentblocks_role_98",
+        "total_bytes": 18913956
+      },
+      {
+        "neighbor_bytes": 13792256,
+        "nodes": 53000,
+        "partition": "documentblocks_role_99",
+        "total_bytes": 14428340
+      }
+    ],
+    "graph_bytes": 1765316592,
+    "graph_mb": 1683.537094116211,
+    "total_bytes": 2277316592,
+    "total_mb": 2171.818344116211,
+    "vector_bytes": 512000000,
+    "vector_mb": 488.28125
+  },
+  "strategy": "role_partition"
+}

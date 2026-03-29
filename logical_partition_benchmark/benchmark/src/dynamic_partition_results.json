@@ -1,0 +1,256 @@
+{
+  "config": {
+    "M": 32,
+    "efConstruction": 200,
+    "efSearch": 60,
+    "num_partitions": 38
+  },
+  "performance": {
+    "avg_recall": 0.9476666666666673,
+    "avg_time_ms": 0.6477216433333329,
+    "num_queries": 300,
+    "p50_ms": 0.60412,
+    "p90_ms": 1.052724,
+    "p95_ms": 1.143778,
+    "p99_ms": 1.3419619999999999
+  },
+  "storage": {
+    "graph_breakdown": [
+      {
+        "neighbor_bytes": 46437376,
+        "nodes": 178500,
+        "partition": "documentblocks_partition_0",
+        "total_bytes": 48579460
+      },
+      {
+        "neighbor_bytes": 33515520,
+        "nodes": 128800,
+        "partition": "documentblocks_partition_1",
+        "total_bytes": 35061204
+      },
+      {
+        "neighbor_bytes": 18496384,
+        "nodes": 71100,
+        "partition": "documentblocks_partition_10",
+        "total_bytes": 19349668
+      },
+      {
+        "neighbor_bytes": 18626560,
+        "nodes": 71600,
+        "partition": "documentblocks_partition_11",
+        "total_bytes": 19485844
+      },
+      {
+        "neighbor_bytes": 22507520,
+        "nodes": 86500,
+        "partition": "documentblocks_partition_12",
+        "total_bytes": 23545604
+      },
+      {
+        "neighbor_bytes": 18939904,
+        "nodes": 72800,
+        "partition": "documentblocks_partition_13",
+        "total_bytes": 19813588
+      },
+      {
+        "neighbor_bytes": 18756736,
+        "nodes": 72100,
+        "partition": "documentblocks_partition_14",
+        "total_bytes": 19622020
+      },
+      {
+        "neighbor_bytes": 18496384,
+        "nodes": 71100,
+        "partition": "documentblocks_partition_15",
+        "total_bytes": 19349668
+      },
+      {
+        "neighbor_bytes": 18836096,
+        "nodes": 72400,
+        "partition": "documentblocks_partition_16",
+        "total_bytes": 19704980
+      },
+      {
+        "neighbor_bytes": 18339968,
+        "nodes": 70500,
+        "partition": "documentblocks_partition_17",
+        "total_bytes": 19186052
+      },
+      {
+        "neighbor_bytes": 18053888,
+        "nodes": 69400,
+        "partition": "documentblocks_partition_18",
+        "total_bytes": 18886772
+      },
+      {
+        "neighbor_bytes": 18183552,
+        "nodes": 69900,
+        "partition": "documentblocks_partition_19",
+        "total_bytes": 19022436
+      },
+      {
+        "neighbor_bytes": 49475328,
+        "nodes": 190200,
+        "partition": "documentblocks_partition_2",
+        "total_bytes": 51757812
+      },
+      {
+        "neighbor_bytes": 19200640,
+        "nodes": 73800,
+        "partition": "documentblocks_partition_20",
+        "total_bytes": 20086324
+      },
+      {
+        "neighbor_bytes": 18496384,
+        "nodes": 71100,
+        "partition": "documentblocks_partition_21",
+        "total_bytes": 19349668
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_partition_22",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18730624,
+        "nodes": 72000,
+        "partition": "documentblocks_partition_23",
+        "total_bytes": 19594708
+      },
+      {
+        "neighbor_bytes": 18600832,
+        "nodes": 71500,
+        "partition": "documentblocks_partition_24",
+        "total_bytes": 19458916
+      },
+      {
+        "neighbor_bytes": 13999232,
+        "nodes": 53800,
+        "partition": "documentblocks_partition_25",
+        "total_bytes": 14644916
+      },
+      {
+        "neighbor_bytes": 18522752,
+        "nodes": 71200,
+        "partition": "documentblocks_partition_26",
+        "total_bytes": 19377236
+      },
+      {
+        "neighbor_bytes": 18548864,
+        "nodes": 71300,
+        "partition": "documentblocks_partition_27",
+        "total_bytes": 19404548
+      },
+      {
+        "neighbor_bytes": 17975680,
+        "nodes": 69100,
+        "partition": "documentblocks_partition_28",
+        "total_bytes": 18804964
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_partition_29",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 47190784,
+        "nodes": 181400,
+        "partition": "documentblocks_partition_3",
+        "total_bytes": 49367668
+      },
+      {
+        "neighbor_bytes": 18704384,
+        "nodes": 71900,
+        "partition": "documentblocks_partition_30",
+        "total_bytes": 19567268
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_partition_31",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18287488,
+        "nodes": 70300,
+        "partition": "documentblocks_partition_32",
+        "total_bytes": 19131172
+      },
+      {
+        "neighbor_bytes": 18183552,
+        "nodes": 69900,
+        "partition": "documentblocks_partition_33",
+        "total_bytes": 19022436
+      },
+      {
+        "neighbor_bytes": 18574976,
+        "nodes": 71400,
+        "partition": "documentblocks_partition_34",
+        "total_bytes": 19431860
+      },
+      {
+        "neighbor_bytes": 18470528,
+        "nodes": 71000,
+        "partition": "documentblocks_partition_35",
+        "total_bytes": 19322612
+      },
+      {
+        "neighbor_bytes": 18287488,
+        "nodes": 70300,
+        "partition": "documentblocks_partition_36",
+        "total_bytes": 19131172
+      },
+      {
+        "neighbor_bytes": 18652288,
+        "nodes": 71700,
+        "partition": "documentblocks_partition_37",
+        "total_bytes": 19512772
+      },
+      {
+        "neighbor_bytes": 37415040,
+        "nodes": 143800,
+        "partition": "documentblocks_partition_4",
+        "total_bytes": 39140724
+      },
+      {
+        "neighbor_bytes": 47242368,
+        "nodes": 181600,
+        "partition": "documentblocks_partition_5",
+        "total_bytes": 49421652
+      },
+      {
+        "neighbor_bytes": 26150272,
+        "nodes": 100500,
+        "partition": "documentblocks_partition_6",
+        "total_bytes": 27356356
+      },
+      {
+        "neighbor_bytes": 26907520,
+        "nodes": 103400,
+        "partition": "documentblocks_partition_7",
+        "total_bytes": 28148404
+      },
+      {
+        "neighbor_bytes": 18313600,
+        "nodes": 70400,
+        "partition": "documentblocks_partition_8",
+        "total_bytes": 19158484
+      },
+      {
+        "neighbor_bytes": 18626560,
+        "nodes": 71600,
+        "partition": "documentblocks_partition_9",
+        "total_bytes": 19485844
+      }
+    ],
+    "graph_bytes": 908760264,
+    "graph_mb": 866.6613235473633,
+    "total_bytes": 1420760264,
+    "total_mb": 1354.9425735473633,
+    "vector_bytes": 512000000,
+    "vector_mb": 488.28125
+  },
+  "strategy": "dynamic_partition"
+}

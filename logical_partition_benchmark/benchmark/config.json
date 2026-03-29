@@ -1,0 +1,7 @@
+{
+    "index_storage_path": "/pgsql_data/sift1M",
+    "description": "Configuration for logical partition benchmark",
+    "notes": {
+        "index_storage_path": "Base directory for storing HNSW index files. All partition indexes will be saved under subdirectories of this path."
+    }
+}

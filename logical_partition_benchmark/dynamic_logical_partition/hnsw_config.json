@@ -1,0 +1,10 @@
+{
+    "M": 32,
+    "ef_construction": 200,
+    "description": "HNSW index parameters for logical partition storage calculation",
+    "notes": {
+        "M": "Number of bi-directional links created for every new element during construction. Higher M leads to higher accuracy but more storage. Default in Faiss: 32, pgvector: 16",
+        "ef_construction": "Size of the dynamic candidate list during construction. Higher values lead to better recall but slower construction. Default in Faiss: 40, pgvector: 64",
+        "storage_calculation": "For logical partitions: bytes_per_node = M * 3 * 4 (base layer has 2M edges, upper layers average M edges)"
+    }
+}

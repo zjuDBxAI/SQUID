@@ -1,0 +1,14 @@
+{
+    "condition": "dynamic_partition",
+    "iterations": 1,
+    "enable_index": true,
+    "average_results": {
+        "avg_recall": 0.9846999999999985,
+        "avg_query_time": 0.0033303789999999966,
+        "avg_block_selectivity": 0
+    },
+    "space_used_mb": 1728.1796875,
+    "index_type": "hnsw",
+    "statistics_type": "sql",
+    "generator_type": ""
+}

@@ -1,0 +1,428 @@
+{
+  "config": {
+    "M": 32,
+    "efConstruction": 200,
+    "efSearch": 30,
+    "num_partitions": 100
+  },
+  "performance": {
+    "avg_recall": 0.9343333333333339,
+    "avg_time_ms": 0.1180517133333333,
+    "num_queries": 300,
+    "p50_ms": 0.12148199999999999,
+    "p90_ms": 0.144679,
+    "p95_ms": 0.154275,
+    "p99_ms": 0.167821
+  },
+  "storage": {
+    "graph_breakdown": [
+      {
+        "nodes": 20100,
+        "partition": "documentblocks_role_1"
+      },
+      {
+        "nodes": 74000,
+        "partition": "documentblocks_role_10"
+      },
+      {
+        "nodes": 69400,
+        "partition": "documentblocks_role_100"
+      },
+      {
+        "nodes": 73500,
+        "partition": "documentblocks_role_11"
+      },
+      {
+        "nodes": 73000,
+        "partition": "documentblocks_role_12"
+      },
+      {
+        "nodes": 55600,
+        "partition": "documentblocks_role_13"
+      },
+      {
+        "nodes": 71600,
+        "partition": "documentblocks_role_14"
+      },
+      {
+        "nodes": 71300,
+        "partition": "documentblocks_role_15"
+      },
+      {
+        "nodes": 72300,
+        "partition": "documentblocks_role_16"
+      },
+      {
+        "nodes": 73100,
+        "partition": "documentblocks_role_17"
+      },
+      {
+        "nodes": 37200,
+        "partition": "documentblocks_role_18"
+      },
+      {
+        "nodes": 53800,
+        "partition": "documentblocks_role_19"
+      },
+      {
+        "nodes": 39700,
+        "partition": "documentblocks_role_2"
+      },
+      {
+        "nodes": 70400,
+        "partition": "documentblocks_role_20"
+      },
+      {
+        "nodes": 71100,
+        "partition": "documentblocks_role_21"
+      },
+      {
+        "nodes": 69900,
+        "partition": "documentblocks_role_22"
+      },
+      {
+        "nodes": 55800,
+        "partition": "documentblocks_role_23"
+      },
+      {
+        "nodes": 71900,
+        "partition": "documentblocks_role_24"
+      },
+      {
+        "nodes": 71700,
+        "partition": "documentblocks_role_25"
+      },
+      {
+        "nodes": 71500,
+        "partition": "documentblocks_role_26"
+      },
+      {
+        "nodes": 54800,
+        "partition": "documentblocks_role_27"
+      },
+      {
+        "nodes": 70900,
+        "partition": "documentblocks_role_28"
+      },
+      {
+        "nodes": 71400,
+        "partition": "documentblocks_role_29"
+      },
+      {
+        "nodes": 56800,
+        "partition": "documentblocks_role_3"
+      },
+      {
+        "nodes": 71100,
+        "partition": "documentblocks_role_30"
+      },
+      {
+        "nodes": 55800,
+        "partition": "documentblocks_role_31"
+      },
+      {
+        "nodes": 72000,
+        "partition": "documentblocks_role_32"
+      },
+      {
+        "nodes": 72100,
+        "partition": "documentblocks_role_33"
+      },
+      {
+        "nodes": 71300,
+        "partition": "documentblocks_role_34"
+      },
+      {
+        "nodes": 38000,
+        "partition": "documentblocks_role_35"
+      },
+      {
+        "nodes": 56300,
+        "partition": "documentblocks_role_36"
+      },
+      {
+        "nodes": 72700,
+        "partition": "documentblocks_role_37"
+      },
+      {
+        "nodes": 72800,
+        "partition": "documentblocks_role_38"
+      },
+      {
+        "nodes": 72200,
+        "partition": "documentblocks_role_39"
+      },
+      {
+        "nodes": 72000,
+        "partition": "documentblocks_role_4"
+      },
+      {
+        "nodes": 74000,
+        "partition": "documentblocks_role_40"
+      },
+      {
+        "nodes": 54800,
+        "partition": "documentblocks_role_41"
+      },
+      {
+        "nodes": 71100,
+        "partition": "documentblocks_role_42"
+      },
+      {
+        "nodes": 71600,
+        "partition": "documentblocks_role_43"
+      },
+      {
+        "nodes": 71400,
+        "partition": "documentblocks_role_44"
+      },
+      {
+        "nodes": 55000,
+        "partition": "documentblocks_role_45"
+      },
+      {
+        "nodes": 71400,
+        "partition": "documentblocks_role_46"
+      },
+      {
+        "nodes": 72800,
+        "partition": "documentblocks_role_47"
+      },
+      {
+        "nodes": 71000,
+        "partition": "documentblocks_role_48"
+      },
+      {
+        "nodes": 37800,
+        "partition": "documentblocks_role_49"
+      },
+      {
+        "nodes": 72400,
+        "partition": "documentblocks_role_5"
+      },
+      {
+        "nodes": 55200,
+        "partition": "documentblocks_role_50"
+      },
+      {
+        "nodes": 71700,
+        "partition": "documentblocks_role_51"
+      },
+      {
+        "nodes": 71000,
+        "partition": "documentblocks_role_52"
+      },
+      {
+        "nodes": 70400,
+        "partition": "documentblocks_role_53"
+      },
+      {
+        "nodes": 70400,
+        "partition": "documentblocks_role_54"
+      },
+      {
+        "nodes": 54700,
+        "partition": "documentblocks_role_55"
+      },
+      {
+        "nodes": 71200,
+        "partition": "documentblocks_role_56"
+      },
+      {
+        "nodes": 70300,
+        "partition": "documentblocks_role_57"
+      },
+      {
+        "nodes": 71000,
+        "partition": "documentblocks_role_58"
+      },
+      {
+        "nodes": 72400,
+        "partition": "documentblocks_role_59"
+      },
+      {
+        "nodes": 73500,
+        "partition": "documentblocks_role_6"
+      },
+      {
+        "nodes": 55000,
+        "partition": "documentblocks_role_60"
+      },
+      {
+        "nodes": 71600,
+        "partition": "documentblocks_role_61"
+      },
+      {
+        "nodes": 70300,
+        "partition": "documentblocks_role_62"
+      },
+      {
+        "nodes": 72200,
+        "partition": "documentblocks_role_63"
+      },
+      {
+        "nodes": 55700,
+        "partition": "documentblocks_role_64"
+      },
+      {
+        "nodes": 73400,
+        "partition": "documentblocks_role_65"
+      },
+      {
+        "nodes": 70400,
+        "partition": "documentblocks_role_66"
+      },
+      {
+        "nodes": 71700,
+        "partition": "documentblocks_role_67"
+      },
+      {
+        "nodes": 19300,
+        "partition": "documentblocks_role_68"
+      },
+      {
+        "nodes": 37200,
+        "partition": "documentblocks_role_69"
+      },
+      {
+        "nodes": 73400,
+        "partition": "documentblocks_role_7"
+      },
+      {
+        "nodes": 54700,
+        "partition": "documentblocks_role_70"
+      },
+      {
+        "nodes": 71400,
+        "partition": "documentblocks_role_71"
+      },
+      {
+        "nodes": 70300,
+        "partition": "documentblocks_role_72"
+      },
+      {
+        "nodes": 71100,
+        "partition": "documentblocks_role_73"
+      },
+      {
+        "nodes": 70100,
+        "partition": "documentblocks_role_74"
+      },
+      {
+        "nodes": 54200,
+        "partition": "documentblocks_role_75"
+      },
+      {
+        "nodes": 70400,
+        "partition": "documentblocks_role_76"
+      },
+      {
+        "nodes": 71500,
+        "partition": "documentblocks_role_77"
+      },
+      {
+        "nodes": 69900,
+        "partition": "documentblocks_role_78"
+      },
+      {
+        "nodes": 70500,
+        "partition": "documentblocks_role_79"
+      },
+      {
+        "nodes": 57400,
+        "partition": "documentblocks_role_8"
+      },
+      {
+        "nodes": 53400,
+        "partition": "documentblocks_role_80"
+      },
+      {
+        "nodes": 70600,
+        "partition": "documentblocks_role_81"
+      },
+      {
+        "nodes": 70400,
+        "partition": "documentblocks_role_82"
+      },
+      {
+        "nodes": 71000,
+        "partition": "documentblocks_role_83"
+      },
+      {
+        "nodes": 71000,
+        "partition": "documentblocks_role_84"
+      },
+      {
+        "nodes": 54700,
+        "partition": "documentblocks_role_85"
+      },
+      {
+        "nodes": 70800,
+        "partition": "documentblocks_role_86"
+      },
+      {
+        "nodes": 71000,
+        "partition": "documentblocks_role_87"
+      },
+      {
+        "nodes": 70900,
+        "partition": "documentblocks_role_88"
+      },
+      {
+        "nodes": 36700,
+        "partition": "documentblocks_role_89"
+      },
+      {
+        "nodes": 73800,
+        "partition": "documentblocks_role_9"
+      },
+      {
+        "nodes": 53900,
+        "partition": "documentblocks_role_90"
+      },
+      {
+        "nodes": 70700,
+        "partition": "documentblocks_role_91"
+      },
+      {
+        "nodes": 70500,
+        "partition": "documentblocks_role_92"
+      },
+      {
+        "nodes": 69100,
+        "partition": "documentblocks_role_93"
+      },
+      {
+        "nodes": 69900,
+        "partition": "documentblocks_role_94"
+      },
+      {
+        "nodes": 52700,
+        "partition": "documentblocks_role_95"
+      },
+      {
+        "nodes": 69700,
+        "partition": "documentblocks_role_96"
+      },
+      {
+        "nodes": 69000,
+        "partition": "documentblocks_role_97"
+      },
+      {
+        "nodes": 69500,
+        "partition": "documentblocks_role_98"
+      },
+      {
+        "nodes": 53000,
+        "partition": "documentblocks_role_99"
+      }
+    ],
+    "graph_bytes": 0,
+    "graph_mb": 0.0,
+    "total_bytes": 5088296724,
+    "total_mb": 4852.577899932861,
+    "vector_bytes": 5088296724,
+    "vector_mb": 4852.577899932861
+  },
+  "strategy": "physical_role_partition"
+}
