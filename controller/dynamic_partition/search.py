@@ -28,7 +28,7 @@ def dynamic_partition_search(user_id, query_vector, topk=5, statistics_type="sql
         return dynamic_partition_search_statistics_system(user_id, query_vector, topk)
 
 
-def dynamic_partition_search_statistics_sql(user_id, query_vector, topk=5, ef_search=40):
+def dynamic_partition_search_statistics_sql(user_id, query_vector, topk=10, ef_search=40):
     """
     Search using SQL query execution time for performance statistics with RLS.
     """
@@ -138,18 +138,29 @@ def dynamic_partition_search_statistics_system(user_id, query_vector, topk=5):
     Search using system time measurement for performance statistics with RLS.
     """
     import time
-    # conn = get_db_connection()
+    import efconfig
     conn = get_db_connection_for_many_users(user_id)
     cur = conn.cursor()
 
     start_time = time.time()  # Track overall system time
+    cur.execute("SET max_parallel_workers_per_gather = 0;")
+    cur.execute("SET jit = off;")
+    cur.execute(f"SET hnsw.ef_search = {efconfig.ef_search};")
 
-    # Step 1: Fetch roles and partitions for the user
+    # Step 1: Fetch roles and partitions for the user using the same mapping table as SQL mode.
     cur.execute("""
-        SELECT partition_id FROM RolePartitions rp
-        JOIN UserRoles ur ON rp.role_id = ur.role_id
-        WHERE ur.user_id = %s;
+        SELECT role_id
+        FROM UserRoles
+        WHERE user_id = %s;
     """, [user_id])
+    user_roles = {row[0] for row in cur.fetchall()}
+    sorted_roles = sorted(user_roles)
+
+    cur.execute("""
+        SELECT partition_id
+        FROM CombRolePartitions
+        WHERE comb_role = %s::integer[];
+    """, [sorted_roles])
     accessible_partitions = {row[0] for row in cur.fetchall()}
 
     # Step 2: Search across partitions
@@ -159,7 +170,7 @@ def dynamic_partition_search_statistics_system(user_id, query_vector, topk=5):
 
         query = sql.SQL(
             """
-            SELECT block_id, document_id, block_content, 
+            SELECT block_id, document_id, block_content,
                    vector <-> %s::vector AS distance
             FROM {}
             ORDER BY distance

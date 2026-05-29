@@ -22,6 +22,7 @@ from services.rbac_generator.tree_based_rbac_data_generator import TreeBasedRBAC
 from services.embedding_service import generate_embedding
 from services.config import get_db_connection, get_dataset_path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 
 SIFT_DOCUMENT_VECTOR_COUNT = 100  # Group 100 vectors into a single synthetic document
@@ -670,7 +671,7 @@ def generate_query_dataset_for_cache(num_queries=1000, topk=5, output_file="quer
     cur.close()
     conn.close()
 
-    return block_ids
+    return candidate_block_ids
 
 
 def generate_query_batch(subset, document_blocks, block_indices, users, topk, total_blocks):
@@ -726,11 +727,10 @@ def generate_query_dataset(num_queries=1000, topk=5, output_file="query_dataset.
     cur.execute("SELECT user_id FROM Users;")
     all_users = [row[0] for row in cur.fetchall()]
 
-    cur.execute("SELECT block_id, vector FROM documentblocks;")
-    document_blocks = cur.fetchall()
-
-    block_ids = [block[0] for block in document_blocks]
-    total_blocks = len(block_ids)
+    cur.execute("SELECT COUNT(*) FROM documentblocks;")
+    total_blocks = int(cur.fetchone()[0])
+    cur.execute("SELECT MIN(block_id), MAX(block_id) FROM documentblocks;")
+    min_block_id, max_block_id = cur.fetchone()
 
     # Step 2: Generate block indices and user IDs
     if zipf_param == 0:
@@ -739,10 +739,44 @@ def generate_query_dataset(num_queries=1000, topk=5, output_file="query_dataset.
         zipf_distribution = np.random.zipf(zipf_param, size=num_queries)
         block_indices = zipf_distribution % total_blocks  # Ensure indices are within range
 
+    candidate_block_ids = [int(min_block_id) + int(index) for index in block_indices]
+    cur.execute(
+        """
+        SELECT block_id, vector
+        FROM documentblocks
+        WHERE block_id = ANY(%s)
+        """,
+        [candidate_block_ids],
+    )
+    vector_by_block_id = {int(block_id): vector for block_id, vector in cur.fetchall()}
+    missing_block_ids = [block_id for block_id in candidate_block_ids if int(block_id) not in vector_by_block_id]
+    if missing_block_ids:
+        cur.execute(
+            """
+            SELECT block_id, vector
+            FROM documentblocks
+            ORDER BY random()
+            LIMIT %s
+            """,
+            [len(set(missing_block_ids))],
+        )
+        fallback_vectors = cur.fetchall()
+        for block_id, vector in fallback_vectors:
+            vector_by_block_id[int(block_id)] = vector
+        fallback_block_ids = [int(block_id) for block_id, _ in fallback_vectors]
+        fallback_index = 0
+        for position, block_id in enumerate(candidate_block_ids):
+            if int(block_id) in vector_by_block_id:
+                continue
+            replacement = fallback_block_ids[fallback_index % len(fallback_block_ids)]
+            candidate_block_ids[position] = int(replacement)
+            fallback_index += 1
+
     user_indices = np.random.choice(len(all_users), size=num_queries, replace=True)
     users = [all_users[i] for i in user_indices]
 
     # Step 3: Split work into subsets for parallel processing
+    num_threads = max(1, min(int(num_threads or 1), int(num_queries), 8))
     subset_size = num_queries // num_threads
     subsets = [range(i * subset_size, (i + 1) * subset_size) for i in range(num_threads)]
     if num_queries % num_threads != 0:
@@ -752,12 +786,20 @@ def generate_query_dataset(num_queries=1000, topk=5, output_file="query_dataset.
     queries = []
     with ProcessPoolExecutor(max_workers=num_threads) as executor:
         futures = [
-            executor.submit(generate_query_batch, subset, document_blocks, block_indices, users, topk, total_blocks)
+            executor.submit(
+                generate_query_batch,
+                subset,
+                [(block_id, vector_by_block_id[int(block_id)]) for block_id in candidate_block_ids],
+                list(range(num_queries)),
+                users,
+                topk,
+                total_blocks,
+            )
             for subset in subsets
         ]
 
         # Collect results from all processes
-        for future in futures:
+        for future in tqdm(futures, desc="Generate query dataset", unit="batch"):
             queries.extend(future.result())
 
     # Step 5: Save the queries to a JSON file
@@ -767,7 +809,7 @@ def generate_query_dataset(num_queries=1000, topk=5, output_file="query_dataset.
     cur.close()
     conn.close()
 
-    return block_ids
+    return candidate_block_ids
 
 def generate_query_for_role_with_sel(role, user, k, topk, role_to_documents, document_blocks):
     """

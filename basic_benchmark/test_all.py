@@ -15,11 +15,9 @@ from basic_benchmark.space_calculate import (
     calculate_rls,
     calculate_dynamic_partition,
     calculate_qd_tree_storage,
-    calculate_adaptive_tenant,
 )
 
 from basic_benchmark.test_dynamic_partition import test_dynamic_partition_search
-from basic_benchmark.test_adaptive_tenant import test_adaptive_tenant_search
 from basic_benchmark.test_row_level_security import test_row_level_security
 from basic_benchmark.test_qd_tree_partition import test_qd_tree_partition_search
 import efconfig
@@ -34,7 +32,7 @@ def _str_to_bool(value: str) -> bool:
     raise ValueError(f'Invalid boolean value: {value}')
 
 
-# python test_all.py --algorithm AdaptiveTenant --efs 40 --alpha 0.5 --max-split-actions 2
+# python test_all.py --algorithm AnonySys --efs 40
 if __name__ == '__main__':
     import argparse
 
@@ -42,16 +40,16 @@ if __name__ == '__main__':
 
     parser.add_argument(
         '--algorithm',
-        choices=['RLS', 'ROLE', 'USER', 'AnonySys', 'AdaptiveTenant', 'QDTree'],
+        choices=['RLS', 'ROLE', 'USER', 'AnonySys', 'QDTree'],
         required=True,
-        help='Select which test to run: RLS, ROLE, USER, AnonySys, AdaptiveTenant, or QDTree',
+        help='Select which test to run: RLS, ROLE, USER, AnonySys, or QDTree',
     )
     parser.add_argument(
         '--efs',
         type=int,
         nargs='+',
         required=True,
-        help='List of EF search values to use (space-separated integers). AdaptiveTenant keeps this for unified benchmarking compatibility.',
+        help='List of EF search values to use (space-separated integers).',
     )
     parser.add_argument('--enable-index', type=_str_to_bool, default=True, help='Whether to build ANN indexes for the selected method.')
     parser.add_argument('--index-type', choices=['hnsw', 'ivfflat'], default='hnsw', help='ANN index type used by the selected method.')
@@ -60,15 +58,6 @@ if __name__ == '__main__':
     parser.add_argument('--iterations', type=int, default=1, help='Repeat each query this many times and average the result.')
     parser.add_argument('--record-recall', type=_str_to_bool, default=True, help='Whether to compute recall against ground truth.')
     parser.add_argument('--warm-up', type=_str_to_bool, default=True, help='Whether to warm up each query before measuring.')
-
-    # AdaptiveTenant-specific controls.
-    parser.add_argument('--alpha', type=float, default=0.5, help='AdaptiveTenant memory budget ratio. Larger alpha allows more dedicated partitions.')
-    parser.add_argument('--topk', type=int, default=10, help='AdaptiveTenant planner top-k used in cost and ef-search estimation.')
-    parser.add_argument('--window-limit', type=int, default=10, help='AdaptiveTenant EMA window depth per tenant.')
-    parser.add_argument('--max-split-actions', type=int, default=0, help='AdaptiveTenant periodic split actions after initialization.')
-    parser.add_argument('--enable-rls', type=_str_to_bool, default=False, help='Whether AdaptiveTenant should enable PostgreSQL RLS on materialized partition tables.')
-    parser.add_argument('--query-num', type=int, default=1000, help='How many benchmark queries to use for AdaptiveTenant.')
-    parser.add_argument('--prepare-adaptive', type=_str_to_bool, default=False, help='Whether AdaptiveTenant should rebuild/materialize partitions before testing. This step no longer builds indexes.')
 
     args = parser.parse_args()
     enable_index = args.enable_index
@@ -86,9 +75,6 @@ if __name__ == '__main__':
     logger.info('EF Search Values: %s', ef_search_values)
     logger.info('Index Type: %s', index_type)
     logger.info('Enable Index: %s', enable_index)
-    if test_type == 'AdaptiveTenant':
-        logger.info('AdaptiveTenant alpha=%s topk=%s window_limit=%s max_split_actions=%s enable_rls=%s query_num=%s prepare_adaptive=%s',
-                    args.alpha, args.topk, args.window_limit, args.max_split_actions, args.enable_rls, args.query_num, args.prepare_adaptive)
 
     if test_type == 'RLS':
         for ef in ef_search_values:
@@ -152,29 +138,6 @@ if __name__ == '__main__':
             )
             dynamic_space_mb = calculate_dynamic_partition('dynamic_partition', enable_index=enable_index)
             logger.info('Dynamic partition storage footprint: %.2f MB', dynamic_space_mb)
-
-    elif test_type == 'AdaptiveTenant':
-        for ef in ef_search_values:
-            efconfig.ef_search = ef
-            logger.info('Running AdaptiveTenant test with ef_search=%s', ef)
-            test_adaptive_tenant_search(
-                iterations=iterations,
-                enable_index=enable_index,
-                statistics_type=statistics_type,
-                index_type=index_type,
-                generator_type=generator_type,
-                record_recall=record_recall,
-                warm_up=warm_up,
-                alpha=args.alpha,
-                topk=args.topk,
-                window_limit=args.window_limit,
-                max_split_actions=args.max_split_actions,
-                enable_rls=args.enable_rls,
-                query_num=args.query_num,
-                prepare_before_test=args.prepare_adaptive,
-            )
-            adaptive_space_mb = calculate_adaptive_tenant('adaptive_tenant', enable_index=enable_index)
-            logger.info('AdaptiveTenant storage footprint: %.2f MB', adaptive_space_mb)
 
     elif test_type == 'QDTree':
         for ef in ef_search_values:

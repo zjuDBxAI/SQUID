@@ -166,12 +166,16 @@ def search_documents_rls_statistics_system(user_id, query_vector, topk=5):
     Searches document blocks based on vector similarity using system time to track query execution time.
     """
     from basic_benchmark.common_function import get_nprobe_value
+    import efconfig
     probes = get_nprobe_value()
     import time
-    start_time = time.time()  # Start system time tracking
     conn = get_db_connection_for_many_users(user_id)
+    start_time = time.time()  # Start system time tracking
     cur = conn.cursor()
+    cur.execute(f"SET max_parallel_workers_per_gather = 0;")
+    cur.execute(f"SET jit = off;")
     cur.execute(f"SET ivfflat.probes = {probes};")
+    cur.execute(f"SET hnsw.ef_search = {efconfig.ef_search};")
     # Perform the vector search query
     query = """
         SELECT block_id, document_id, block_content, vector <-> %s::vector AS distance

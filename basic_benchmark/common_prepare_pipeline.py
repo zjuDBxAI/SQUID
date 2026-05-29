@@ -5,7 +5,6 @@ import time
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
 
 from controller.prepare_database import clear_db
 from controller.initialize_main_tables import initialize_database_deduplication

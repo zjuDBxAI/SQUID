@@ -25,7 +25,7 @@ project_root = os.path.dirname(
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from services.config import get_db_connection, get_maintenance_settings  # pylint: disable=wrong-import-position
+from services.config import get_db_connection, get_document_vector_dimension, get_maintenance_settings  # pylint: disable=wrong-import-position
 from controller.baseline.pg_row_security.row_level_security import (  # pylint: disable=wrong-import-position
     get_db_connection_for_many_users,
 )
@@ -1166,6 +1166,7 @@ def _persist_partition_worker(args: Tuple[str, List[Tuple[int, int]], str]) -> T
     table_name, pairs, index_type = args
     conn = get_db_connection()
     cur = conn.cursor()
+    vector_dimension = get_document_vector_dimension()
     try:
         cur.execute(
             sql.SQL("DROP TABLE IF EXISTS {} CASCADE;").format(sql.Identifier(table_name))
@@ -1177,11 +1178,11 @@ def _persist_partition_worker(args: Tuple[str, List[Tuple[int, int]], str]) -> T
                     block_id INT NOT NULL,
                     document_id INT NOT NULL REFERENCES Documents(document_id),
                     block_content BYTEA NOT NULL,
-                    vector VECTOR(300),
+                    vector VECTOR({vector_dimension}),
                     PRIMARY KEY (block_id, document_id)
                 );
                 """
-            ).format(sql.Identifier(table_name))
+            ).format(sql.Identifier(table_name), vector_dimension=sql.Literal(int(vector_dimension)))
         )
 
         cur.execute("CREATE TEMP TABLE qd_tree_pairs(document_id INT, block_id INT) ON COMMIT DROP;")

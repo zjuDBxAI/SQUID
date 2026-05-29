@@ -76,6 +76,7 @@ def fetch_initial_data():
     document_block_counts = [row[1] for row in cur.fetchall()]
     avg_blocks_per_document = sum(document_block_counts) / len(document_block_counts) if document_block_counts else 0
 
+    cur.close()
     conn.close()
     return roles, documents, permissions, avg_blocks_per_document, user_to_roles
 

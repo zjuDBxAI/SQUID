@@ -12,7 +12,6 @@ RESULT_DIR = os.path.join(project_root,"basic_benchmark", "result")
 os.makedirs(RESULT_DIR,exist_ok=True)
 
 sys.path.append(project_root)
-print(sys.path)
 
 from basic_benchmark.condition_config import CONDITION_CONFIG
 from controller.baseline.prefilter.initialize_partitions import initialize_user_partitions, initialize_role_partitions, \
@@ -671,7 +670,7 @@ def _format_ground_truth_results(rows):
     return formatted
 
 
-def _ground_truth_func_postgres(user_id, query_vector, topk=5, use_role_partition=True):
+def _ground_truth_func_postgres(user_id, query_vector, topk=5, use_role_partition=False):
     """PostgreSQL-based ground truth (brute force), optionally using role partitions."""
     global _faiss_query_counter
 
@@ -708,6 +707,10 @@ def _ground_truth_func_postgres(user_id, query_vector, topk=5, use_role_partitio
                 all_results.extend(cur.fetchall())
             except Exception:
                 # Role partition doesn't exist, fall back to JOIN
+                conn.rollback()
+                cur.execute("SET enable_indexscan = off;")
+                cur.execute("SET enable_bitmapscan = off;")
+                cur.execute("SET enable_indexonlyscan = off;")
                 use_role_partition = False
                 break
 
@@ -1142,16 +1145,16 @@ def ground_truth_func_batch(queries, use_faiss=None, use_cache=True):
     return all_results
 
 
-def prepare_query_dataset(regenerate=True, num_queries=1000):
-    query_dataset_file = "query_dataset.json"
+def prepare_query_dataset(regenerate=True, num_queries=1000, query_dataset_path=None):
+    query_dataset_file = query_dataset_path or os.path.join(project_root, "basic_benchmark", "query_dataset.json")
     # Check if the dataset file exists
     if not os.path.exists(query_dataset_file) or regenerate:
-        generate_query_dataset(num_queries=num_queries, topk=5, output_file="query_dataset.json")
+        generate_query_dataset(num_queries=num_queries, topk=10, output_file=query_dataset_file)
 
     # Load queries from the dataset
     queries = load_queries_from_dataset(query_dataset_file)
     if len(queries) < num_queries:
-        generate_query_dataset(num_queries=num_queries, topk=5, output_file=query_dataset_file)
+        generate_query_dataset(num_queries=num_queries, topk=10, output_file=query_dataset_file)
         queries = load_queries_from_dataset(query_dataset_file)
 
     return queries[:num_queries]
@@ -1208,6 +1211,8 @@ def run_test(
         generator_type="tree-based",
         record_recall=True,
         warm_up=True,
+        use_ground_truth_cache=True,
+        queries_num=None,
 ):
     """
     Runs an experiment with the provided search function and computes recall, query time, and optionally block selectivity.
@@ -1265,13 +1270,14 @@ def run_test(
         queries=queries,
         search_func=search_func,
         statistics_type=statistics_type,
-        queries_num=extra_params.get("queries_num"),
+        queries_num=queries_num if queries_num is not None else extra_params.get("queries_num"),
         generator_type=generator_type,
         enable_index=enable_index,
         iterations=iterations,
         index_type=index_type,
         record_recall=record_recall,
         warm_up=warm_up,
+        use_ground_truth_cache=use_ground_truth_cache,
     )
 
     # Extract average recall and query time from run_search_experiment
@@ -1329,7 +1335,7 @@ def run_test(
 
 def run_search_experiment(queries, search_func, queries_num=None, statistics_type="sql",
                           generator_type="tree-based", enable_index=False, index_type="ivfflat", iterations=1,
-                          record_recall=True, plot=False, warm_up=True):
+                          record_recall=True, plot=False, warm_up=True, use_ground_truth_cache=True):
     """
     Runs the search experiment and returns aggregated results.
 
@@ -1355,7 +1361,7 @@ def run_search_experiment(queries, search_func, queries_num=None, statistics_typ
     if record_recall:
         set_ground_truth_total_queries(len(queries_to_process))
         print(f"Computing ground truth for {len(queries_to_process)} queries in batch mode...")
-        ground_truth_results_list = ground_truth_func_batch(queries_to_process)
+        ground_truth_results_list = ground_truth_func_batch(queries_to_process, use_cache=use_ground_truth_cache)
         ground_truth_results_map = {i: gt for i, gt in enumerate(ground_truth_results_list)}
         print(f"Ground truth computation complete!")
 

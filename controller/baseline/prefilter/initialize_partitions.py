@@ -347,7 +347,7 @@ def process_role_partition(role_id, enable_index=False, index_type="ivfflat", ve
         conn.close()
 
 
-def initialize_role_partitions(enable_index=False, index_type="ivfflat"):
+def initialize_role_partitions(enable_index=False, index_type="ivfflat", max_workers=4):
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -359,8 +359,11 @@ def initialize_role_partitions(enable_index=False, index_type="ivfflat"):
 
     vector_dimension = get_document_vector_dimension()
 
-    # Process each role in parallel using ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+    worker_count = max(1, int(max_workers))
+
+    # Process each role in parallel using a bounded worker pool to avoid exhausting
+    # PostgreSQL client connections when the workload has many roles.
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
         futures = [
             executor.submit(process_role_partition, role_id[0], enable_index, index_type, vector_dimension)
             for role_id in roles
@@ -370,7 +373,7 @@ def initialize_role_partitions(enable_index=False, index_type="ivfflat"):
         for future in futures:
             future.result()
 
-    print("Finished processing all role partitions.")
+    print(f"Finished processing all role partitions with max_workers={worker_count}.")
 
 
 
@@ -557,7 +560,7 @@ def initialize_combination_partitions(enable_index=False, index_type="ivfflat"):
     conn.close()
 
     # Determine the number of workers and split combinations
-    num_workers = os.cpu_count()
+    num_workers = min(2,os.cpu_count())
     chunk_size = math.ceil(len(role_combinations) / num_workers)
     role_combination_chunks = [
         role_combinations[i:i + chunk_size]
@@ -778,7 +781,7 @@ def create_indexes_for_all_combination_tables(index_type="ivfflat"):
     conn.close()
 
     # Process each combination in parallel
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+    with ProcessPoolExecutor(max_workers=min(os.cpu_count(),2)) as executor:
         futures = []
         for combination in combinations:
             future = executor.submit(create_index_for_combination, combination[0], index_type)

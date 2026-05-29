@@ -5,7 +5,6 @@ import argparse
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
 
 from controller.baseline.prefilter.initialize_partitions import initialize_role_partitions, \
     drop_prefilter_partition_tables
@@ -17,6 +16,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Initialize role partitions with optional index type.")
     parser.add_argument('--index_type', choices=['hnsw', 'ivfflat'], default=None,
                         help="Type of index to use. Valid options are 'hnsw' and 'ivfflat'.")
+    parser.add_argument('--max-workers', type=int, default=4,
+                        help="Maximum number of parallel role partition workers.")
 
     # Parse arguments
     args = parser.parse_args()
@@ -36,6 +37,6 @@ if __name__ == '__main__':
 
     # Measure time for initializing role partitions
     start_time = time.time()
-    initialize_role_partitions(enable_index=enable_index, index_type=index_type)
+    initialize_role_partitions(enable_index=enable_index, index_type=index_type, max_workers=args.max_workers)
     time_taken = time.time() - start_time
     print(f"initialize_role_partition time cost: {time_taken} seconds")

@@ -5,7 +5,6 @@ import argparse
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
 
 from controller.baseline.prefilter.initialize_partitions import initialize_combination_partitions, \
     drop_prefilter_partition_tables

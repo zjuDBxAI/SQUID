@@ -10,7 +10,6 @@ from controller.dynamic_partition.load_result_to_database import disable_rls_for
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
 
 from controller.initialize_main_tables import create_indexes
 

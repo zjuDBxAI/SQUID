@@ -7,7 +7,6 @@ from psycopg2 import sql
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
 from services.config import get_db_connection
 
 

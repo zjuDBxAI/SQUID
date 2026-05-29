@@ -51,11 +51,19 @@ def search_documents_combination_partition_statistics_system(user_id, query_vect
     Returns:
         tuple: List of query results and total system query time.
     """
+    from basic_benchmark.common_function import get_nprobe_value
+    import efconfig
+
+    probes = get_nprobe_value()
+    ef_search = efconfig.ef_search
+
     import time
+    conn = get_db_connection()
     start_time = time.time()  # Start time tracking
 
-    conn = get_db_connection()
     cur = conn.cursor()
+    cur.execute(f"SET hnsw.ef_search = {ef_search};")
+    cur.execute(f"SET ivfflat.probes = {probes};")
 
     # Retrieve the role combination for the user
     cur.execute("""

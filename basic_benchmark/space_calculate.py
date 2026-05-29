@@ -10,7 +10,6 @@ from wasabi import table
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
 from services.config import get_db_connection
 from controller.baseline.HQI.qd_tree import DEFAULT_QD_TREE_PARTITION_PREFIX
 
@@ -213,28 +212,21 @@ def calculate_table_storage_in_mb(table_names):
 
 def calculate_prefilter(condition, *, enable_index):
     """
-    Calculate the total storage space used by the tables associated with the specified condition.
-
-    Args:
-        condition (str): The partitioning condition ("role", "user", or "combination_role").
-        enable_index (bool): Whether indexes should be counted instead of raw vectors.
+    Calculate the total physical storage used by the prefilter partitions.
 
     Returns:
         float: The total size of the relevant tables in MB.
     """
-    # Base tables whose full storage we always count
-    base_tables = [
+    tables = [
         'Documents',
         'PermissionAssignment',
         'Roles',
         'UserRoles',
-        'Users'
+        'Users',
     ]
 
     conn = get_db_connection()
     cur = conn.cursor()
-
-    # Determine the specific partition tables to include based on the condition
     if condition == "prefilter_partition_role":
         cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE 'documentblocks_role_%';")
     elif condition == "prefilter_partition_combination":
@@ -242,36 +234,11 @@ def calculate_prefilter(condition, *, enable_index):
     else:
         raise ValueError("Invalid condition specified")
 
-    partition_tables = cur.fetchall()
-
-    # Close the initial cursor/connection (we will open another for detailed stats)
+    tables.extend(row[0] for row in cur.fetchall())
     cur.close()
     conn.close()
 
-    # Base tables use full storage measurement
-    total_storage_mb = calculate_table_storage_in_mb(base_tables)
-
-    if not partition_tables:
-        return total_storage_mb
-
-    # For partition tables, apply index/vector-specific rules
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    for (table_name,) in partition_tables:
-        if enable_index:
-            index_mb = _get_index_size_mb(cur, table_name)
-            if index_mb:
-                total_storage_mb += index_mb
-                continue
-
-        # When indexes are disabled or not present, count vector storage instead
-        total_storage_mb += calculate_size_in_mb([table_name])
-
-    cur.close()
-    conn.close()
-
-    return total_storage_mb
+    return calculate_table_storage_in_mb(tables)
 
 
 def calculate_postfilter(condition=None, *, enable_index=None):
@@ -296,10 +263,10 @@ def calculate_postfilter(condition=None, *, enable_index=None):
 
 def calculate_rls(condition=None, *, enable_index=None):
     """
-    Calculate the total storage space used by the RLS scenario, including optional index-only accounting for documentblocks.
+    Calculate the total physical storage used by the RLS scenario.
 
     Returns:
-        float: The total size of the relevant tables and RLS policies in MB.
+        float: Total size in MB, using full relation size for documentblocks.
     """
     base_tables = [
         'Documents',
@@ -307,26 +274,11 @@ def calculate_rls(condition=None, *, enable_index=None):
         'Roles',
         'UserRoles',
         'Users',
+        'documentblocks',
     ]
 
     total_size_mb = calculate_table_storage_in_mb(base_tables)
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    doc_table = "documentblocks"
-    use_index = bool(enable_index)
-    doc_index_mb = _get_index_size_mb(cur, doc_table) if use_index else 0.0
-    if doc_index_mb:
-        total_size_mb += doc_index_mb
-    else:
-        total_size_mb += calculate_size_in_mb([doc_table])
-
-    cur.close()
-    conn.close()
-
-    rls_policy_size_mb = float(calculate_rls_policy_size())  # Convert decimal to float
-
+    rls_policy_size_mb = float(calculate_rls_policy_size())
     return total_size_mb + rls_policy_size_mb
 
 
@@ -411,42 +363,107 @@ def calculate_partition_proposal(condition, *, enable_index=None):
 
 def calculate_dynamic_partition(condition=None, *, enable_index=None):
     """
-    Calculate the total storage space used by dynamic partition tables, including RolePartitions.
+    Calculate the total physical storage used by dynamic partition tables, including RolePartitions.
 
     Returns:
         float: The total size of the dynamic partition tables in MB.
     """
-    base_tables = [
+    tables = [
         'Documents', 'PermissionAssignment', 'Roles',
         'UserRoles', 'Users', 'CombRolePartitions'
     ]
 
-    total_storage_mb = calculate_table_storage_in_mb(base_tables)
-
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE 'documentblocks_partition_%';")
-    partition_tables = [row[0] for row in cur.fetchall()]
-
-    use_index = bool(enable_index)
-    for table_name in partition_tables:
-        if use_index:
-            index_mb = _get_index_size_mb(cur, table_name)
-            if index_mb:
-                total_storage_mb += index_mb
-                continue
-        total_storage_mb += calculate_size_in_mb([table_name])
-
+    tables.extend(row[0] for row in cur.fetchall())
     cur.close()
     conn.close()
 
-    rls_policy_size_mb = float(calculate_rls_policy_size(dynamic_partition=True))  # Convert decimal to float
+    total_storage_mb = calculate_table_storage_in_mb(tables)
+    rls_policy_size_mb = float(calculate_rls_policy_size(dynamic_partition=True))
     return total_storage_mb + rls_policy_size_mb
 
 
+def calculate_method_partition(condition=None, *, enable_index=None):
+    """Calculate total physical storage for the standalone method_partition implementation."""
+    base_tables = [
+        'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
+        'dynamic_partition_current_plan', 'dynamic_partition_current_partitions',
+        'dynamic_partition_current_partition_documents', 'dynamic_partition_current_logical_patterns',
+        'dynamic_partition_current_dag_nodes',
+    ]
+
+    total_storage_mb = 0.0
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        existing_base_tables = []
+        for table_name in base_tables:
+            cur.execute('SELECT to_regclass(%s);', [table_name])
+            if cur.fetchone()[0] is not None:
+                existing_base_tables.append(table_name)
+        if existing_base_tables:
+            total_storage_mb += calculate_table_storage_in_mb(existing_base_tables)
+
+        cur.execute(
+            """
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'workload_documentblocks_partition_%'
+               OR tablename LIKE 'workload_documentblocks_overlay_%'
+               OR tablename LIKE 'workload_documentblocks_access_overlay_%';
+            """
+        )
+        partition_tables = [row[0] for row in cur.fetchall()]
+        if partition_tables:
+            total_storage_mb += calculate_table_storage_in_mb(partition_tables)
+    finally:
+        cur.close()
+        conn.close()
+
+    return total_storage_mb
+
+
+def calculate_kmeans_partition(condition=None, *, enable_index=None):
+    """Calculate total physical storage for the kmeans tenant-cluster partition implementation."""
+    base_tables = [
+        'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
+        'kmeans_current_plan', 'kmeans_current_partitions',
+        'kmeans_current_patterns', 'kmeans_current_routes',
+    ]
+
+    total_storage_mb = 0.0
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        existing_base_tables = []
+        for table_name in base_tables:
+            cur.execute('SELECT to_regclass(%s);', [table_name])
+            if cur.fetchone()[0] is not None:
+                existing_base_tables.append(table_name)
+        if existing_base_tables:
+            total_storage_mb += calculate_table_storage_in_mb(existing_base_tables)
+
+        cur.execute(
+            """
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'kmeans_documentblocks_partition_%';
+            """
+        )
+        partition_tables = [row[0] for row in cur.fetchall()]
+        if partition_tables:
+            total_storage_mb += calculate_table_storage_in_mb(partition_tables)
+    finally:
+        cur.close()
+        conn.close()
+
+    return total_storage_mb
+
+
 def calculate_adaptive_tenant(condition=None, *, enable_index=None):
-    """Calculate total storage for adaptive_tenant control and physical partitions."""
+    """Calculate total physical storage for adaptive_tenant control and physical partitions."""
     base_tables = [
         'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
         'adaptive_tenant_profiles', 'adaptive_tenant_windows',
@@ -474,15 +491,45 @@ def calculate_adaptive_tenant(condition=None, *, enable_index=None):
             """
         )
         partition_tables = [row[0] for row in cur.fetchall()]
+        if partition_tables:
+            total_storage_mb += calculate_table_storage_in_mb(partition_tables)
+    finally:
+        cur.close()
+        conn.close()
 
-        use_index = bool(enable_index)
-        for table_name in partition_tables:
-            if use_index:
-                index_mb = _get_index_size_mb(cur, table_name)
-                if index_mb:
-                    total_storage_mb += index_mb
-                    continue
-            total_storage_mb += calculate_size_in_mb([table_name])
+    return total_storage_mb
+
+
+def calculate_latent_access(condition=None, *, enable_index=None):
+    """Calculate total physical storage for latent_access control data and materialized partitions."""
+    base_tables = [
+        'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
+        'latent_access_current_plan', 'latent_access_current_partitions',
+        'latent_access_current_partition_documents', 'latent_access_current_atom_tenants',
+    ]
+
+    total_storage_mb = 0.0
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        existing_base_tables = []
+        for table_name in base_tables:
+            cur.execute('SELECT to_regclass(%s);', [table_name])
+            if cur.fetchone()[0] is not None:
+                existing_base_tables.append(table_name)
+        if existing_base_tables:
+            total_storage_mb += calculate_table_storage_in_mb(existing_base_tables)
+
+        cur.execute(
+            """
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'latent_documentblocks_partition_%';
+            """
+        )
+        partition_tables = [row[0] for row in cur.fetchall()]
+        if partition_tables:
+            total_storage_mb += calculate_table_storage_in_mb(partition_tables)
     finally:
         cur.close()
         conn.close()
@@ -492,7 +539,7 @@ def calculate_adaptive_tenant(condition=None, *, enable_index=None):
 
 def calculate_qd_tree_storage(condition: str = None, partition_prefix: str = None, *, enable_index=None) -> float:
     """
-    Calculate the total storage used by the QD-tree partitioning scheme.
+    Calculate the total physical storage used by the QD-tree partitioning scheme.
 
     Args:
         condition (str): Unused placeholder to maintain compatibility with the benchmark harness.
@@ -502,9 +549,7 @@ def calculate_qd_tree_storage(condition: str = None, partition_prefix: str = Non
         float: Total size in MB of core tables, QD-tree partitions, and associated RLS metadata.
     """
     prefix = partition_prefix or DEFAULT_QD_TREE_PARTITION_PREFIX
-    base_tables = ['Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users']
-
-    total_storage_mb = calculate_table_storage_in_mb(base_tables)
+    tables = ['Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users']
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -516,20 +561,34 @@ def calculate_qd_tree_storage(condition: str = None, partition_prefix: str = Non
         """,
         (f"{prefix}_%",),
     )
-    partition_tables = [row[0] for row in cur.fetchall()]
-
-    use_index = bool(enable_index)
-    for table_name in partition_tables:
-        if use_index:
-            index_mb = _get_index_size_mb(cur, table_name)
-            if index_mb:
-                total_storage_mb += index_mb
-                continue
-        total_storage_mb += calculate_size_in_mb([table_name])
-
+    tables.extend(row[0] for row in cur.fetchall())
     cur.close()
     conn.close()
 
+    total_storage_mb = calculate_table_storage_in_mb(tables)
     rls_policy_size_mb = float(calculate_rls_policy_size(dynamic_partition=False))
-
     return total_storage_mb + rls_policy_size_mb
+
+
+def calculate_sieve(condition=None, *, enable_index=None):
+    """Calculate the total physical storage for the PostgreSQL SIEVE baseline."""
+    tables = [
+        'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
+        'sieve_current_plan', 'sieve_current_candidates', 'sieve_current_partitions',
+        'sieve_current_edges', 'sieve_current_hasse_edges', 'sieve_documentblocks_root',
+    ]
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'sieve_documentblocks_partition_%';
+        """)
+        tables.extend(row[0] for row in cur.fetchall())
+    finally:
+        cur.close()
+        conn.close()
+
+    return calculate_table_storage_in_mb(tables)

@@ -1,2 +1,59 @@
-# 忽略整个 dataset 文件夹里的所有内容
-dataset/
+# Data
+/dataset/
+/query_dataset.json
+/basic_benchmark/query_dataset.json
+/basic_benchmark/ground_truth_cache.json
+
+# Local config / secrets
+/config.json
+*.local.json
+.env
+.env.*
+
+# Benchmark outputs
+/controller/kmeans/version/
+/basic_benchmark/result/
+/basic_benchmark/efs_logs/
+/basic_benchmark/*_time.json
+/basic_benchmark/*.png
+/basic_benchmark/*.pdf
+/basic_benchmark/*.csv
+/controller/**/result/
+/controller/**/debug/result/
+/controller/**/debug/**/result/
+/controller/dynamic_partition/hnsw/analysis/*.pdf
+/controller/dynamic_partition/hnsw/analysis/*_data.json
+/controller/dynamic_partition/hnsw/validate/*.pdf
+/controller/dynamic_partition/hnsw/validate/*_data.json
+
+# Papers / notes / memory
+/papers/
+/memory/
+/*.pdf
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# Temporary / backup / OS files
+*.log
+*.bak
+*.bak.*
+.DS_Store
+
+# Optional: vendored third-party source. Uncomment if GitHub should not carry these dependencies.
+# /pgvector/
+# /logical_partition_benchmark/benchmark/faiss/
+# /logical_partition_benchmark/benchmark/hnswlib/

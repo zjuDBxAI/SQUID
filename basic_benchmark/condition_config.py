@@ -6,7 +6,6 @@ from controller.baseline.pg_row_security.row_level_security import search_docume
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
 
 # Define the mapping outside the function for better organization
 CONDITION_CONFIG = {
@@ -30,14 +29,29 @@ CONDITION_CONFIG = {
         "space_calc_func_path": "basic_benchmark.space_calculate.calculate_dynamic_partition",
         "extra_params": {"queries_num": 1000}
     },
-    "adaptive_tenant": {
-        "search_func_path": "controller.adaptive_tenant.search.adaptive_tenant_search",
-        "space_calc_func_path": "basic_benchmark.space_calculate.calculate_adaptive_tenant",
+    "method_partition": {
+        "search_func_path": "controller.method.dynamic_partition_search",
+        "space_calc_func_path": "basic_benchmark.space_calculate.calculate_method_partition",
+        "extra_params": {"queries_num": 1000}
+    },
+    "kmeans_partition": {
+        "search_func_path": "controller.kmeans.kmeans_partition_search",
+        "space_calc_func_path": "basic_benchmark.space_calculate.calculate_kmeans_partition",
+        "extra_params": {"queries_num": 1000}
+    },
+    "latent_access": {
+        "search_func_path": "controller.latent_access.search.latent_access_search",
+        "space_calc_func_path": "basic_benchmark.space_calculate.calculate_latent_access",
         "extra_params": {"queries_num": 1000}
     },
     "qd_tree_partition": {
         "search_func_path": "controller.baseline.HQI.qd_tree.qd_tree_search",
         "space_calc_func_path": "basic_benchmark.space_calculate.calculate_qd_tree_storage",
+        "extra_params": {"queries_num": 1000}
+    },
+    "sieve": {
+        "search_func_path": "controller.baseline.SIEVE.sieve_search",
+        "space_calc_func_path": "basic_benchmark.space_calculate.calculate_sieve",
         "extra_params": {"queries_num": 1000}
     },
 }

@@ -289,6 +289,7 @@ def insert_comb_role_partition_mapping(role_comb, partition_ids):
 
 def initialize_partitions_and_role_mappings(partition_assignment, comb_role_tracker, document_to_index,
                                             num_threads=os.cpu_count(), increment_update=False):
+    num_threads=min(4, os.cpu_count())
     conn = get_db_connection()
     cur = conn.cursor()
 
