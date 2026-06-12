@@ -23,9 +23,10 @@ def get_dataset_path():
 def get_maintenance_settings():
     """
     Retrieve maintenance-related PostgreSQL settings from config with safe defaults.
+    Environment variables can override config.json for memory-sensitive index builds.
     """
-    maintenance_work_mem_gb = int(config.get("maintenance_work_mem_gb", 1))
-    max_parallel_workers = int(config.get("max_parallel_maintenance_workers", 1))
+    maintenance_work_mem_gb = int(os.environ.get("MAINTENANCE_WORK_MEM_GB", config.get("maintenance_work_mem_gb", 1)))
+    max_parallel_workers = int(os.environ.get("MAX_PARALLEL_MAINTENANCE_WORKERS", config.get("max_parallel_maintenance_workers", 1)))
     return {
         "maintenance_work_mem_gb": max(1, maintenance_work_mem_gb),
         "max_parallel_maintenance_workers": max(1, max_parallel_workers),

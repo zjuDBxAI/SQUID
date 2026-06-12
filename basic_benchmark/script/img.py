@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,15 +16,17 @@ import matplotlib.pyplot as plt
 SCRIPT_DIR = Path(__file__).resolve().parent
 BENCHMARK_DIR = SCRIPT_DIR.parent
 DEFAULT_LOG_DIR = BENCHMARK_DIR / "efs_logs"
-DEFAULT_OUTPUT = DEFAULT_LOG_DIR / "honeybee_vs_ours_recall_time.png"
+DEFAULT_OUTPUT = DEFAULT_LOG_DIR / "honeybee_rls_effveda_recall_time.png"
 
-METHOD_ORDER = ("AnonySys", "kmeans", "QDTree", "RLS")
+METHOD_ORDER = ("AnonySys", "RLS", "ROLE", "veda", "OURS")
 DISPLAY_METHOD_NAME = {
     "AnonySys": "HONEYBEE",
-    "kmeans": "ours",
-    "QDTree": "HQI",
     "RLS": "RLS",
+    "ROLE": "ROLE",
+    "veda": "EFFVEDA",
+    "OURS": "OURS",
 }
+VEDA_MIN_TIMESTAMP = 20260610000000
 
 
 @dataclass(frozen=True)
@@ -38,20 +41,29 @@ class Point:
 def _method_from_name(name: str) -> str | None:
     if name.startswith("AnonySys_"):
         return "AnonySys"
-    if name.startswith("kmeans_"):
-        return "kmeans"
-    if name.startswith("QDTree_"):
-        return "QDTree"
     if name.startswith("RLS_"):
         return "RLS"
+    if name.startswith("ROLE_"):
+        return "ROLE"
+    if name.startswith("veda_"):
+        return "veda"
+    if "OURS" in name:
+        return "OURS"
     return None
 
 
 def _ef_from_name(name: str) -> int | None:
-    match = re.search(r"(?:^|_)efs(\d+)(?=_)", name)
+    match = re.search(r"(?:^|_)(?:efs|ef)(\d+)(?=_|$)", name)
     if match is None:
         return None
     return int(match.group(1))
+
+
+def _timestamp_from_name(name: str) -> int | None:
+    match = re.search(r"_(\d{8}_\d{6})(?=\.log$)", name)
+    if match is None:
+        return None
+    return int(match.group(1).replace("_", ""))
 
 
 def _last_float(pattern: str, text: str) -> float | None:
@@ -65,6 +77,10 @@ def _parse_log(path: Path) -> Point | None:
     method = _method_from_name(path.name)
     ef_search = _ef_from_name(path.name)
     if method is None or ef_search is None:
+        return None
+
+    timestamp = _timestamp_from_name(path.name)
+    if method == "veda" and timestamp is not None and timestamp < VEDA_MIN_TIMESTAMP:
         return None
 
     text = path.read_text(encoding="utf-8", errors="ignore")
@@ -82,6 +98,13 @@ def _parse_log(path: Path) -> Point | None:
     )
 
 
+def _log_sort_key(path: Path) -> tuple[int, float]:
+    timestamp = _timestamp_from_name(path.name)
+    if timestamp is None:
+        return (0, path.stat().st_mtime)
+    return (timestamp, path.stat().st_mtime)
+
+
 def load_points(log_dir: Path) -> dict[str, list[Point]]:
     latest_by_method_ef: dict[tuple[str, int], Point] = {}
     for path in sorted(log_dir.glob("*.log")):
@@ -90,7 +113,7 @@ def load_points(log_dir: Path) -> dict[str, list[Point]]:
             continue
         key = (point.method, point.ef_search)
         old = latest_by_method_ef.get(key)
-        if old is None or path.stat().st_mtime >= old.log_file.stat().st_mtime:
+        if old is None or _log_sort_key(path) >= _log_sort_key(old.log_file):
             latest_by_method_ef[key] = point
 
     grouped: dict[str, list[Point]] = {method: [] for method in METHOD_ORDER}
@@ -109,7 +132,7 @@ def write_csv(points_by_method: dict[str, list[Point]], output: Path) -> None:
             "ef_search": point.ef_search,
             "recall": point.recall,
             "query_time_ms": point.query_time_ms,
-            "log_file": str(point.log_file),
+            "source_file": str(point.log_file),
         }
         for method in METHOD_ORDER
         for point in points_by_method.get(method, [])
@@ -132,7 +155,7 @@ def plot(points_by_method: dict[str, list[Point]], output: Path, *, annotate_ef:
             "linewidth": 1.0,
             "markersize": 6.0,
         },
-        "kmeans": {
+        "veda": {
             "color": "#b12a2f",
             "marker": "X",
             "linestyle": ":",
@@ -149,6 +172,20 @@ def plot(points_by_method: dict[str, list[Point]], output: Path, *, annotate_ef:
         "RLS": {
             "color": "#4d4d4d",
             "marker": "^",
+            "linestyle": ":",
+            "linewidth": 1.0,
+            "markersize": 6.0,
+        },
+        "ROLE": {
+            "color": "#7a5ab5",
+            "marker": "D",
+            "linestyle": ":",
+            "linewidth": 1.0,
+            "markersize": 5.8,
+        },
+        "OURS": {
+            "color": "#2f6fbb",
+            "marker": "o",
             "linestyle": ":",
             "linewidth": 1.0,
             "markersize": 6.0,
@@ -179,9 +216,10 @@ def plot(points_by_method: dict[str, list[Point]], output: Path, *, annotate_ef:
         raise RuntimeError("No valid benchmark log points were found.")
 
     ax.set_xlabel("Recall@10", fontsize=13)
-    ax.set_ylabel("Query Time (ms)", fontsize=13)
+    ax.set_ylabel("Query Time (ms, log scale)", fontsize=13)
+    ax.set_yscale("log")
     ax.set_xlim(0.7, 1.0)
-    ax.grid(True, color="#d9d9d9", linewidth=0.7, alpha=0.65)
+    ax.grid(True, which="both", color="#d9d9d9", linewidth=0.7, alpha=0.65)
     ax.tick_params(axis="both", labelsize=11, direction="in")
     ax.legend(
         loc="upper center",

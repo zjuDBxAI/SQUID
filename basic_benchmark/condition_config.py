@@ -54,4 +54,9 @@ CONDITION_CONFIG = {
         "space_calc_func_path": "basic_benchmark.space_calculate.calculate_sieve",
         "extra_params": {"queries_num": 1000}
     },
+    "veda": {
+        "search_func_path": "controller.baseline.veda.veda_search",
+        "space_calc_func_path": "basic_benchmark.space_calculate.calculate_veda",
+        "extra_params": {"queries_num": 1000}
+    },
 }

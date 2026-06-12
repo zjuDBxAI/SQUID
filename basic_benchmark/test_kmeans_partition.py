@@ -13,6 +13,7 @@ from controller.kmeans import (
     create_indexes_for_materialized_partitions,
     drop_indexes_for_materialized_partitions,
     load_current_partitions,
+    list_materialized_partition_tables,
 )
 from controller.kmeans.common import DEFAULT_QUERY_DATASET_PATH
 
@@ -51,9 +52,9 @@ def _ratio_tag(value) -> str:
     return text.replace("-", "m").replace(".", "p")
 
 
-def _compose_generator_label(generator_type: str, result_tag, cluster_count: int) -> str:
+def _compose_generator_label(generator_type: str, result_tag) -> str:
     label = str(generator_type or "")
-    tag = result_tag or f"k{int(cluster_count)}"
+    tag = result_tag or "cost"
     safe_tag = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(tag))
     return f"{label}_{safe_tag}" if label else safe_tag
 
@@ -82,22 +83,16 @@ def test_kmeans_partition_search(
     warm_up=True,
     query_num=1000,
     prepare_before_test=False,
-    cluster_count=30,
-    private_cluster_count=None,
-    shared_cluster_count=5,
-    shared_score_ratio=0.10,
-    shared_route_limit=3,
     private_replication_budget_ratio=0.0,
     embedding_dim=None,
     document_limit=None,
-    fetch_multiplier=1,
     ef_search=120,
-    hnsw_iterative_scan="relaxed_order",
-    hnsw_max_scan_tuples=20000,
     show_progress=True,
     result_tag=None,
     use_ground_truth_cache=False,
     query_dataset_path=DEFAULT_QUERY_DATASET_PATH,
+    enable_split=True,
+    private_edge_top_d=32,
 ):
     effective_query_num = max(1, int(query_num))
     queries = prepare_query_dataset(
@@ -108,11 +103,6 @@ def test_kmeans_partition_search(
 
     if prepare_before_test:
         build_and_materialize_kmeans_plan(
-            cluster_count=int(cluster_count),
-            private_cluster_count=private_cluster_count,
-            shared_cluster_count=int(shared_cluster_count),
-            shared_score_ratio=float(shared_score_ratio),
-            shared_route_limit=int(shared_route_limit),
             private_replication_budget_ratio=float(private_replication_budget_ratio),
             ef_search=int(ef_search),
             embedding_dim=embedding_dim,
@@ -121,28 +111,36 @@ def test_kmeans_partition_search(
             create_indexes=False,
             index_type=index_type,
             show_progress=bool(show_progress),
+            enable_split=bool(enable_split),
+            private_edge_top_d=int(private_edge_top_d),
         )
 
     partitions = load_current_partitions(refresh=True)
     if not partitions:
         raise RuntimeError("No kmeans partitions are materialized. Run with --prepare true first.")
 
+    materialized_tables = set(list_materialized_partition_tables())
+    missing_tables = [partition.table_name for partition in partitions if partition.table_name not in materialized_tables]
+    if missing_tables:
+        preview = ", ".join(missing_tables[:5])
+        suffix = "" if len(missing_tables) <= 5 else f" ... (+{len(missing_tables) - 5} more)"
+        raise RuntimeError(
+            "Current kmeans plan metadata references missing partition tables: "
+            f"{preview}{suffix}. Run with --prepare true to rebuild the plan and materialized tables."
+        )
+
     if enable_index:
         _ensure_index_state(partitions, index_type)
     else:
         drop_indexes_for_materialized_partitions()
 
-    _sync_efconfig_value("kmeans_partition_fetch_multiplier", int(fetch_multiplier))
     if ef_search is not None:
         _sync_efconfig_value("ef_search", int(ef_search))
         _sync_efconfig_value("kmeans_ef_search", int(ef_search))
     else:
         _delete_efconfig_value("kmeans_ef_search")
-    _sync_efconfig_value("kmeans_hnsw_iterative_scan", str(hnsw_iterative_scan))
-    _sync_efconfig_value("kmeans_hnsw_max_scan_tuples", int(hnsw_max_scan_tuples))
-    effective_private_cluster_count = int(private_cluster_count) if private_cluster_count is not None else int(cluster_count)
-    default_tag = f"cost_v12_p{effective_private_cluster_count}_s{int(shared_cluster_count)}_r{_ratio_tag(shared_score_ratio)}_l{int(shared_route_limit)}_b{_ratio_tag(private_replication_budget_ratio)}"
-    effective_generator_type = _compose_generator_label(generator_type, result_tag or default_tag, int(cluster_count))
+    default_tag = f"cost_split_b{_ratio_tag(private_replication_budget_ratio)}_ef{int(ef_search)}"
+    effective_generator_type = _compose_generator_label(generator_type, result_tag or default_tag)
     run_test(
         queries,
         "kmeans_partition",
@@ -169,22 +167,16 @@ if __name__ == "__main__":
     parser.add_argument("--warm-up", type=_str_to_bool, default=True)
     parser.add_argument("--query-num", type=int, default=1000)
     parser.add_argument("--prepare", type=_str_to_bool, default=False)
-    parser.add_argument("--cluster-count", type=int, default=30)
-    parser.add_argument("--private-cluster-count", type=int, default=None)
-    parser.add_argument("--shared-cluster-count", type=int, default=5)
-    parser.add_argument("--shared-score-ratio", type=float, default=0.10)
-    parser.add_argument("--shared-route-limit", type=int, default=3)
     parser.add_argument("--private-replication-budget-ratio", type=float, default=0.0)
     parser.add_argument("--embedding-dim", type=int, default=None)
     parser.add_argument("--document-limit", type=int, default=None)
-    parser.add_argument("--fetch-multiplier", type=int, default=1)
     parser.add_argument("--ef-search", type=int, default=120)
-    parser.add_argument("--hnsw-iterative-scan", default="relaxed_order")
-    parser.add_argument("--hnsw-max-scan-tuples", type=int, default=20000)
     parser.add_argument("--show-progress", type=_str_to_bool, default=True)
     parser.add_argument("--result-tag", default=None)
     parser.add_argument("--use-ground-truth-cache", type=_str_to_bool, default=False)
     parser.add_argument("--query-dataset-path", default=DEFAULT_QUERY_DATASET_PATH)
+    parser.add_argument("--enable-split", type=_str_to_bool, default=True)
+    parser.add_argument("--private-edge-top-d", type=int, default=32)
     args = parser.parse_args()
 
     test_kmeans_partition_search(
@@ -197,20 +189,14 @@ if __name__ == "__main__":
         warm_up=args.warm_up,
         query_num=args.query_num,
         prepare_before_test=args.prepare,
-        cluster_count=args.cluster_count,
-        private_cluster_count=args.private_cluster_count,
-        shared_cluster_count=args.shared_cluster_count,
-        shared_score_ratio=args.shared_score_ratio,
-        shared_route_limit=args.shared_route_limit,
         private_replication_budget_ratio=args.private_replication_budget_ratio,
         embedding_dim=args.embedding_dim,
         document_limit=args.document_limit,
-        fetch_multiplier=args.fetch_multiplier,
         ef_search=args.ef_search,
-        hnsw_iterative_scan=args.hnsw_iterative_scan,
-        hnsw_max_scan_tuples=args.hnsw_max_scan_tuples,
         show_progress=args.show_progress,
         result_tag=args.result_tag,
         use_ground_truth_cache=args.use_ground_truth_cache,
         query_dataset_path=args.query_dataset_path,
+        enable_split=args.enable_split,
+        private_edge_top_d=args.private_edge_top_d,
     )

@@ -452,6 +452,15 @@ def create_indexes_for_all_partitions(
         print("No dynamic partition tables found. Skipping index creation.")
         return
 
+    env_max_workers = os.environ.get("DYNAMIC_INDEX_MAX_WORKERS")
+    if max_workers is None and env_max_workers:
+        max_workers = max(1, int(env_max_workers))
+    env_parallel = os.environ.get("DYNAMIC_INDEX_PARALLEL")
+    if env_parallel is not None and env_parallel.strip().lower() in {"0", "false", "off", "no"}:
+        parallel = False
+    if hnsw_threads is None and os.environ.get("HNSW_INDEX_THREADS"):
+        hnsw_threads = max(1, int(os.environ["HNSW_INDEX_THREADS"]))
+
     worker_count = max_workers or max(1, os.cpu_count() // 2)
 
     if parallel and worker_count > 1:

@@ -792,6 +792,8 @@ def build_and_materialize_kmeans_plan(
     create_indexes: bool = False,
     index_type: str = "hnsw",
     show_progress: bool = True,
+    enable_split: bool = True,
+    private_edge_top_d: int = 32,
     db_connection_factory=_default_db_connection_factory,
 ) -> KMeansPlan:
     print("[kmeans][planner] loading ACL rows...", flush=True)
@@ -807,7 +809,9 @@ def build_and_materialize_kmeans_plan(
         f"shared_score_ratio={float(shared_score_ratio):.4f}, "
         f"shared_route_limit={int(shared_route_limit)}, "
         f"private_replication_budget_ratio={float(private_replication_budget_ratio):.4f}, "
-        f"ef_search={int(ef_search)}",
+        f"ef_search={int(ef_search)}, "
+        f"enable_split={bool(enable_split)}, "
+        f"private_edge_top_d={int(private_edge_top_d)}",
         flush=True,
     )
     plan = planner.build_plan(
@@ -821,6 +825,8 @@ def build_and_materialize_kmeans_plan(
         embedding_dim=embedding_dim,
         query_dataset_path=query_dataset_path,
         show_progress=show_progress,
+        enable_split=bool(enable_split),
+        private_edge_top_d=int(private_edge_top_d),
     )
     print(
         f"[kmeans][planner] built {len(plan.partitions)} partitions; "

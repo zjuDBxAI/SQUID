@@ -96,16 +96,16 @@ def main(num_documents):
     conn.close()
 
     # Calculate m_perms as one-tenth of the number of documents
-    m_perms = num_documents // 26
+    m_perms = num_documents // 25
 
     #used for sharing degree
     erbac_generator = ERBACDataGenerator(
-        n_froles=100,      # Number of functional roles
-        n_broles=300,      # Number of business roles
+        n_froles=40,      # Number of functional roles
+        n_broles=100,      # Number of business roles
         document_ids=document_ids,  # Use the specified number of documents
         m_perms=m_perms,  # Max permissions per functional role (one-tenth of num_documents)
-        m_froles=2,       # Max functional roles per business role
-        m_broles=1        # Max business roles per user
+        m_froles=3,       # Max functional roles per business role
+        m_broles=3        # Max business roles per user
     )
 
     # Generate data for 1000 users

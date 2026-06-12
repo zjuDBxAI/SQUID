@@ -592,3 +592,36 @@ def calculate_sieve(condition=None, *, enable_index=None):
         conn.close()
 
     return calculate_table_storage_in_mb(tables)
+
+
+
+def calculate_veda(condition=None, *, enable_index=None):
+    """Calculate total physical storage for the Veda/EffVeda access-aware lattice baseline."""
+    tables = [
+        'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
+        'veda_current_plan', 'veda_current_patterns', 'veda_current_nodes',
+        'veda_current_role_plans', 'veda_current_user_routes',
+    ]
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        existing_tables = []
+        for table_name in tables:
+            cur.execute('SELECT to_regclass(%s);', [table_name])
+            if cur.fetchone()[0] is not None:
+                existing_tables.append(table_name)
+
+        cur.execute("""
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'veda_documentblocks_node_%';
+        """)
+        existing_tables.extend(row[0] for row in cur.fetchall())
+    finally:
+        cur.close()
+        conn.close()
+
+    if not existing_tables:
+        return 0.0
+    return calculate_table_storage_in_mb(existing_tables)

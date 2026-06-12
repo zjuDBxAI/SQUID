@@ -5,16 +5,17 @@ import heapq
 import json
 import math
 from pathlib import Path
+
 from typing import Optional
 
 from tqdm import tqdm
+
+from controller.baseline.veda.common import DEFAULT_COST_A, DEFAULT_COST_B, DEFAULT_COST_C
 
 from .common import ACLPattern, KMeansPartition, KMeansPlan, TenantRoute, get_partition_table_name
 
 
 _COST_TOPK = 5
-_COST_GAMMA = 1.0
-_COST_EPS = 1e-6
 _PRIVATE_MERGE_NEIGHBOR_LIMIT = 128
 _PRIVATE_FALLBACK_POOL_LIMIT = 128
 _SHARED_MERGE_NEIGHBOR_LIMIT = 128
@@ -92,6 +93,7 @@ class HybridACLKMeansPlanner:
         self._last_private_metadata: dict[str, object] = {}
         self._last_shared_metadata: dict[str, object] = {}
         self._last_split_metadata: dict[str, object] = {}
+        self._last_private_groups: list[dict[str, object]] = []
 
     def build_plan(
         self,
@@ -106,6 +108,8 @@ class HybridACLKMeansPlanner:
         query_dataset_path: Optional[str] = None,
         ef_search: int = 120,
         show_progress: bool = True,
+        enable_split: bool = True,
+        private_edge_top_d: int = 32,
     ) -> KMeansPlan:
         if not acl_rows:
             raise ValueError("Cannot build kmeans ACL partitions without ACL rows")
@@ -120,10 +124,10 @@ class HybridACLKMeansPlanner:
                 raise ValueError("No tenants found in ACL rows")
             tenant_vector_counts = self._tenant_vector_counts(patterns)
             total_original_vectors = int(sum(int(pattern.vector_count) for pattern in patterns))
-            workload_frequencies = _load_workload_frequencies(query_dataset_path)
-            tenant_query_weights = self._tenant_query_weights(tenant_ids, workload_frequencies)
+            tenant_query_weights = {int(tenant_id): 1.0 for tenant_id in tenant_ids}
+            split_tenant_query_weights = dict(tenant_query_weights)
             progress.update(1)
-            progress.set_description("Cost split planner: loaded tenant stats")
+            progress.set_description("Cost split planner: splitting shared/private ACLs")
 
             shared_patterns, private_patterns, shared_threshold = self._split_patterns(
                 patterns,
@@ -131,10 +135,11 @@ class HybridACLKMeansPlanner:
                 private_cluster_count=int(private_cluster_count),
                 tenant_ids=tenant_ids,
                 tenant_vector_counts=tenant_vector_counts,
-                tenant_query_weights=tenant_query_weights,
+                tenant_query_weights=split_tenant_query_weights,
                 total_original_vectors=total_original_vectors,
                 ef_search=int(ef_search),
                 private_replication_budget_ratio=float(private_replication_budget_ratio),
+                enable_split=bool(enable_split),
             )
             progress.update(1)
             progress.set_description("Cost split planner: split shared/private ACLs")
@@ -150,6 +155,7 @@ class HybridACLKMeansPlanner:
             progress.update(1)
             progress.set_description("Cost split planner: built shared splits")
 
+            shared_vector_count = int(sum(int(pattern.vector_count) for pattern in shared_patterns))
             tenant_to_private_cluster = self._cluster_private_tenants_by_cost_split(
                 private_patterns,
                 tenant_ids=tenant_ids,
@@ -157,9 +163,10 @@ class HybridACLKMeansPlanner:
                 replication_budget_ratio=float(private_replication_budget_ratio),
                 tenant_query_weights=tenant_query_weights,
                 total_original_vectors=total_original_vectors,
-                shared_vector_count=int(sum(int(pattern.vector_count) for pattern in shared_patterns)),
+                shared_vector_count=int(shared_vector_count),
                 ef_search=int(ef_search),
                 show_progress=show_progress,
+                private_edge_top_d=int(private_edge_top_d),
             )
             progress.update(1)
             progress.set_description("Cost split planner: built private splits")
@@ -189,7 +196,7 @@ class HybridACLKMeansPlanner:
         effective_private_cluster_count = len({int(cluster_id) for cluster_id in tenant_to_private_cluster.values()})
         effective_shared_cluster_count = len({int(cluster_id) for cluster_id in shared_assignments.values()})
         metadata = {
-            "algorithm": "cost_guided_two_zone_split_private_merge_v1",
+            "algorithm": "private_core_star_split_merge_v16",
             "private_cluster_count": int(private_cluster_count),
             "effective_private_cluster_count": int(effective_private_cluster_count),
             "shared_cluster_count": int(shared_cluster_count),
@@ -207,21 +214,31 @@ class HybridACLKMeansPlanner:
             "shared_score_threshold": None if shared_threshold is None else float(shared_threshold),
             "shared_route_limit": int(shared_route_limit),
             "private_replication_budget_ratio": float(private_replication_budget_ratio),
+            "enable_split": bool(enable_split),
+            "private_edge_top_d": int(private_edge_top_d),
             "ef_search_for_cost": int(ef_search),
             "topk_for_cost": int(_COST_TOPK),
-            "cost_model": "shared uses bottom-up ACL merge by exact pre/post tenant query cost; private uses bottom-up ACL-overlap merge with HNSW/filter effort",
-            "shared_cost_model": "bottom-up ACL group merge: C(t,G)=R0+log(1+V_G)*max(k, ef*log(1+V_G)/log(1+N), k/selectivity); candidate uses total affected query gain C_before-C_after",
-            "private_cost_model": (
-                "sum_t q_t * log(1+|P|) * max(k, ef*log(1+|P|)/log(1+N), "
-                "k/max(A(t,P)/|P|, eps))"
-            ),
+            "cost_model": "HNSW-filter latency: C(t,P)=q_t*(a*h+b*ef_search*(1/r+log2(1/r)*h)+c), h=log2(1+|P|), r=A(t,P)/|P| in (0,1], q_t=1 for every tenant",
+            "cost_a": float(DEFAULT_COST_A),
+            "cost_b": float(DEFAULT_COST_B),
+            "cost_c": float(DEFAULT_COST_C),
+            "shared_cost_model": "bottom-up ACL group merge using exact pre/post VEDA-calibrated tenant query cost",
+            "private_cost_model": "v16 core-star private merge: edge first chooses the memory-saving operation with minimum delta_latency; heap ranks by unit_latency_cost = delta_latency / memory_saved",
             "shared_score_rule": "adaptive ACL marginal cost split with reference private groups and storage multiplier",
+            "query_weight_rule": "all tenants use q_t=1; query_dataset workload frequencies are ignored",
+            "split_query_weight_rule": "all tenants use q_t=1 in shared/private split",
+            "private_query_weight_rule": "all tenants use q_t=1 in private merge",
             "shared_query_weight_rule": "q_t fixed to 1 in shared cost model",
             "shared_vector_ratio_actual": float(
                 sum(int(pattern.vector_count) for pattern in shared_patterns) / max(total_original_vectors, 1)
             ),
             "shared_pattern_ratio_actual": float(len(shared_patterns) / max(len(patterns), 1)),
-            "private_objective": "bottom-up tenant merge minimizing query cost increase per storage saved under private storage budget",
+            "shared_vector_count": int(sum(int(pattern.vector_count) for pattern in shared_patterns)),
+            "shared_storage_if_private": int(sum(int(pattern.vector_count) * len(pattern.tenant_ids) for pattern in shared_patterns)),
+            "shared_storage_saved_by_split": int(
+                sum(int(pattern.vector_count) * max(0, len(pattern.tenant_ids) - 1) for pattern in shared_patterns)
+            ),
+            "private_objective": "v16 core-star split-merge: start from one private group per tenant and compress ACL copies until total storage satisfies private_replication_budget_ratio",
             "shared_objective": "bottom-up shared ACL global merge while total pre/post query-cost gain is positive",
             "embedding_dim_status": "ignored_by_cost_guided_two_zone_split_v12",
             "tenant_vector_count_min": int(min(tenant_vector_counts.values())) if tenant_vector_counts else 0,
@@ -283,6 +300,7 @@ class HybridACLKMeansPlanner:
         total_original_vectors: int,
         ef_search: int,
         private_replication_budget_ratio: float,
+        enable_split: bool = True,
     ) -> tuple[list[ACLPattern], list[ACLPattern], Optional[float]]:
         if not patterns:
             self._last_split_metadata = {
@@ -292,11 +310,50 @@ class HybridACLKMeansPlanner:
             }
             return [], [], None
 
+        if not bool(enable_split):
+            private = []
+            for pattern in patterns:
+                pattern.zone = "private"
+                private.append(pattern)
+            total_original = int(sum(int(pattern.vector_count) for pattern in patterns))
+            base_private_storage = int(sum(int(pattern.vector_count) * len(pattern.tenant_ids) for pattern in patterns))
+            allowed_storage = int(
+                math.floor(
+                    float(max(1, int(total_original_vectors)))
+                    * (1.0 + max(0.0, float(private_replication_budget_ratio)))
+                )
+            )
+            self._last_split_metadata = {
+                "enabled": False,
+                "reason": "disabled_by_enable_split_flag",
+                "rule": "split_disabled_all_acl_private",
+                "shared_score_ratio_input": float(shared_score_ratio),
+                "shared_score_ratio_used": False,
+                "shared_count": 0,
+                "private_count": int(len(private)),
+                "actual_shared_ratio": 0.0,
+                "selected_acl_count": 0,
+                "private_replication_budget_ratio": float(private_replication_budget_ratio),
+                "estimated_allowed_storage": int(allowed_storage),
+                "estimated_base_private_storage": int(base_private_storage),
+                "estimated_selected_storage": int(base_private_storage),
+                "estimated_all_shared_storage": int(total_original),
+                "estimated_storage_budget_satisfied": bool(int(base_private_storage) <= int(allowed_storage)),
+                "private_cluster_count_hint": int(private_cluster_count),
+            }
+            return [], private, None
+
         tenant_ids = tuple(sorted(int(tenant_id) for tenant_id in tenant_ids))
         pattern_weights = {int(pattern.pattern_id): max(0, int(pattern.vector_count)) for pattern in patterns}
 
         route_startup_samples = sorted(
-            float(_COST_TOPK) * math.log1p(max(1, int(pattern.vector_count)))
+            self._partition_query_cost(
+                partition_vectors=max(1, int(pattern.vector_count)),
+                accessible_vectors=max(1, int(pattern.vector_count)),
+                tenant_weight=1.0,
+                total_vectors=int(total_original_vectors),
+                ef_search=int(ef_search),
+            )
             for pattern in patterns
             if int(pattern.vector_count) > 0
         )
@@ -305,21 +362,20 @@ class HybridACLKMeansPlanner:
             if route_startup_samples
             else float(_COST_TOPK)
         )
-        total_vector_scale = max(math.log1p(max(1, int(total_original_vectors))), 1.0)
 
         def split_query_cost(partition_vectors: int, accessible_vectors: int) -> float:
-            partition_vectors = max(1, int(partition_vectors))
-            accessible_vectors = int(accessible_vectors)
-            if accessible_vectors <= 0:
+            if int(partition_vectors) <= 0 or int(accessible_vectors) <= 0:
                 return 0.0
-            selectivity = float(accessible_vectors) / float(partition_vectors)
-            size_scaled_ef = float(max(1, int(ef_search))) * math.log1p(partition_vectors) / float(total_vector_scale)
-            filter_scaled_ef = float(_COST_TOPK) / max(selectivity, _COST_EPS)
-            effort = max(float(_COST_TOPK), float(size_scaled_ef), float(filter_scaled_ef))
-            return float(route_startup_cost) + math.log1p(partition_vectors) * float(effort)
+            return self._partition_query_cost(
+                partition_vectors=int(partition_vectors),
+                accessible_vectors=int(accessible_vectors),
+                tenant_weight=1.0,
+                total_vectors=int(total_original_vectors),
+                ef_search=int(ef_search),
+            )
 
-        # Reference private groups are only an estimator for shared/private split.
-        # They avoid running the full private merge before the split decision.
+        # Same split shape as SQUID: build reference private groups only for deciding
+        # whether an ACL should be admitted to shared. These are not final partitions.
         tenant_owner_rank: dict[int, tuple[float, int, int, int]] = {}
         tenant_owner_pattern: dict[int, int] = {}
         for pattern in patterns:
@@ -384,7 +440,10 @@ class HybridACLKMeansPlanner:
         }
         base_private_storage = int(sum(int(value) for value in group_vector_counts.values()))
         allowed_storage = int(
-            math.floor(float(max(1, int(total_original_vectors))) * (1.0 + max(0.0, float(private_replication_budget_ratio))))
+            math.floor(
+                float(max(1, int(total_original_vectors)))
+                * (1.0 + max(0.0, float(private_replication_budget_ratio)))
+            )
         )
 
         split_rows: list[dict[str, object]] = []
@@ -491,6 +550,7 @@ class HybridACLKMeansPlanner:
         selected_gains: list[float] = []
         base_scores = [float(row["base_score"]) for row in split_rows]
         storage_deltas = [int(row["storage_delta"]) for row in split_rows]
+        touched_group_counts = [int(row["touched_group_count"]) for row in split_rows]
         beneficial_count = 0
         shared_by_query_gain = 0
         shared_by_storage_pressure = 0
@@ -518,10 +578,9 @@ class HybridACLKMeansPlanner:
         selected_storage = int(estimate_storage(float(lambda_value)))
         reference_group_sizes = [len(value) for value in group_tenants.values()]
         reference_group_vectors = [int(value) for value in group_vector_counts.values()]
-        touched_group_counts = [int(row["touched_group_count"]) for row in split_rows]
         self._last_split_metadata = {
             "enabled": True,
-            "rule": "adaptive_acl_marginal_cost_with_reference_private_groups",
+            "rule": "squid_reference_group_adaptive_acl_marginal_cost_v1",
             "shared_score_ratio_input": float(shared_score_ratio),
             "shared_score_ratio_used": False,
             "shared_count": int(len(shared)),
@@ -542,13 +601,14 @@ class HybridACLKMeansPlanner:
             "estimated_all_shared_storage": int(sum(int(pattern.vector_count) for pattern in patterns)),
             "private_cluster_count_hint": int(private_cluster_count),
             "shared_beneficial_candidate_count": int(beneficial_count),
+            "selected_acl_count": int(len(shared)),
             "shared_admission_unit_cost": float(shared_admission_unit_cost),
             "shared_admission_rule": "sort by positive net gain and admit ACL a only if gain(a) > R0 * sum_{b in S}(|T_a| + |T_b|)",
             "estimated_storage_budget_satisfied": bool(int(selected_storage) <= int(allowed_storage)),
             "private_reference_group_count": int(len(group_tenants)),
             "private_reference_owner_rule": "owner(t)=argmax_a n_a/|T_a|, tie by larger n_a, smaller |T_a|, smaller pattern_id",
             "route_startup_cost": float(route_startup_cost),
-            "query_weight_rule": "q_t fixed to 1.0 per tenant for split estimation",
+            "query_weight_rule": "q_t fixed to 1.0 per tenant for split estimation; workload frequencies are ignored; VEDA cost parameters are unchanged",
             "shared_by_query_gain": int(shared_by_query_gain),
             "shared_by_storage_pressure": int(shared_by_storage_pressure),
             "base_score_min": float(min(base_scores)) if base_scores else None,
@@ -568,6 +628,7 @@ class HybridACLKMeansPlanner:
             "reference_group_vector_min": int(min(reference_group_vectors)) if reference_group_vectors else 0,
             "reference_group_vector_mean": float(sum(reference_group_vectors) / len(reference_group_vectors)) if reference_group_vectors else 0.0,
             "reference_group_vector_max": int(max(reference_group_vectors)) if reference_group_vectors else 0,
+            "cost_model": "HNSW-filter C=q*(a*h+b*ef*(1/r+log2(1/r)*h)+c), h=log2(1+V), r=A/V in (0,1]; split shape follows SQUID reference-group admission",
         }
         return shared, private, None
 
@@ -583,12 +644,7 @@ class HybridACLKMeansPlanner:
         tenant_ids: tuple[int, ...],
         workload_frequencies: dict[int, float],
     ) -> dict[int, float]:
-        raw = {int(tenant_id): max(0.0, float(workload_frequencies.get(int(tenant_id), 0.0))) for tenant_id in tenant_ids}
-        total = float(sum(raw.values()))
-        if total <= 0.0:
-            uniform = 1.0 / float(max(1, len(tenant_ids)))
-            return {int(tenant_id): float(uniform) for tenant_id in tenant_ids}
-        return {int(tenant_id): float(value / total) for tenant_id, value in raw.items()}
+        return {int(tenant_id): 1.0 for tenant_id in tenant_ids}
 
     def _partition_query_cost(
         self,
@@ -602,12 +658,20 @@ class HybridACLKMeansPlanner:
         if int(partition_vectors) <= 0 or int(accessible_vectors) <= 0 or float(tenant_weight) <= 0.0:
             return 0.0
         partition_vectors = max(1, int(partition_vectors))
-        total_vectors = max(partition_vectors, int(total_vectors), 1)
-        selectivity = float(accessible_vectors) / float(partition_vectors)
-        size_scaled_ef = float(max(1, int(ef_search))) * math.log1p(partition_vectors) / max(math.log1p(total_vectors), 1.0)
-        filter_scaled_ef = float(_COST_GAMMA * _COST_TOPK / max(selectivity, _COST_EPS))
-        effort = max(float(_COST_TOPK), float(size_scaled_ef), float(filter_scaled_ef))
-        return float(tenant_weight) * math.log1p(partition_vectors) * effort
+        accessible_vectors = max(1, int(accessible_vectors))
+        selectivity = min(1.0, max(1e-12, float(accessible_vectors) / float(partition_vectors)))
+        inverse_selectivity = 1.0 / float(selectivity)  #选择性要倒数
+        efs = float(max(1, int(ef_search)))
+        log_vectors = math.log2(float(partition_vectors) + 1.0)
+        #filter_walk = float(inverse_selectivity) + math.log2(float(inverse_selectivity)) * float(log_vectors)
+
+        filter_walk = float(inverse_selectivity) #+ math.log2(float(inverse_selectivity)) * float(log_vectors)
+        base_cost = (
+            float(DEFAULT_COST_A) * float(log_vectors)
+            + float(DEFAULT_COST_B) * efs * filter_walk # k=10, 代表recall@10的召回max(efs * float(inverse_selectivity), 10 * float(inverse_selectivity), 10)
+            + float(DEFAULT_COST_C)
+        )
+        return float(tenant_weight) * float(base_cost)
 
     def _assign_shared_groups_by_cost_split(
         self,
@@ -628,7 +692,13 @@ class HybridACLKMeansPlanner:
         pattern_by_id = {int(pattern.pattern_id): pattern for pattern in patterns}
         pattern_weights = {int(pattern.pattern_id): int(pattern.vector_count) for pattern in patterns}
         route_startup_samples = sorted(
-            float(_COST_TOPK) * math.log1p(max(1, int(pattern.vector_count)))
+            self._partition_query_cost(
+                partition_vectors=max(1, int(pattern.vector_count)),
+                accessible_vectors=max(1, int(pattern.vector_count)),
+                tenant_weight=1.0,
+                total_vectors=int(total_original_vectors),
+                ef_search=int(ef_search),
+            )
             for pattern in patterns
             if int(pattern.vector_count) > 0
         )
@@ -642,20 +712,13 @@ class HybridACLKMeansPlanner:
             return 1.0
 
         def tenant_query_cost(vector_count: int, accessible_vectors: int, tenant_id: int) -> float:
-            vector_count = int(vector_count)
-            accessible_vectors = int(accessible_vectors)
-            if vector_count <= 0 or accessible_vectors <= 0:
-                return 0.0
-            partition_vectors = max(1, int(vector_count))
-            total_vectors = max(partition_vectors, int(total_original_vectors), 1)
-            selectivity = float(accessible_vectors) / float(partition_vectors)
-            size_scaled_ef = float(max(1, int(ef_search))) * math.log1p(partition_vectors) / max(
-                math.log1p(total_vectors),
-                1.0,
+            return self._partition_query_cost(
+                partition_vectors=int(vector_count),
+                accessible_vectors=int(accessible_vectors),
+                tenant_weight=float(tenant_weight(int(tenant_id))),
+                total_vectors=int(total_original_vectors),
+                ef_search=int(ef_search),
             )
-            filter_scaled_ef = float(_COST_TOPK / max(selectivity, _COST_EPS))
-            effort = max(float(_COST_TOPK), float(size_scaled_ef), float(filter_scaled_ef))
-            return float(route_startup_cost) + float(tenant_weight(int(tenant_id))) * math.log1p(partition_vectors) * float(effort)
 
         def group_query_cost_from_access(vector_count: int, tenant_access: Counter) -> float:
             vector_count = int(vector_count)
@@ -758,6 +821,8 @@ class HybridACLKMeansPlanner:
         total_cost_gain = 0.0
         total_overlap_weight = 0.0
         initial_candidate_edges = 0
+        capped_tenant_count = 0
+        skipped_pattern_memberships_by_cap = 0
 
         def candidate_entry(left_id: int, right_id: int) -> tuple[float, float, float, int, int, int, int, int] | None:
             nonlocal candidate_evaluations
@@ -799,11 +864,35 @@ class HybridACLKMeansPlanner:
             heapq.heappush(candidate_heap, entry)
             return True
 
-        initial_group_ids = sorted(int(group_id) for group_id in groups)
-        for index, left_id in enumerate(initial_group_ids):
-            for right_id in initial_group_ids[index + 1:]:
-                if push_candidate(int(left_id), int(right_id)):
-                    initial_candidate_edges += 1
+        tenant_to_group_ids: dict[int, list[int]] = defaultdict(list)
+        for pattern in patterns:
+            pattern_id = int(pattern.pattern_id)
+            for tenant_id in pattern.tenant_ids:
+                tenant_to_group_ids[int(tenant_id)].append(int(pattern_id))
+
+        initial_neighbor_weights: dict[int, Counter] = defaultdict(Counter)
+        for _tenant_id, group_ids in tenant_to_group_ids.items():
+            ordered_group_ids = sorted(
+                {int(group_id) for group_id in group_ids},
+                key=lambda group_id: (-int(pattern_weights.get(int(group_id), 0)), int(group_id)),
+            )
+            if len(ordered_group_ids) > int(_SHARED_TENANT_PATTERN_CAP):
+                capped_tenant_count += 1
+                skipped_pattern_memberships_by_cap += len(ordered_group_ids) - int(_SHARED_TENANT_PATTERN_CAP)
+                ordered_group_ids = ordered_group_ids[: int(_SHARED_TENANT_PATTERN_CAP)]
+            for index, left_id in enumerate(ordered_group_ids):
+                for right_id in ordered_group_ids[index + 1:]:
+                    initial_neighbor_weights[int(left_id)][int(right_id)] += 1
+                    initial_neighbor_weights[int(right_id)][int(left_id)] += 1
+
+        initial_candidate_pairs: set[tuple[int, int]] = set()
+        for left_id, neighbor_weights in initial_neighbor_weights.items():
+            for right_id, _weight in neighbor_weights.most_common(int(_SHARED_MERGE_NEIGHBOR_LIMIT)):
+                edge = (int(left_id), int(right_id)) if int(left_id) < int(right_id) else (int(right_id), int(left_id))
+                initial_candidate_pairs.add(edge)
+        for left_id, right_id in sorted(initial_candidate_pairs):
+            if push_candidate(int(left_id), int(right_id)):
+                initial_candidate_edges += 1
 
         def pop_valid_candidate() -> tuple[int, int, float, float, float] | None:
             nonlocal stale_candidates
@@ -868,9 +957,16 @@ class HybridACLKMeansPlanner:
             else:
                 zero_overlap_merge_count += 1
 
-            for other_id in list(groups):
-                if int(other_id) != int(new_group_id):
-                    push_candidate(int(new_group_id), int(other_id))
+            refreshed_neighbors: list[tuple[float, int, int]] = []
+            for other_id, other in groups.items():
+                if int(other_id) == int(new_group_id):
+                    continue
+                other_overlap = float(overlap_weight(new_group, other))
+                if other_overlap <= 0.0:
+                    continue
+                refreshed_neighbors.append((-float(other_overlap), int(other["vector_count"]), int(other_id)))
+            for _negative_overlap, _other_vectors, other_id in sorted(refreshed_neighbors)[: int(_SHARED_MERGE_NEIGHBOR_LIMIT)]:
+                push_candidate(int(new_group_id), int(other_id))
 
             if progress.n < progress.total:
                 progress.update(1)
@@ -906,7 +1002,7 @@ class HybridACLKMeansPlanner:
         final_route_count = int(sum(int(len(group["tenant_access"])) for group in groups.values()))
         self._last_shared_metadata = {
             "enabled": True,
-            "objective": "bottom-up shared ACL merge by global exact pre/post tenant query-cost gain",
+            "objective": "bottom-up shared ACL merge by neighbor-limited exact pre/post tenant query-cost gain",
             "target_cluster_count": int(target_cluster_count),
             "target_cluster_count_enforced": False,
             "route_limit": int(route_limit),
@@ -926,14 +1022,18 @@ class HybridACLKMeansPlanner:
             "last_unit_cost": None,
             "last_adaptive_threshold": None,
             "candidate_evaluations": int(candidate_evaluations),
+            "active_heap_entries": int(len(candidate_heap)),
+            "edge_cache_size": 0,
+            "edge_cache_hits": 0,
+            "edge_cache_misses": 0,
             "initial_candidate_edges": int(initial_candidate_edges),
             "stale_candidates": int(stale_candidates),
-            "tenant_pattern_cap": None,
-            "capped_tenant_count": 0,
-            "skipped_pattern_memberships_by_cap": 0,
-            "neighbor_limit": None,
+            "tenant_pattern_cap": int(_SHARED_TENANT_PATTERN_CAP),
+            "capped_tenant_count": int(capped_tenant_count),
+            "skipped_pattern_memberships_by_cap": int(skipped_pattern_memberships_by_cap),
+            "neighbor_limit": int(_SHARED_MERGE_NEIGHBOR_LIMIT),
             "fallback_pool_limit": None,
-            "global_candidate_graph": True,
+            "global_candidate_graph": False,
             "cost_initial": float(initial_cost),
             "cost_final": float(current_cost),
             "total_cost_increase": float(total_cost_increase),
@@ -951,9 +1051,9 @@ class HybridACLKMeansPlanner:
             "max_group_tenants": int(max(group_tenant_counts)) if group_tenant_counts else 0,
             "min_group_patterns": int(min(group_pattern_counts)) if group_pattern_counts else 0,
             "max_group_patterns": int(max(group_pattern_counts)) if group_pattern_counts else 0,
-            "merge_score_rule": "choose global candidate with max total Gain=C_before-C_after; merge only when Gain>0",
+            "merge_score_rule": "choose best available neighbor candidate by total Gain=C_before-C_after; merge only when Gain>0",
             "route_startup_cost": float(route_startup_cost),
-            "candidate_rule": "global all-pair shared ACL group heap; after each merge refresh new group against every active group",
+            "candidate_rule": "tenant co-access neighbor heap capped by neighbor_limit; after each merge refresh only positive-overlap neighbors of the new group",
         }
         return assignments
 
@@ -969,35 +1069,66 @@ class HybridACLKMeansPlanner:
         shared_vector_count: int,
         ef_search: int,
         show_progress: bool,
+        private_edge_top_d: int = 32,
+    ) -> dict[int, int]:
+        return self._cluster_private_tenants_by_core_star_v16(
+            patterns,
+            tenant_ids=tenant_ids,
+            cluster_count=int(cluster_count),
+            replication_budget_ratio=float(replication_budget_ratio),
+            tenant_query_weights=tenant_query_weights,
+            total_original_vectors=int(total_original_vectors),
+            shared_vector_count=int(shared_vector_count),
+            ef_search=int(ef_search),
+            show_progress=bool(show_progress),
+            private_edge_top_d=int(private_edge_top_d),
+        )
+
+    def _cluster_private_tenants_by_core_star_v16(
+        self,
+        patterns: list[ACLPattern],
+        *,
+        tenant_ids: tuple[int, ...],
+        cluster_count: int,
+        replication_budget_ratio: float,
+        tenant_query_weights: dict[int, float],
+        total_original_vectors: int,
+        shared_vector_count: int,
+        ef_search: int,
+        show_progress: bool,
+        private_edge_top_d: int = 32,
     ) -> dict[int, int]:
         tenant_ids = tuple(sorted(int(tenant_id) for tenant_id in tenant_ids))
+        tenant_set = set(int(tenant_id) for tenant_id in tenant_ids)
         tenant_count = int(len(tenant_ids))
+        top_d = max(1, int(private_edge_top_d))
+        self._last_private_groups = []
         if tenant_count == 0:
-            self._last_private_metadata = {"enabled": False, "reason": "empty_tenant_input"}
+            self._last_private_metadata = {"enabled": False, "reason": "empty_tenant_input", "planner": "private_core_star_split_merge_v16"}
             return {}
 
         target_cluster_count = max(1, min(int(cluster_count), tenant_count))
-        pattern_weights = {int(pattern.pattern_id): int(pattern.vector_count) for pattern in patterns}
-        tenant_patterns: dict[int, set[int]] = {int(tenant_id): set() for tenant_id in tenant_ids}
+        pattern_weights = {int(pattern.pattern_id): max(0, int(pattern.vector_count)) for pattern in patterns}
+        tenant_bit_index = {int(tenant_id): index for index, tenant_id in enumerate(tenant_ids)}
+        pattern_tenant_masks: dict[int, int] = {}
         for pattern in patterns:
-            pattern_id = int(pattern.pattern_id)
+            tenant_mask = 0
             for tenant_id in pattern.tenant_ids:
-                tenant_id = int(tenant_id)
-                if tenant_id in tenant_patterns:
-                    tenant_patterns[tenant_id].add(pattern_id)
-
-        tenant_private_vectors = {
-            int(tenant_id): int(sum(pattern_weights.get(pattern_id, 0) for pattern_id in pattern_ids))
-            for tenant_id, pattern_ids in tenant_patterns.items()
-        }
-        private_unique_vectors = int(sum(pattern_weights.values()))
+                tenant_index = tenant_bit_index.get(int(tenant_id))
+                if tenant_index is not None:
+                    tenant_mask |= int(1 << int(tenant_index))
+            pattern_tenant_masks[int(pattern.pattern_id)] = int(tenant_mask)
+        private_unique_vectors = int(sum(int(value) for value in pattern_weights.values()))
         if private_unique_vectors <= 0:
             self._last_private_metadata = {
                 "enabled": False,
                 "reason": "no_private_patterns",
+                "planner": "private_core_star_split_merge_v16",
                 "target_cluster_count": int(target_cluster_count),
                 "private_unique_vectors": 0,
+                "private_edge_top_d": int(top_d),
             }
+            self._last_private_groups = []
             return {int(tenant_id): 0 for tenant_id in tenant_ids}
 
         allowed_total_storage = int(
@@ -1007,64 +1138,267 @@ class HybridACLKMeansPlanner:
             int(private_unique_vectors),
             int(allowed_total_storage) - int(shared_vector_count),
         )
+        base_all_private_storage_for_patterns = int(
+            sum(int(pattern_weights.get(int(pattern.pattern_id), 0)) * len(pattern.tenant_ids) for pattern in patterns)
+        )
+        shared_adjusted_private_budget = int(allowed_private_storage)
 
-        def vector_count(pattern_ids: set[int] | frozenset[int]) -> int:
-            return int(sum(pattern_weights.get(int(pattern_id), 0) for pattern_id in pattern_ids))
+        ordered_pattern_ids = tuple(sorted(int(pattern_id) for pattern_id in pattern_weights))
+        pattern_bit_index = {int(pattern_id): index for index, pattern_id in enumerate(ordered_pattern_ids)}
+        bit_index_pattern_ids = {index: int(pattern_id) for pattern_id, index in pattern_bit_index.items()}
+        bit_index_weights = tuple(int(pattern_weights[int(pattern_id)]) for pattern_id in ordered_pattern_ids)
+        single_pattern_bits = {int(pattern_id): int(1 << index) for pattern_id, index in pattern_bit_index.items()}
+        bit_weight_cache: dict[int, int] = {0: 0}
 
-        def group_cost_for(tenant_values: set[int] | frozenset[int], partition_vectors: int) -> float:
+        def pattern_bits_for(pattern_ids: set[int] | frozenset[int] | tuple[int, ...] | list[int]) -> int:
+            bits = 0
+            for pattern_id in pattern_ids:
+                bits |= int(single_pattern_bits.get(int(pattern_id), 0))
+            return int(bits)
+
+        def pattern_ids_from_bits(pattern_bits: int) -> set[int]:
+            bits = int(pattern_bits)
+            result: set[int] = set()
+            while bits:
+                lowest_bit = bits & -bits
+                index = int(lowest_bit.bit_length() - 1)
+                result.add(int(bit_index_pattern_ids[int(index)]))
+                bits ^= lowest_bit
+            return result
+
+        def vector_count_bits(pattern_bits: int) -> int:
+            bits = int(pattern_bits)
+            cached = bit_weight_cache.get(bits)
+            if cached is not None:
+                return int(cached)
+            original_bits = bits
+            total = 0
+            while bits:
+                lowest_bit = bits & -bits
+                index = int(lowest_bit.bit_length() - 1)
+                total += int(bit_index_weights[int(index)])
+                bits ^= lowest_bit
+            bit_weight_cache[int(original_bits)] = int(total)
+            return int(total)
+
+        def bit_count(value: int) -> int:
+            return int(int(value).bit_count())
+
+        def normalize_tenant_bits(tenant_bits: dict[int, int]) -> dict[int, int]:
+            return {int(tenant_id): int(bits) for tenant_id, bits in tenant_bits.items() if int(bits) != 0}
+
+        def data_bits_from_tenant_bits(tenant_bits: dict[int, int]) -> int:
+            bits = 0
+            for value in tenant_bits.values():
+                bits |= int(value)
+            return int(bits)
+
+        def tenant_access_from_bits(tenant_bits: dict[int, int], data_bits: int | None = None) -> dict[int, int]:
+            mask = None if data_bits is None else int(data_bits)
+            result: dict[int, int] = {}
+            for tenant_id, bits in tenant_bits.items():
+                kept = int(bits) if mask is None else int(bits) & int(mask)
+                if kept:
+                    access = int(vector_count_bits(kept))
+                    if access > 0:
+                        result[int(tenant_id)] = int(access)
+            return result
+
+        def group_cost_from_access(tenant_access: dict[int, int], partition_vectors: int) -> float:
             partition_vectors = int(partition_vectors)
             if partition_vectors <= 0:
                 return 0.0
-            cost = 0.0
-            for tenant_id in tenant_values:
-                tenant_id = int(tenant_id)
-                accessible_vectors = int(tenant_private_vectors.get(tenant_id, 0))
-                cost += self._partition_query_cost(
-                    partition_vectors=partition_vectors,
-                    accessible_vectors=accessible_vectors,
-                    tenant_weight=float(tenant_query_weights.get(tenant_id, 0.0)),
+            total = 0.0
+            for tenant_id, accessible_vectors in tenant_access.items():
+                accessible_vectors = int(accessible_vectors)
+                if accessible_vectors <= 0:
+                    continue
+                total += self._partition_query_cost(
+                    partition_vectors=int(partition_vectors),
+                    accessible_vectors=int(accessible_vectors),
+                    tenant_weight=float(tenant_query_weights.get(int(tenant_id), 1.0)),
                     total_vectors=int(total_original_vectors),
                     ef_search=int(ef_search),
                 )
-            return float(cost)
+            return float(total)
 
-        def make_group(group_id: int, tenant_values: set[int], pattern_ids: set[int]) -> dict[str, object]:
-            group_vectors = int(vector_count(pattern_ids))
+        def tenant_bits_to_pattern_map(tenant_bits: dict[int, int]) -> dict[int, set[int]]:
+            result: dict[int, set[int]] = {}
+            for tenant_id, bits in normalize_tenant_bits(tenant_bits).items():
+                pattern_ids = pattern_ids_from_bits(int(bits))
+                if pattern_ids:
+                    result[int(tenant_id)] = pattern_ids
+            return result
+
+        def make_group_from_bits(
+            group_id: int,
+            tenant_bits: dict[int, int],
+            *,
+            stored_bits: int | None = None,
+            version: int = 0,
+        ) -> dict[str, object]:
+            service_bits = normalize_tenant_bits(tenant_bits)
+            service_data_bits = int(data_bits_from_tenant_bits(service_bits)) if service_bits else 0
+            data_bits = int(service_data_bits) if stored_bits is None else int(stored_bits)
+            # The physical ACLs in a private partition and the tenants routed to
+            # that partition are separate concepts. Cost and route generation use
+            # service_bits only; data_bits is the physical storage used by memory
+            # accounting and graph overlap.
+            data_bits &= int(service_data_bits)
+            tenant_access = tenant_access_from_bits(service_bits, data_bits)
+            vectors = int(vector_count_bits(data_bits))
             return {
                 "group_id": int(group_id),
-                "tenant_ids": set(int(tenant_id) for tenant_id in tenant_values),
-                "pattern_ids": set(int(pattern_id) for pattern_id in pattern_ids),
-                "vector_count": int(group_vectors),
-                "cost": float(group_cost_for(set(int(tenant_id) for tenant_id in tenant_values), int(group_vectors))),
-                "version": 0,
+                "pattern_ids": pattern_ids_from_bits(data_bits),
+                "pattern_bits": int(data_bits),
+                "tenant_patterns": tenant_bits_to_pattern_map(service_bits),
+                "service_tenant_patterns": tenant_bits_to_pattern_map(service_bits),
+                "tenant_pattern_bits": service_bits,
+                "service_tenant_pattern_bits": service_bits,
+                "tenant_access": tenant_access,
+                "vector_count": int(vectors),
+                "cost": float(group_cost_from_access(tenant_access, int(vectors))),
+                "version": int(version),
             }
 
-        def shared_weight(left: dict[str, object], right: dict[str, object]) -> int:
-            left_patterns = left["pattern_ids"]  # type: ignore[assignment]
-            right_patterns = right["pattern_ids"]  # type: ignore[assignment]
-            if len(left_patterns) > len(right_patterns):
-                left_patterns, right_patterns = right_patterns, left_patterns
-            return int(sum(pattern_weights.get(int(pattern_id), 0) for pattern_id in left_patterns if pattern_id in right_patterns))
+        def is_live_group(group: dict[str, object]) -> bool:
+            service_bits = group.get("service_tenant_pattern_bits", group.get("tenant_pattern_bits"))
+            return bool(int(group.get("vector_count", 0)) > 0 and service_bits)
 
-        def merged_group(next_group_id: int, left: dict[str, object], right: dict[str, object]) -> dict[str, object]:
-            left_tenants = left["tenant_ids"]  # type: ignore[assignment]
-            right_tenants = right["tenant_ids"]  # type: ignore[assignment]
-            left_patterns = left["pattern_ids"]  # type: ignore[assignment]
-            right_patterns = right["pattern_ids"]  # type: ignore[assignment]
-            return make_group(
-                int(next_group_id),
-                set(left_tenants) | set(right_tenants),
-                set(left_patterns) | set(right_patterns),
-            )
+        def group_tenant_bits(group: dict[str, object]) -> dict[int, int]:
+            return dict(group.get("service_tenant_pattern_bits", group.get("tenant_pattern_bits", {})) or {})  # type: ignore[arg-type]
+
+        def group_pattern_bits(group: dict[str, object]) -> int:
+            return int(group.get("pattern_bits", 0))
+
+        def union_tenant_bits(*maps: dict[int, int]) -> dict[int, int]:
+            result: dict[int, int] = {}
+            for mapping in maps:
+                for tenant_id, bits in mapping.items():
+                    bits = int(bits)
+                    if bits:
+                        result[int(tenant_id)] = int(result.get(int(tenant_id), 0)) | bits
+            return normalize_tenant_bits(result)
+
+        def remove_bits_from_tenants(tenant_bits: dict[int, int], removed_bits: int) -> dict[int, int]:
+            removed_bits = int(removed_bits)
+            result: dict[int, int] = {}
+            for tenant_id, bits in tenant_bits.items():
+                kept = int(bits) & ~removed_bits
+                if kept:
+                    result[int(tenant_id)] = int(kept)
+            return result
+
+        def mask_tenant_bits(tenant_bits: dict[int, int], mask_bits: int) -> dict[int, int]:
+            mask_bits = int(mask_bits)
+            if mask_bits == 0:
+                return {}
+            result: dict[int, int] = {}
+            for tenant_id, bits in tenant_bits.items():
+                kept = int(bits) & mask_bits
+                if kept:
+                    result[int(tenant_id)] = int(kept)
+            return result
+
+        def normalize_spec(spec: tuple[dict[int, int], int | None]) -> tuple[dict[int, int], int]:
+            tenant_bits, stored_bits = spec
+            normalized = normalize_tenant_bits(tenant_bits)
+            data_bits = int(data_bits_from_tenant_bits(normalized)) if stored_bits is None else int(stored_bits)
+            data_bits &= int(data_bits_from_tenant_bits(normalized)) if normalized else 0
+            return normalized, int(data_bits)
+
+        def specs_cost_memory(specs: list[tuple[dict[int, int], int | None]]) -> tuple[float, int, int, int]:
+            after_cost = 0.0
+            after_memory = 0
+            max_partition_size = 0
+            live_count = 0
+            for spec in specs:
+                normalized, data_bits = normalize_spec(spec)
+                if not normalized or data_bits == 0:
+                    continue
+                vectors = int(vector_count_bits(data_bits))
+                if vectors <= 0:
+                    continue
+                tenant_access = tenant_access_from_bits(normalized, data_bits)
+                if not tenant_access:
+                    continue
+                after_memory += int(vectors)
+                after_cost += float(group_cost_from_access(tenant_access, int(vectors)))
+                max_partition_size = max(int(max_partition_size), int(vectors))
+                live_count += 1
+            return float(after_cost), int(after_memory), int(max_partition_size), int(live_count)
+
+        def operation_specs(left: dict[str, object], right: dict[str, object], operation: str) -> list[tuple[dict[int, int], int | None]]:
+            left_bits = group_tenant_bits(left)
+            right_bits = group_tenant_bits(right)
+            left_stored_bits = int(group_pattern_bits(left))
+            right_stored_bits = int(group_pattern_bits(right))
+            raw_overlap_bits = int(left_stored_bits & right_stored_bits)
+            overlap_bits = int(raw_overlap_bits)
+            if overlap_bits == 0:
+                return []
+            if operation == "full":
+                merged_bits = union_tenant_bits(left_bits, right_bits)
+                return [(merged_bits, int(left_stored_bits | right_stored_bits))]
+            if operation == "move_left":
+                moved = mask_tenant_bits(left_bits, overlap_bits)
+                new_left = remove_bits_from_tenants(left_bits, overlap_bits)
+                new_right = union_tenant_bits(right_bits, moved)
+                return [(new_left, int(left_stored_bits & ~overlap_bits)), (new_right, int(right_stored_bits))]
+            if operation == "move_right":
+                moved = mask_tenant_bits(right_bits, overlap_bits)
+                new_left = union_tenant_bits(left_bits, moved)
+                new_right = remove_bits_from_tenants(right_bits, overlap_bits)
+                return [(new_left, int(left_stored_bits)), (new_right, int(right_stored_bits & ~overlap_bits))]
+            if operation == "split_overlap":
+                left_remain = remove_bits_from_tenants(left_bits, overlap_bits)
+                overlap = union_tenant_bits(mask_tenant_bits(left_bits, overlap_bits), mask_tenant_bits(right_bits, overlap_bits))
+                right_remain = remove_bits_from_tenants(right_bits, overlap_bits)
+                return [
+                    (left_remain, int(left_stored_bits & ~overlap_bits)),
+                    (overlap, int(overlap_bits)),
+                    (right_remain, int(right_stored_bits & ~overlap_bits)),
+                ]
+            raise ValueError(f"Unknown private core-star operation: {operation}")
+
+        operation_rank = {
+            "split_overlap": 0,
+            "move_left": 1,
+            "move_right": 2,
+            "full": 3,
+        }
+        operations = ("full", "move_left", "move_right", "split_overlap")
+
+        tenant_pattern_bits: dict[int, int] = {int(tenant_id): 0 for tenant_id in tenant_ids}
+        for pattern in sorted(patterns, key=lambda item: int(item.pattern_id)):
+            pattern_id = int(pattern.pattern_id)
+            if int(pattern_weights.get(pattern_id, 0)) <= 0:
+                continue
+            bit = int(single_pattern_bits.get(pattern_id, 0))
+            if bit == 0:
+                continue
+            for tenant_id in pattern.tenant_ids:
+                tenant_id = int(tenant_id)
+                if tenant_id in tenant_set:
+                    tenant_pattern_bits[int(tenant_id)] = int(tenant_pattern_bits.get(int(tenant_id), 0)) | int(bit)
 
         groups: dict[int, dict[str, object]] = {}
-        initial_group_id_by_tenant: dict[int, int] = {}
-        for index, tenant_id in enumerate(tenant_ids):
-            group_id = int(index)
-            tenant_id = int(tenant_id)
-            initial_group_id_by_tenant[tenant_id] = group_id
-            groups[group_id] = make_group(group_id, {tenant_id}, set(tenant_patterns.get(tenant_id, set())))
-        next_group_id = int(len(groups))
+        next_group_id = 0
+        for tenant_id in tenant_ids:
+            bits = int(tenant_pattern_bits.get(int(tenant_id), 0))
+            if bits == 0:
+                continue
+            group = make_group_from_bits(int(next_group_id), {int(tenant_id): int(bits)})
+            if is_live_group(group):
+                groups[int(next_group_id)] = group
+                next_group_id += 1
+        initial_group_count = int(len(groups))
+
+        if not groups:
+            self._last_private_metadata = {"enabled": False, "reason": "empty_private_groups", "planner": "private_core_star_split_merge_v16"}
+            self._last_private_groups = []
+            return {int(tenant_id): 0 for tenant_id in tenant_ids}
+
         private_current_storage = int(sum(int(group["vector_count"]) for group in groups.values()))
         total_current_storage = int(shared_vector_count) + int(private_current_storage)
         initial_private_storage = int(private_current_storage)
@@ -1072,239 +1406,696 @@ class HybridACLKMeansPlanner:
         initial_cost = float(sum(float(group["cost"]) for group in groups.values()))
         current_cost = float(initial_cost)
 
-        def should_continue() -> bool:
-            return bool(
-                len(groups) > int(target_cluster_count)
-                or int(private_current_storage) > int(allowed_private_storage)
-            )
-
-        candidate_heap: list[tuple[float, float, int, int, int, int, int, int]] = []
+        pattern_group_ids: dict[int, set[int]] = defaultdict(set)
+        pattern_star_edges: dict[int, dict[tuple[int, int], float]] = defaultdict(dict)
+        edge_refcounts: Counter = Counter()
+        edge_signal_scores: dict[tuple[int, int], float] = defaultdict(float)
+        adjacency: dict[int, set[int]] = defaultdict(set)
+        candidate_heap: list[tuple[object, ...]] = []
+        edge_heap_tokens: dict[tuple[int, int], int] = {}
+        edge_candidate_cache: dict[tuple[int, int, int, int], dict[str, object] | None] = {}
+        edge_candidate_cache_groups: dict[int, set[tuple[int, int, int, int]]] = defaultdict(set)
+        edge_cache_hits = 0
+        edge_cache_misses = 0
+        edge_cache_prune_count = 0
+        next_heap_token = 0
         candidate_evaluations = 0
         stale_candidates = 0
-        fallback_merge_count = 0
-        positive_merge_count = 0
-        zero_benefit_merge_count = 0
+        heap_push_count = 0
+        heap_rebuild_count = 0
+        graph_rebuild_count = 0
+        operation_counts: Counter = Counter()
+        initial_candidate_edges = 0
+        refreshed_edge_count = 0
+        incremental_group_refresh_count = 0
+        incremental_pattern_refresh_count = 0
+        incremental_edge_add_count = 0
+        incremental_edge_remove_count = 0
+        rejected_no_overlap_candidates = 0
+        rejected_no_saving_candidates = 0
         total_storage_reduction = 0
-        total_cost_increase = 0.0
+        total_latency_delta = 0.0
+        last_operation = None
+        last_candidate_score = None
+        last_candidate_delta_latency = None
+        last_candidate_memory_saved = None
 
-        def push_candidate(left_id: int, right_id: int, precomputed_benefit: Optional[int] = None) -> None:
-            nonlocal candidate_evaluations
+        def edge_key(left_id: int, right_id: int) -> tuple[int, int]:
+            left_id = int(left_id)
+            right_id = int(right_id)
+            return (left_id, right_id) if left_id < right_id else (right_id, left_id)
+
+        def register_group(group_id: int) -> None:
+            group = groups.get(int(group_id))
+            if group is None:
+                return
+            for pattern_id in group.get("pattern_ids", set()):  # type: ignore[union-attr]
+                pattern_group_ids[int(pattern_id)].add(int(group_id))
+
+        def unregister_group(group_id: int) -> None:
+            group = groups.get(int(group_id))
+            if group is None:
+                return
+            for pattern_id in group.get("pattern_ids", set()):  # type: ignore[union-attr]
+                owners = pattern_group_ids.get(int(pattern_id))
+                if owners is not None:
+                    owners.discard(int(group_id))
+                    if not owners:
+                        pattern_group_ids.pop(int(pattern_id), None)
+
+        def choose_core_group(owner_ids: set[int]) -> int | None:
+            live_owner_ids = [int(group_id) for group_id in owner_ids if int(group_id) in groups]
+            if not live_owner_ids:
+                return None
+            return min(
+                live_owner_ids,
+                key=lambda group_id: (
+                    int(groups[int(group_id)]["vector_count"]),
+                    int(bit_count(group_pattern_bits(groups[int(group_id)]))),
+                    int(len(group_tenant_bits(groups[int(group_id)]))),
+                    int(group_id),
+                ),
+            )
+
+        def compute_pattern_star_edges(pattern_id: int) -> dict[tuple[int, int], float]:
+            pattern_id = int(pattern_id)
+            owners = {int(group_id) for group_id in pattern_group_ids.get(pattern_id, set()) if int(group_id) in groups}
+            if len(owners) <= 1:
+                return {}
+            core_id = choose_core_group(owners)
+            if core_id is None:
+                return {}
+            signal = float(pattern_weights.get(pattern_id, 0)) / float(max(1, int(len(owners)) - 1))
+            if signal <= 0.0:
+                return {}
+            return {
+                edge_key(int(core_id), int(owner_id)): float(signal)
+                for owner_id in sorted(owners)
+                if int(owner_id) != int(core_id)
+            }
+
+        def store_edge_candidate_cache(cache_key: tuple[int, int, int, int], value: dict[str, object] | None) -> None:
+            edge_candidate_cache[cache_key] = None if value is None else dict(value)
+            edge_candidate_cache_groups[int(cache_key[0])].add(cache_key)
+            edge_candidate_cache_groups[int(cache_key[2])].add(cache_key)
+
+        def prune_edge_candidate_cache(group_ids: set[int]) -> int:
+            nonlocal edge_cache_prune_count
+            normalized_group_ids = {int(group_id) for group_id in group_ids}
+            if not normalized_group_ids:
+                return 0
+            removed = 0
+            for group_id in sorted(normalized_group_ids):
+                cache_keys = edge_candidate_cache_groups.pop(int(group_id), set())
+                for cache_key in list(cache_keys):
+                    if cache_key in edge_candidate_cache:
+                        edge_candidate_cache.pop(cache_key, None)
+                        removed += 1
+                    other_group_id = int(cache_key[2]) if int(cache_key[0]) == int(group_id) else int(cache_key[0])
+                    other_keys = edge_candidate_cache_groups.get(int(other_group_id))
+                    if other_keys is not None:
+                        other_keys.discard(cache_key)
+                        if not other_keys:
+                            edge_candidate_cache_groups.pop(int(other_group_id), None)
+            edge_cache_prune_count += int(removed)
+            return int(removed)
+
+        def add_edge_reference(edge: tuple[int, int], signal: float, *, push: bool = True) -> bool:
+            edge = edge_key(int(edge[0]), int(edge[1]))
+            if edge[0] == edge[1] or edge[0] not in groups or edge[1] not in groups:
+                return False
+            was_inactive = int(edge_refcounts.get(edge, 0)) <= 0
+            edge_refcounts[edge] += 1
+            edge_signal_scores[edge] = float(edge_signal_scores.get(edge, 0.0)) + float(signal)
+            if was_inactive:
+                adjacency[edge[0]].add(edge[1])
+                adjacency[edge[1]].add(edge[0])
+                if push:
+                    push_candidate(edge[0], edge[1])
+                return True
+            if push and edge not in edge_heap_tokens:
+                push_candidate(edge[0], edge[1])
+            return False
+
+        def remove_edge_reference(edge: tuple[int, int], signal: float) -> bool:
+            edge = edge_key(int(edge[0]), int(edge[1]))
+            current = int(edge_refcounts.get(edge, 0))
+            if current <= 0:
+                edge_refcounts.pop(edge, None)
+                edge_signal_scores.pop(edge, None)
+                return False
+            if current <= 1:
+                edge_refcounts.pop(edge, None)
+                edge_signal_scores.pop(edge, None)
+                adjacency[edge[0]].discard(edge[1])
+                adjacency[edge[1]].discard(edge[0])
+                edge_heap_tokens.pop(edge, None)
+                return True
+            edge_refcounts[edge] = current - 1
+            edge_signal_scores[edge] = max(0.0, float(edge_signal_scores.get(edge, 0.0)) - float(signal))
+            return False
+
+        def refresh_star_edges_for_patterns(
+            pattern_ids: set[int],
+            *,
+            push: bool = True,
+            focus_group_ids: set[int] | None = None,
+        ) -> tuple[int, int, int]:
+            nonlocal incremental_pattern_refresh_count, incremental_edge_add_count, incremental_edge_remove_count
+            normalized_pattern_ids = {int(pattern_id) for pattern_id in pattern_ids}
+            if not normalized_pattern_ids:
+                return 0, 0, 0
+            focus_ids = {int(group_id) for group_id in (focus_group_ids or set()) if int(group_id) in groups}
+
+            all_new_edges_by_pattern: dict[int, dict[tuple[int, int], float]] = {}
+            edge_scores: dict[tuple[int, int], float] = defaultdict(float)
+            target_group_ids: set[int] = set()
+            for pattern_id in sorted(normalized_pattern_ids):
+                new_edges = compute_pattern_star_edges(int(pattern_id))
+                all_new_edges_by_pattern[int(pattern_id)] = new_edges
+                for edge, signal in new_edges.items():
+                    if edge[0] not in groups or edge[1] not in groups:
+                        continue
+                    edge_scores[edge] += float(signal)
+                    target_group_ids.add(int(edge[0]))
+                    target_group_ids.add(int(edge[1]))
+                for edge in pattern_star_edges.get(int(pattern_id), {}):
+                    target_group_ids.add(int(edge[0]))
+                    target_group_ids.add(int(edge[1]))
+
+            if focus_ids:
+                target_group_ids = set(focus_ids)
+
+            incident_edges_by_group: dict[int, list[tuple[float, tuple[int, int]]]] = defaultdict(list)
+            for edge, score in edge_scores.items():
+                if edge[0] not in groups or edge[1] not in groups:
+                    continue
+                incident_edges_by_group[int(edge[0])].append((float(score), edge))
+                incident_edges_by_group[int(edge[1])].append((float(score), edge))
+
+            selected_edges: set[tuple[int, int]] = set()
+            for group_id in sorted(group_id for group_id in target_group_ids if int(group_id) in groups):
+                incident_edges = incident_edges_by_group.get(int(group_id), [])
+                incident_edges.sort(key=lambda item: (-float(item[0]), int(item[1][0]), int(item[1][1])))
+                for _score, edge in incident_edges[: int(top_d)]:
+                    selected_edges.add(edge)
+
+            refreshed_patterns = 0
+            added_edges = 0
+            removed_edges = 0
+            for pattern_id in sorted(normalized_pattern_ids):
+                old_edges = dict(pattern_star_edges.get(int(pattern_id), {}))
+                new_edges = {
+                    edge: float(signal)
+                    for edge, signal in all_new_edges_by_pattern.get(int(pattern_id), {}).items()
+                    if edge in selected_edges
+                }
+                if focus_ids:
+                    preserved_edges = {
+                        edge: float(signal)
+                        for edge, signal in old_edges.items()
+                        if edge[0] in groups
+                        and edge[1] in groups
+                        and edge[0] not in focus_ids
+                        and edge[1] not in focus_ids
+                    }
+                    preserved_edges.update(new_edges)
+                    new_edges = preserved_edges
+                if old_edges == new_edges:
+                    continue
+                refreshed_patterns += 1
+                for edge, signal in old_edges.items():
+                    if edge not in new_edges:
+                        if remove_edge_reference(edge, float(signal)):
+                            removed_edges += 1
+                for edge, signal in new_edges.items():
+                    if edge not in old_edges:
+                        if add_edge_reference(edge, float(signal), push=push):
+                            added_edges += 1
+                    else:
+                        old_signal = float(old_edges.get(edge, 0.0))
+                        if abs(float(signal) - old_signal) > 1e-12:
+                            edge_signal_scores[edge] = max(
+                                0.0,
+                                float(edge_signal_scores.get(edge, 0.0)) - old_signal + float(signal),
+                            )
+                if new_edges:
+                    pattern_star_edges[int(pattern_id)] = dict(new_edges)
+                else:
+                    pattern_star_edges.pop(int(pattern_id), None)
+
+            incremental_pattern_refresh_count += int(refreshed_patterns)
+            incremental_edge_add_count += int(added_edges)
+            incremental_edge_remove_count += int(removed_edges)
+            return int(refreshed_patterns), int(added_edges), int(removed_edges)
+
+        def candidate_for_edge(left_id: int, right_id: int, *, include_specs: bool = False) -> dict[str, object] | None:
+            nonlocal candidate_evaluations, edge_cache_hits, edge_cache_misses, rejected_no_overlap_candidates, rejected_no_saving_candidates
             left_id = int(left_id)
             right_id = int(right_id)
             if left_id == right_id or left_id not in groups or right_id not in groups:
-                return
+                return None
             if left_id > right_id:
                 left_id, right_id = right_id, left_id
             left = groups[left_id]
             right = groups[right_id]
-            benefit = int(precomputed_benefit) if precomputed_benefit is not None else int(shared_weight(left, right))
-            if benefit <= 0:
-                return
-            merged_vectors = int(left["vector_count"]) + int(right["vector_count"]) - int(benefit)
-            left_tenants = left["tenant_ids"]  # type: ignore[assignment]
-            right_tenants = right["tenant_ids"]  # type: ignore[assignment]
-            merged_tenants = set(left_tenants) | set(right_tenants)
-            merged_cost_value = float(group_cost_for(merged_tenants, int(merged_vectors)))
-            cost_increase = float(merged_cost_value - float(left["cost"]) - float(right["cost"]))
-            unit_cost = float(cost_increase / float(max(1, benefit)))
+            cache_key = (int(left_id), int(left["version"]), int(right_id), int(right["version"]))
+            cached = edge_candidate_cache.get(cache_key, "__missing__")
+            if cached != "__missing__":
+                edge_cache_hits += 1
+                if cached is None:
+                    return None
+                candidate = dict(cached)
+                if include_specs:
+                    specs = operation_specs(left, right, str(candidate["operation"]))
+                    if not specs:
+                        return None
+                    candidate["result_specs"] = specs
+                return candidate
+
+            edge_cache_misses += 1
             candidate_evaluations += 1
+            overlap_bits = int(group_pattern_bits(left) & group_pattern_bits(right))
+            if overlap_bits == 0:
+                rejected_no_overlap_candidates += 1
+                store_edge_candidate_cache(cache_key, None)
+                return None
+            before_cost = float(left["cost"]) + float(right["cost"])
+            before_memory = int(left["vector_count"]) + int(right["vector_count"])
+            best: tuple[tuple[float, int, int], str, float, int, int, list[tuple[dict[int, int], int | None]]] | None = None
+            for operation in operations:
+                specs = operation_specs(left, right, str(operation))
+                if not specs:
+                    continue
+                after_cost, after_memory, max_partition_size, live_count = specs_cost_memory(specs)
+                if int(live_count) <= 0:
+                    continue
+                memory_saved = int(before_memory) - int(after_memory)
+                if int(memory_saved) <= 0:
+                    rejected_no_saving_candidates += 1
+                    continue
+                delta_latency = float(after_cost) - float(before_cost)
+                op_rank = int(operation_rank[str(operation)])
+                rank = (float(delta_latency), int(max_partition_size), int(op_rank))
+                if best is None or rank < best[0]:
+                    best = (rank, str(operation), float(delta_latency), int(memory_saved), int(max_partition_size), specs)
+            if best is None:
+                store_edge_candidate_cache(cache_key, None)
+                return None
+            _rank, operation, delta_latency, memory_saved, max_partition_size, _specs = best
+            score_memory_gain = float(max(1, int(memory_saved)))
+            score_memory_m0 = 0.0
+            unit_latency_cost = float(delta_latency) / max(float(score_memory_gain), 1e-12)
+            candidate: dict[str, object] = {
+                "left_id": int(left_id),
+                "right_id": int(right_id),
+                "operation": str(operation),
+                "score": -float(unit_latency_cost),
+                "unit_latency_cost": float(unit_latency_cost),
+                "delta_latency": float(delta_latency),
+                "memory_saved": int(memory_saved),
+                "score_memory_gain": float(score_memory_gain),
+                "score_memory_m0": float(score_memory_m0),
+                "before_cost": float(before_cost),
+                "before_memory": int(before_memory),
+                "max_result_partition_size": int(max_partition_size),
+                "left_version": int(left["version"]),
+                "right_version": int(right["version"]),
+            }
+            store_edge_candidate_cache(cache_key, candidate)
+            if include_specs:
+                specs = operation_specs(left, right, str(operation))
+                if not specs:
+                    return None
+                candidate["result_specs"] = specs
+            return candidate
+
+        def push_candidate(left_id: int, right_id: int) -> bool:
+            nonlocal next_heap_token, heap_push_count
+            left_id = int(left_id)
+            right_id = int(right_id)
+            if left_id == right_id or left_id not in groups or right_id not in groups:
+                return False
+            edge = edge_key(left_id, right_id)
+            candidate = candidate_for_edge(edge[0], edge[1], include_specs=False)
+            if candidate is None:
+                return False
+            next_heap_token += 1
+            edge_heap_tokens[edge] = int(next_heap_token)
+            heap_push_count += 1
             heapq.heappush(
                 candidate_heap,
                 (
-                    float(unit_cost),
-                    float(cost_increase),
-                    -int(benefit),
-                    int(merged_vectors),
-                    int(left_id),
-                    int(right_id),
-                    int(left["version"]),
-                    int(right["version"]),
+                    float(candidate["unit_latency_cost"]),
+                    float(candidate["delta_latency"]),
+                    int(candidate["max_result_partition_size"]),
+                    -int(candidate["memory_saved"]),
+                    int(operation_rank[str(candidate["operation"])]),
+                    int(edge[0]),
+                    int(edge[1]),
+                    int(candidate["left_version"]),
+                    int(candidate["right_version"]),
+                    str(candidate["operation"]),
+                    int(next_heap_token),
                 ),
             )
+            return True
 
-        initial_pair_weights: dict[int, Counter] = defaultdict(Counter)
-        for pattern in patterns:
-            weight = int(pattern_weights.get(int(pattern.pattern_id), 0))
-            if weight <= 0:
-                continue
-            active_tenants = sorted(int(tenant_id) for tenant_id in pattern.tenant_ids if int(tenant_id) in initial_group_id_by_tenant)
-            for index, left_tenant in enumerate(active_tenants):
-                left_group_id = int(initial_group_id_by_tenant[int(left_tenant)])
-                for right_tenant in active_tenants[index + 1:]:
-                    right_group_id = int(initial_group_id_by_tenant[int(right_tenant)])
-                    initial_pair_weights[left_group_id][right_group_id] += int(weight)
-                    initial_pair_weights[right_group_id][left_group_id] += int(weight)
+        def add_edge(left_id: int, right_id: int, *, push: bool = True) -> bool:
+            edge = edge_key(int(left_id), int(right_id))
+            return bool(add_edge_reference(edge, 0.0, push=push))
 
-        initial_candidate_edges: set[tuple[int, int]] = set()
-        for left_id, neighbor_weights in initial_pair_weights.items():
-            for right_id, _weight in neighbor_weights.most_common(int(_PRIVATE_MERGE_NEIGHBOR_LIMIT)):
-                edge = (int(left_id), int(right_id)) if int(left_id) < int(right_id) else (int(right_id), int(left_id))
-                initial_candidate_edges.add(edge)
-        for left_id, right_id in sorted(initial_candidate_edges):
-            benefit = int(initial_pair_weights.get(int(left_id), {}).get(int(right_id), 0))
-            push_candidate(int(left_id), int(right_id), precomputed_benefit=int(benefit))
+        def remove_edge(left_id: int, right_id: int) -> None:
+            edge = edge_key(left_id, right_id)
+            adjacency[edge[0]].discard(edge[1])
+            adjacency[edge[1]].discard(edge[0])
+            edge_heap_tokens.pop(edge, None)
+            edge_refcounts.pop(edge, None)
+            edge_signal_scores.pop(edge, None)
 
-        def pop_valid_candidate() -> tuple[int, int, int, float] | None:
+        def remove_group_edges(group_id: int) -> None:
+            group_id = int(group_id)
+            for neighbor_id in list(adjacency.get(group_id, set())):
+                remove_edge(group_id, int(neighbor_id))
+            adjacency.pop(group_id, None)
+
+        def rebuild_overlap_graph() -> int:
+            nonlocal graph_rebuild_count, stale_candidates
+            graph_rebuild_count += 1
+            stale_candidates = 0
+            adjacency.clear()
+            candidate_heap.clear()
+            edge_heap_tokens.clear()
+            edge_candidate_cache.clear()
+            edge_candidate_cache_groups.clear()
+            pattern_star_edges.clear()
+            edge_refcounts.clear()
+            edge_signal_scores.clear()
+            _refreshed, added_edges, _removed = refresh_star_edges_for_patterns(set(pattern_group_ids), push=True)
+            return int(added_edges)
+
+        def rebuild_candidate_heap() -> None:
+            nonlocal heap_rebuild_count, stale_candidates
+            heap_rebuild_count += 1
+            stale_candidates = 0
+            candidate_heap.clear()
+            edge_heap_tokens.clear()
+            for left_id in sorted(adjacency):
+                for right_id in sorted(adjacency.get(left_id, set())):
+                    if int(left_id) < int(right_id):
+                        push_candidate(int(left_id), int(right_id))
+
+        def refresh_neighbors_for_patterns(pattern_ids: set[int]) -> int:
+            _refreshed, added_edges, _removed = refresh_star_edges_for_patterns(pattern_ids, push=True)
+            return int(added_edges)
+
+        def refresh_neighbors_for_groups(group_ids: set[int]) -> int:
+            nonlocal incremental_group_refresh_count
+            normalized_group_ids = {int(group_id) for group_id in group_ids if int(group_id) in groups}
+            if not normalized_group_ids:
+                return 0
+            pattern_ids: set[int] = set()
+            for group_id in sorted(normalized_group_ids):
+                group = groups.get(int(group_id))
+                if group is None:
+                    continue
+                pattern_ids.update(int(pattern_id) for pattern_id in group.get("pattern_ids", set()))
+            incremental_group_refresh_count += int(len(normalized_group_ids))
+            _refreshed, added_edges, _removed = refresh_star_edges_for_patterns(
+                pattern_ids,
+                push=True,
+                focus_group_ids=normalized_group_ids,
+            )
+            return int(added_edges)
+
+        def pop_valid_candidate() -> dict[str, object] | None:
             nonlocal stale_candidates
             while candidate_heap:
-                unit_cost, cost_increase, negative_benefit, _merged_vectors, left_id, right_id, left_version, right_version = heapq.heappop(candidate_heap)
+                (
+                    _unit_latency_cost,
+                    _delta_latency,
+                    _max_partition_size,
+                    _negative_memory_saved,
+                    _operation_rank,
+                    left_id,
+                    right_id,
+                    left_version,
+                    right_version,
+                    _operation,
+                    heap_token,
+                ) = heapq.heappop(candidate_heap)
+                left_id = int(left_id)
+                right_id = int(right_id)
+                edge = edge_key(left_id, right_id)
+                if int(edge_heap_tokens.get(edge, -1)) != int(heap_token):
+                    stale_candidates += 1
+                    continue
                 if left_id not in groups or right_id not in groups:
                     stale_candidates += 1
                     continue
                 if int(groups[left_id]["version"]) != int(left_version) or int(groups[right_id]["version"]) != int(right_version):
                     stale_candidates += 1
                     continue
-                benefit = int(-negative_benefit)
-                if benefit <= 0:
+                if right_id not in adjacency.get(left_id, set()):
                     stale_candidates += 1
                     continue
-                return int(left_id), int(right_id), int(benefit), float(cost_increase)
+                candidate = candidate_for_edge(left_id, right_id, include_specs=True)
+                if candidate is None:
+                    stale_candidates += 1
+                    continue
+                return candidate
             return None
 
-        def fallback_candidate() -> tuple[int, int, int, float] | None:
-            active = sorted(
-                groups,
-                key=lambda group_id: (
-                    int(groups[int(group_id)]["vector_count"]),
-                    int(len(groups[int(group_id)]["tenant_ids"])),
-                    int(group_id),
-                ),
-            )[: max(2, min(int(_PRIVATE_FALLBACK_POOL_LIMIT), len(groups)))]
-            best = None
-            for index, left_id in enumerate(active):
-                for right_id in active[index + 1:]:
-                    left = groups[int(left_id)]
-                    right = groups[int(right_id)]
-                    benefit = int(shared_weight(left, right))
-                    merged_vectors = int(left["vector_count"]) + int(right["vector_count"]) - int(benefit)
-                    left_tenants = left["tenant_ids"]  # type: ignore[assignment]
-                    right_tenants = right["tenant_ids"]  # type: ignore[assignment]
-                    merged_tenants = set(left_tenants) | set(right_tenants)
-                    merged_cost_value = float(group_cost_for(merged_tenants, int(merged_vectors)))
-                    cost_increase = float(merged_cost_value - float(left["cost"]) - float(right["cost"]))
-                    rank = (
-                        float(cost_increase),
-                        int(merged_vectors),
-                        int(len(merged_tenants)),
-                        int(left_id),
-                        int(right_id),
-                    )
-                    if best is None or rank < best[0]:
-                        best = (rank, int(left_id), int(right_id), int(benefit), float(cost_increase))
-            if best is None:
-                return None
-            _rank, left_id, right_id, benefit, cost_increase = best
-            return int(left_id), int(right_id), int(benefit), float(cost_increase)
+        for group_id in sorted(groups):
+            register_group(int(group_id))
+        initial_candidate_edges = int(rebuild_overlap_graph())
 
         progress = tqdm(
-            total=max(0, tenant_count - target_cluster_count),
-            desc="Private cost merge",
-            unit="merge",
+            desc="Private core-star planner",
+            unit="op",
             leave=False,
             disable=not show_progress,
         )
+        stop_reason = "memory_satisfied" if int(total_current_storage) <= int(allowed_total_storage) else "not_started"
         merge_count = 0
-        while should_continue() and len(groups) > 1:
+        while int(total_current_storage) > int(allowed_total_storage):
             candidate = pop_valid_candidate()
-            from_fallback = False
             if candidate is None:
-                candidate = fallback_candidate()
-                from_fallback = True
+                rebuild_overlap_graph()
+                candidate = pop_valid_candidate()
             if candidate is None:
+                stop_reason = "no_storage_saving_candidate"
                 break
 
-            left_id, right_id, benefit, cost_increase = candidate
+            operation = str(candidate["operation"])
+            left_id = int(candidate["left_id"])
+            right_id = int(candidate["right_id"])
             if left_id not in groups or right_id not in groups:
                 continue
-            left = groups.pop(int(left_id))
-            right = groups.pop(int(right_id))
-            new_group = merged_group(int(next_group_id), left, right)
-            new_group_id = int(next_group_id)
-            next_group_id += 1
-            groups[new_group_id] = new_group
+            left = groups[left_id]
+            right = groups[right_id]
+            specs: list[tuple[dict[int, int], int | None]] = candidate.get("result_specs", [])  # type: ignore[assignment]
+            if not specs:
+                continue
 
-            storage_reduction = int(int(left["vector_count"]) + int(right["vector_count"]) - int(new_group["vector_count"]))
-            private_current_storage -= int(storage_reduction)
-            total_current_storage -= int(storage_reduction)
-            actual_cost_increase = float(float(new_group["cost"]) - float(left["cost"]) - float(right["cost"]))
-            current_cost += float(actual_cost_increase)
-            total_cost_increase += float(actual_cost_increase)
-            total_storage_reduction += int(storage_reduction)
+            before_memory = int(left["vector_count"]) + int(right["vector_count"])
+            before_cost = float(left["cost"]) + float(right["cost"])
+            affected_patterns = set(int(pattern_id) for pattern_id in left.get("pattern_ids", set())) | set(
+                int(pattern_id) for pattern_id in right.get("pattern_ids", set())
+            )
+
+            prune_edge_candidate_cache({int(left_id), int(right_id)})
+            unregister_group(left_id)
+            unregister_group(right_id)
+            groups.pop(left_id, None)
+            groups.pop(right_id, None)
+
+            new_group_ids: set[int] = set()
+            after_memory = 0
+            after_cost = 0.0
+            for spec in specs:
+                new_group_bits, new_group_stored_bits = normalize_spec(spec)
+                new_group = make_group_from_bits(int(next_group_id), new_group_bits, stored_bits=new_group_stored_bits)
+                if not is_live_group(new_group):
+                    continue
+                new_group_id = int(next_group_id)
+                next_group_id += 1
+                groups[new_group_id] = new_group
+                register_group(new_group_id)
+                affected_patterns.update(int(pattern_id) for pattern_id in new_group.get("pattern_ids", set()))
+                new_group_ids.add(new_group_id)
+                after_memory += int(new_group["vector_count"])
+                after_cost += float(new_group["cost"])
+
+            memory_saved = int(before_memory) - int(after_memory)
+            delta_latency = float(after_cost) - float(before_cost)
+            if int(memory_saved) <= 0 or not new_group_ids:
+                stop_reason = "invalid_candidate_after_recompute"
+                break
+
+            private_current_storage -= int(memory_saved)
+            total_current_storage -= int(memory_saved)
+            current_cost += float(delta_latency)
+            total_storage_reduction += int(memory_saved)
+            total_latency_delta += float(delta_latency)
+            operation_counts[str(operation)] += 1
             merge_count += 1
-            if int(benefit) > 0:
-                positive_merge_count += 1
+            last_operation = str(operation)
+            last_candidate_score = float(candidate["score"])
+            last_candidate_delta_latency = float(delta_latency)
+            last_candidate_memory_saved = int(memory_saved)
+            if new_group_ids:
+                refreshed_edge_count += int(refresh_neighbors_for_groups(new_group_ids))
             else:
-                zero_benefit_merge_count += 1
-            if from_fallback:
-                fallback_merge_count += 1
+                refreshed_edge_count += int(refresh_neighbors_for_patterns(affected_patterns))
 
-            for other_id in list(groups):
-                if int(other_id) != int(new_group_id):
-                    push_candidate(int(new_group_id), int(other_id))
-
-            if progress.n < progress.total:
-                progress.update(1)
+            progress.update(1)
             if show_progress:
                 progress.set_postfix(
                     {
                         "groups": int(len(groups)),
                         "private_storage": int(private_current_storage),
-                        "need": int(allowed_private_storage),
-                        "saved": int(storage_reduction),
+                        "budget": int(allowed_private_storage),
+                        "saved": int(memory_saved),
+                        "op": str(operation),
                     }
                 )
+            if int(total_current_storage) <= int(allowed_total_storage):
+                stop_reason = "memory_satisfied"
+                break
+            stop_reason = "memory_candidate_pending"
+            if int(stale_candidates) > max(4096, int(len(candidate_heap) // 2)):
+                rebuild_candidate_heap()
         progress.close()
+        if int(total_current_storage) <= int(allowed_total_storage):
+            stop_reason = "memory_satisfied"
 
         compact_ids = {group_id: index for index, group_id in enumerate(sorted(groups))}
+        private_groups_for_partitions: list[dict[str, object]] = []
         tenant_to_cluster: dict[int, int] = {}
+        tenant_primary_rank: dict[int, tuple[int, int]] = {}
         for group_id in sorted(groups):
             compact_id = int(compact_ids[int(group_id)])
-            for tenant_id in groups[int(group_id)]["tenant_ids"]:
-                tenant_to_cluster[int(tenant_id)] = compact_id
+            group = groups[int(group_id)]
+            tenant_pattern_map: dict[int, set[int]] = group.get("service_tenant_patterns", group.get("tenant_patterns", {}))  # type: ignore[assignment]
+            compact_tenant_patterns = {
+                int(tenant_id): set(int(pattern_id) for pattern_id in pattern_ids)
+                for tenant_id, pattern_ids in tenant_pattern_map.items()
+                if pattern_ids
+            }
+            if not compact_tenant_patterns:
+                continue
+            private_groups_for_partitions.append(
+                {
+                    "cluster_id": int(compact_id),
+                    "pattern_ids": set(int(pattern_id) for pattern_id in group["pattern_ids"]),  # type: ignore[index]
+                    "tenant_patterns": compact_tenant_patterns,
+                    "service_tenant_patterns": compact_tenant_patterns,
+                    "vector_count": int(group["vector_count"]),
+                }
+            )
+            tenant_access: dict[int, int] = group.get("tenant_access", {})  # type: ignore[assignment]
+            for tenant_id, pattern_ids in compact_tenant_patterns.items():
+                cached_access = tenant_access.get(int(tenant_id))
+                if cached_access is None:
+                    accessible_vectors = int(vector_count_bits(pattern_bits_for(tuple(pattern_ids))))
+                else:
+                    accessible_vectors = int(cached_access)
+                rank = (int(accessible_vectors), -int(compact_id))
+                if int(tenant_id) not in tenant_primary_rank or rank > tenant_primary_rank[int(tenant_id)]:
+                    tenant_primary_rank[int(tenant_id)] = rank
+                    tenant_to_cluster[int(tenant_id)] = int(compact_id)
+        for tenant_id in tenant_ids:
+            tenant_to_cluster.setdefault(int(tenant_id), 0)
+        self._last_private_groups = private_groups_for_partitions
 
-        cluster_sizes = [int(len(group["tenant_ids"])) for group in groups.values()]
+        cluster_sizes = [int(len(group.get("tenant_patterns", {}))) for group in groups.values()]
         cluster_vector_counts = [int(group["vector_count"]) for group in groups.values()]
+        active_adjacency_edges = int(sum(len(neighbors) for neighbors in adjacency.values()) // 2)
+        adjacency_degrees = [int(len(neighbors)) for group_id, neighbors in adjacency.items() if int(group_id) in groups]
+        route_counts: Counter = Counter()
         weighted_filter = 0.0
         for group in groups.values():
             group_size = int(group["vector_count"])
-            for tenant_id in group["tenant_ids"]:
-                tenant_size = max(1, int(tenant_private_vectors.get(int(tenant_id), 0)))
-                if int(tenant_private_vectors.get(int(tenant_id), 0)) <= 0:
-                    continue
-                weighted_filter += float(tenant_query_weights.get(int(tenant_id), 0.0)) * (float(group_size) / float(tenant_size))
+            tenant_access: dict[int, int] = group.get("tenant_access", {})  # type: ignore[assignment]
+            for tenant_id, accessible_vectors in tenant_access.items():
+                route_counts[int(tenant_id)] += 1
+                weighted_filter += float(tenant_query_weights.get(int(tenant_id), 1.0)) * (float(group_size) / float(max(1, int(accessible_vectors))))
 
         self._last_private_metadata = {
             "enabled": True,
-            "objective": "bottom-up tenant merge by ACL copy saving under private storage budget",
+            "planner": "private_core_star_split_merge_v16",
+            "objective": "v16 rollback: start from one private group per tenant; compress replicated ACLs with ACL-core star graph and four operations until total storage reaches budget",
             "target_cluster_count": int(target_cluster_count),
+            "target_cluster_count_enforced": False,
             "replication_budget_ratio": float(max(0.0, float(replication_budget_ratio))),
             "allowed_total_storage": int(allowed_total_storage),
             "allowed_private_storage": int(allowed_private_storage),
+            "shared_vector_count": int(shared_vector_count),
+            "shared_adjusted_private_budget": int(shared_adjusted_private_budget),
+            "base_all_private_storage_for_private_patterns": int(base_all_private_storage_for_patterns),
+            "private_budget_rule": "allowed_private_storage = max(private_unique_vectors, allowed_total_storage - shared_vector_count); shared ACLs consume one copy each, so private compression only needs to fit the remaining budget",
             "initial_total_storage": int(initial_total_storage),
             "final_total_storage": int(total_current_storage),
             "private_unique_vectors": int(private_unique_vectors),
             "initial_private_storage": int(initial_private_storage),
             "final_private_storage": int(private_current_storage),
             "private_replication_factor": float(private_current_storage / max(1, private_unique_vectors)),
-            "initial_group_count": int(tenant_count),
+            "initial_group_count": int(initial_group_count),
             "final_group_count": int(len(groups)),
-            "merge_count": int(merge_count),
-            "positive_merge_count": int(positive_merge_count),
-            "zero_benefit_merge_count": int(zero_benefit_merge_count),
-            "fallback_merge_count": int(fallback_merge_count),
-            "stale_candidates": int(stale_candidates),
-            "candidate_evaluations": int(candidate_evaluations),
+            "operation_count": int(merge_count),
+            "full_merge_count": int(operation_counts.get("full", 0)),
+            "move_left_count": int(operation_counts.get("move_left", 0)),
+            "move_right_count": int(operation_counts.get("move_right", 0)),
+            "split_overlap_count": int(operation_counts.get("split_overlap", 0)),
+            "total_storage_reduction": int(total_storage_reduction),
+            "total_latency_delta": float(total_latency_delta),
             "cost_initial": float(initial_cost),
             "cost_final": float(current_cost),
-            "total_cost_increase": float(total_cost_increase),
-            "total_storage_reduction": int(total_storage_reduction),
-            "candidate_rule": "initial top co-access neighbors from ACL graph, exact merged-group overlap refresh, fallback only when no positive overlap remains",
-            "merge_score_rule": "minimize query_cost_increase / storage_saved; stop when private storage budget and cluster target are both satisfied",
+            "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; heap ranks by unit_latency_cost = delta_latency / memory_saved, smaller is better",
+            "cost_model": "same VEDA-calibrated kmeans route model, q_t=1 for every tenant",
+            "graph_rule": "ACL-core star graph: for each ACL choose smallest owner as core and connect core to other owners; edge signal n_a/(support(a)-1); each group keeps top-d incident candidates",
+            "graph_update_rule": "v16 incremental core-star: maintain pattern_star_edges, edge_refcounts, edge_signal_scores, and group-indexed candidate cache; after each operation refresh only new groups' ACL patterns and their top-d incident star edges; rebuild graph only as fallback when heap is empty",
+            "operation_rule": "four operations: full keeps whole-group A+B merge; move_left, move_right, and split_overlap use I as the full ACL intersection between the two groups",
+            "private_edge_top_d": int(top_d),
+            "initial_candidate_edges": int(initial_candidate_edges),
+            "active_adjacency_edges": int(active_adjacency_edges),
+            "active_heap_entries": int(len(candidate_heap)),
+            "heap_push_count": int(heap_push_count),
+            "stale_candidates": int(stale_candidates),
+            "heap_rebuild_count": int(heap_rebuild_count),
+            "graph_rebuild_count": int(graph_rebuild_count),
+            "candidate_evaluations": int(candidate_evaluations),
+            "edge_cache_size": int(len(edge_candidate_cache)),
+            "edge_cache_group_index_size": int(sum(len(values) for values in edge_candidate_cache_groups.values())),
+            "edge_cache_hits": int(edge_cache_hits),
+            "edge_cache_misses": int(edge_cache_misses),
+            "edge_cache_prune_count": int(edge_cache_prune_count),
+            "refreshed_edge_count": int(refreshed_edge_count),
+            "incremental_group_refresh_count": int(incremental_group_refresh_count),
+            "incremental_pattern_refresh_count": int(incremental_pattern_refresh_count),
+            "incremental_edge_add_count": int(incremental_edge_add_count),
+            "incremental_edge_remove_count": int(incremental_edge_remove_count),
+            "dag_edge_count": int(active_adjacency_edges),
+            "edge_refcount_entries": int(len(edge_refcounts)),
+            "rejected_no_overlap_candidates": int(rejected_no_overlap_candidates),
+            "rejected_no_saving_candidates": int(rejected_no_saving_candidates),
+            "max_adjacency_degree": int(max(adjacency_degrees)) if adjacency_degrees else 0,
+            "mean_adjacency_degree": float(sum(adjacency_degrees) / len(adjacency_degrees)) if adjacency_degrees else 0.0,
+            "route_count_min": int(min(route_counts.values())) if route_counts else 0,
+            "route_count_mean": float(sum(route_counts.values()) / len(route_counts)) if route_counts else 0.0,
+            "route_count_max": int(max(route_counts.values())) if route_counts else 0,
             "weighted_filter_ratio": float(weighted_filter),
             "min_cluster_size": int(min(cluster_sizes)) if cluster_sizes else 0,
             "max_cluster_size": int(max(cluster_sizes)) if cluster_sizes else 0,
             "min_cluster_vectors": int(min(cluster_vector_counts)) if cluster_vector_counts else 0,
             "max_cluster_vectors": int(max(cluster_vector_counts)) if cluster_vector_counts else 0,
+            "last_operation": None if last_operation is None else str(last_operation),
+            "last_candidate_score": None if last_candidate_score is None else float(last_candidate_score),
+            "last_candidate_delta_latency": None if last_candidate_delta_latency is None else float(last_candidate_delta_latency),
+            "last_candidate_memory_saved": None if last_candidate_memory_saved is None else int(last_candidate_memory_saved),
+            "stop_reason": str(stop_reason),
+            "query_weight_rule": "all tenants use q_t=1 unless caller passes explicit tenant_query_weights; current build_plan passes q_t=1",
         }
         return tenant_to_cluster
 
@@ -1337,28 +2128,53 @@ class HybridACLKMeansPlanner:
                 )
                 shared_partition_index += 1
 
-        private_by_cluster: dict[int, dict[int, ACLPattern]] = defaultdict(dict)
-        for pattern in tqdm(private_patterns, desc="Private cluster copies", unit="acl", leave=False, disable=not show_progress):
-            owning_clusters = {
-                int(tenant_to_private_cluster[int(tenant_id)])
-                for tenant_id in pattern.tenant_ids
-                if int(tenant_id) in tenant_to_private_cluster
-            }
-            for cluster_id in owning_clusters:
-                private_by_cluster[int(cluster_id)][int(pattern.pattern_id)] = pattern
+        private_group_records = list(getattr(self, "_last_private_groups", []) or [])
+        pattern_by_id = {int(pattern.pattern_id): pattern for pattern in private_patterns}
         private_partition_index = 0
-        for cluster_id in sorted(private_by_cluster):
-            cluster_patterns = [private_by_cluster[int(cluster_id)][pattern_id] for pattern_id in sorted(private_by_cluster[int(cluster_id)])]
-            if cluster_patterns:
-                partitions.append(
-                    self._make_partition(
-                        f"private_{private_partition_index}",
-                        cluster_id,
-                        "private",
-                        cluster_patterns,
+        if private_group_records:
+            for group in sorted(private_group_records, key=lambda item: int(item.get("cluster_id", 0))):
+                cluster_id = int(group.get("cluster_id", private_partition_index))
+                pattern_ids = sorted(int(pattern_id) for pattern_id in group.get("pattern_ids", set()) if int(pattern_id) in pattern_by_id)
+                cluster_patterns = [pattern_by_id[int(pattern_id)] for pattern_id in pattern_ids]
+                raw_tenant_pattern_map = group.get("service_tenant_patterns", group.get("tenant_patterns", {}))
+                tenant_pattern_map = {
+                    int(tenant_id): {int(pattern_id) for pattern_id in pattern_values if int(pattern_id) in pattern_by_id}
+                    for tenant_id, pattern_values in dict(raw_tenant_pattern_map).items()
+                }
+                tenant_pattern_map = {tenant_id: pattern_values for tenant_id, pattern_values in tenant_pattern_map.items() if pattern_values}
+                if cluster_patterns and tenant_pattern_map:
+                    partitions.append(
+                        self._make_partition(
+                            f"private_{private_partition_index}",
+                            cluster_id,
+                            "private",
+                            cluster_patterns,
+                            route_tenant_patterns=tenant_pattern_map,
+                        )
                     )
-                )
-                private_partition_index += 1
+                    private_partition_index += 1
+        else:
+            private_by_cluster: dict[int, dict[int, ACLPattern]] = defaultdict(dict)
+            for pattern in tqdm(private_patterns, desc="Private cluster copies", unit="acl", leave=False, disable=not show_progress):
+                owning_clusters = {
+                    int(tenant_to_private_cluster[int(tenant_id)])
+                    for tenant_id in pattern.tenant_ids
+                    if int(tenant_id) in tenant_to_private_cluster
+                }
+                for cluster_id in owning_clusters:
+                    private_by_cluster[int(cluster_id)][int(pattern.pattern_id)] = pattern
+            for cluster_id in sorted(private_by_cluster):
+                cluster_patterns = [private_by_cluster[int(cluster_id)][pattern_id] for pattern_id in sorted(private_by_cluster[int(cluster_id)])]
+                if cluster_patterns:
+                    partitions.append(
+                        self._make_partition(
+                            f"private_{private_partition_index}",
+                            cluster_id,
+                            "private",
+                            cluster_patterns,
+                        )
+                    )
+                    private_partition_index += 1
         return partitions
 
     def _make_partition(
@@ -1367,8 +2183,12 @@ class HybridACLKMeansPlanner:
         cluster_id: int,
         partition_kind: str,
         patterns: list[ACLPattern],
+        route_tenant_patterns: Optional[dict[int, set[int]]] = None,
     ) -> KMeansPartition:
-        tenant_ids = tuple(sorted({int(tenant_id) for pattern in patterns for tenant_id in pattern.tenant_ids}))
+        if route_tenant_patterns is not None:
+            tenant_ids = tuple(sorted(int(tenant_id) for tenant_id, pattern_ids in route_tenant_patterns.items() if pattern_ids))
+        else:
+            tenant_ids = tuple(sorted({int(tenant_id) for pattern in patterns for tenant_id in pattern.tenant_ids}))
         document_pattern_pairs = tuple(
             (int(document_id), int(pattern.pattern_id))
             for pattern in patterns
@@ -1394,6 +2214,11 @@ class HybridACLKMeansPlanner:
                     str(int(pattern.pattern_id)): [int(tenant_id) for tenant_id in pattern.tenant_ids]
                     for pattern in patterns
                 },
+                "tenant_patterns": {
+                    str(int(tenant_id)): sorted(int(pattern_id) for pattern_id in pattern_ids)
+                    for tenant_id, pattern_ids in (route_tenant_patterns or {}).items()
+                    if pattern_ids
+                } if route_tenant_patterns is not None else {},
             },
         )
 
@@ -1406,18 +2231,26 @@ class HybridACLKMeansPlanner:
         routes: list[TenantRoute] = []
         for partition in partitions:
             tenant_to_patterns: dict[int, list[int]] = defaultdict(list)
-            pattern_tenant_map = partition.metadata.get("pattern_tenants", {}) or {}
-            if not pattern_tenant_map:
-                continue
-            for pattern_id_text, tenant_values in pattern_tenant_map.items():
-                for tenant_id in tenant_values:
-                    if (
-                        str(partition.partition_kind) == "private"
-                        and int(tenant_to_private_cluster.get(int(tenant_id), -1)) != int(partition.cluster_id)
-                    ):
-                        continue
-                    tenant_to_patterns[int(tenant_id)].append(int(pattern_id_text))
+            explicit_tenant_patterns = partition.metadata.get("tenant_patterns", {}) or {}
+            if explicit_tenant_patterns:
+                for tenant_id_text, pattern_values in dict(explicit_tenant_patterns).items():
+                    tenant_to_patterns[int(tenant_id_text)].extend(int(pattern_id) for pattern_id in pattern_values)
+            else:
+                pattern_tenant_map = partition.metadata.get("pattern_tenants", {}) or {}
+                if not pattern_tenant_map:
+                    continue
+                for pattern_id_text, tenant_values in pattern_tenant_map.items():
+                    for tenant_id in tenant_values:
+                        if (
+                            str(partition.partition_kind) == "private"
+                            and int(tenant_to_private_cluster.get(int(tenant_id), -1)) != int(partition.cluster_id)
+                        ):
+                            continue
+                        tenant_to_patterns[int(tenant_id)].append(int(pattern_id_text))
             for tenant_id, pattern_ids in tenant_to_patterns.items():
+                normalized_pattern_ids = tuple(sorted(set(int(pattern_id) for pattern_id in pattern_ids)))
+                if not normalized_pattern_ids:
+                    continue
                 routes.append(
                     TenantRoute(
                         tenant_id=int(tenant_id),
@@ -1425,7 +2258,7 @@ class HybridACLKMeansPlanner:
                         table_name=str(partition.table_name),
                         route_kind=str(partition.partition_kind),
                         cluster_id=int(partition.cluster_id),
-                        pattern_ids=tuple(sorted(set(int(pattern_id) for pattern_id in pattern_ids))),
+                        pattern_ids=normalized_pattern_ids,
                     )
                 )
         return routes

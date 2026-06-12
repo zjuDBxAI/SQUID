@@ -11,6 +11,7 @@
 .env.*
 
 # Benchmark outputs
+/controller/kmeans/train/
 /controller/kmeans/version/
 /basic_benchmark/result/
 /basic_benchmark/efs_logs/

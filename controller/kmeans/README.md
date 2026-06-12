@@ -1,12 +1,5 @@
-# KMeans ACL Partition
+# SQUID
 
-`controller/kmeans` 是当前项目中的多租户向量检索分区方案实现。它不是传统语义 k-means，而是基于 ACL pattern、租户共现关系、存储预算和查询代价模型构建 PostgreSQL/pgvector 物理分区。
-
-核心目标：
-
-- 降低单次查询需要访问的分区数。
-- 提高分区内权限选择性，减少 PostgreSQL HNSW 后过滤开销。
-- 在允许的数据复制预算下，用更多空间换取更低延迟和更高召回。
 
 ## 文件结构
 
@@ -214,6 +207,7 @@ bash run_ours.sh
 ## 重要参数
 
 | 参数 | 作用 |
+|--||--|
 | `--private-replication-budget-ratio` | private zone 允许的数据复制预算，越大通常空间越高、路由和过滤代价越低。 |
 | `--ef-search` | HNSW 查询搜索参数，同时参与 planner cost model 和实际查询。 |
 

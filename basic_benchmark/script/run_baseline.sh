@@ -1,26 +1,63 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ALGORITHM="RLS"
-EFS_LIST=(800  1000  1200 1500 1800 2000 2200)
-LOG_DIR="./efs_logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${ROOT_DIR}"
 
-mkdir -p "$LOG_DIR"
+PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 
-for EFS in "${EFS_LIST[@]}"; do
-  TS="$(date +%Y%m%d_%H%M%S)"
-  LOG_FILE="${LOG_DIR}/${ALGORITHM}_efs${EFS}_${TS}.log"
+# Space-separated algorithms supported by test_all.py:
+#   RLS ROLE USER AnonySys QDTree
+# Override example: ALGORITHMS="AnonySys RLS" ./script/run_baseline.sh
+ALGORITHMS="${ALGORITHMS:-ROLE}"
+read -r -a ALGORITHM_LIST <<< "${ALGORITHMS}"
 
-  echo "========================================"
-  echo "[RUN] python test_all.py --algorithm ${ALGORITHM} --efs ${EFS}"
-  echo "[LOG] ${LOG_FILE}"
+# Space-separated or comma-separated ef_search values.
+# Override example: EFS_VALUES="40 60 80 100" ./script/run_baseline.sh
+EFS_VALUES="${EFS_VALUES:-10 15 20 25 30 35 40 45 55 60 65}"
+EFS_VALUES="${EFS_VALUES//,/ }"
+read -r -a EFS_LIST <<< "${EFS_VALUES}"
 
-  python test_all.py \
-    --algorithm "${ALGORITHM}" \
-    --efs "${EFS}" \
-    > "${LOG_FILE}" 2>&1
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/efs_logs}"
+ENABLE_INDEX="${ENABLE_INDEX:-true}"
+INDEX_TYPE="${INDEX_TYPE:-hnsw}"
+STATISTICS_TYPE="${STATISTICS_TYPE:-sql}"
+ITERATIONS="${ITERATIONS:-1}"
+RECORD_RECALL="${RECORD_RECALL:-true}"
+WARM_UP="${WARM_UP:-true}"
+GENERATOR_TYPE="${GENERATOR_TYPE:-tree-based}"
 
-  echo "[DONE] efs=${EFS}"
+# test_all.py has no --prepare flag.  This script intentionally does not build
+# partitions; it only changes ef_search and reuses already materialized baseline
+# partition tables.  Prepare/build the partition tables once before running this
+# script when using ROLE/USER/AnonySys/QDTree.
+
+mkdir -p "${LOG_DIR}"
+
+for ALGORITHM in "${ALGORITHM_LIST[@]}"; do
+  for EFS in "${EFS_LIST[@]}"; do
+    TS="$(date +%Y%m%d_%H%M%S)"
+    LOG_FILE="${LOG_DIR}/${ALGORITHM}_efs${EFS}_${TS}.log"
+
+    echo "========================================"
+    echo "[RUN] algorithm=${ALGORITHM} ef_search=${EFS} prepare=false"
+    echo "[LOG] ${LOG_FILE}"
+
+    "${PYTHON_BIN}" test_all.py \
+      --algorithm "${ALGORITHM}" \
+      --efs "${EFS}" \
+      --enable-index "${ENABLE_INDEX}" \
+      --index-type "${INDEX_TYPE}" \
+      --statistics-type "${STATISTICS_TYPE}" \
+      --generator-type "${GENERATOR_TYPE}" \
+      --iterations "${ITERATIONS}" \
+      --record-recall "${RECORD_RECALL}" \
+      --warm-up "${WARM_UP}" \
+      > "${LOG_FILE}" 2>&1
+
+    echo "[DONE] algorithm=${ALGORITHM} ef_search=${EFS}"
+  done
 done
 
-echo "All runs finished."
+echo "All baseline ef_search runs finished. Logs: ${LOG_DIR}"
