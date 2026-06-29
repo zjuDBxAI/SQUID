@@ -82,8 +82,8 @@ if __name__ == '__main__':
         num_users=1000,
         num_roles=num_roles,
         document_ids=document_ids,  # Actual document IDs representing permissions
-        m_roles=1,  # Maximum of x roles per user
-        m_perms=int(len(document_ids) / num_roles * 9),  # Maximum of x permissions per role
+        m_roles=2,  # Maximum of x roles per user
+        m_perms=int(len(document_ids) / num_roles * 5),  # Maximum of x permissions per role
     )
     # Generate users, roles, user-role assignments, and permission assignments
     users, roles, user_roles, user_permissions = rbac_generator.generate_rbac_data()

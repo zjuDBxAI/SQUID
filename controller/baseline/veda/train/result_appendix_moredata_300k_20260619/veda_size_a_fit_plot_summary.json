@@ -1,0 +1,14 @@
+{
+  "logN_plus_inv_sqrtN": {
+    "a": 0.18918923571601648,
+    "c1": -2.4688505840345947,
+    "r2": 0.94909266658671,
+    "s": 25.60994250495124
+  },
+  "original_logN": {
+    "a": 0.10718037140163453,
+    "c1": -1.0273473368099577,
+    "r2": 0.8679013075745754
+  },
+  "plot": "/data/Multitenanthakes/controller/baseline/veda/train/result_appendix_moredata_300k_20260619/veda_size_a_fit.png"
+}

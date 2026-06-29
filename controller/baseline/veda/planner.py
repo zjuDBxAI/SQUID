@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import heapq
 from dataclasses import dataclass, field
 import itertools
 import math
@@ -29,6 +30,59 @@ class _LatticeNode:
     role_ids: tuple[int, ...]
     pattern_ids: frozenset[int]
     virtual_components: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(slots=True)
+class _RolePlanSeed:
+    selected_counts: dict[str, int]
+    pending_bits: int
+
+
+class _LocationOverlay:
+    __slots__ = ("base", "overrides")
+
+    def __init__(self, base, overrides: dict[int, list[str]]) -> None:
+        self.base = base
+        self.overrides = overrides
+
+    def get(self, key, default=None):
+        key = int(key)
+        if key in self.overrides:
+            return self.overrides[key]
+        return self.base.get(key, default)
+
+
+class _LatticeOverlay:
+    __slots__ = ("base", "overrides", "removed")
+
+    def __init__(
+        self,
+        base: dict[str, _LatticeNode],
+        overrides: dict[str, _LatticeNode],
+        removed: Iterable[str] = tuple(),
+    ) -> None:
+        self.base = base
+        self.overrides = {str(node_id): node for node_id, node in overrides.items()}
+        self.removed = frozenset(str(node_id) for node_id in removed)
+
+    def get(self, key, default=None):
+        key = str(key)
+        if key in self.removed:
+            return default
+        if key in self.overrides:
+            return self.overrides[key]
+        return self.base.get(key, default)
+
+    def __contains__(self, key) -> bool:
+        key = str(key)
+        return key not in self.removed and (key in self.overrides or key in self.base)
+
+    def materialize(self) -> dict[str, _LatticeNode]:
+        lattice = dict(self.base)
+        for node_id in self.removed:
+            lattice.pop(str(node_id), None)
+        lattice.update(self.overrides)
+        return lattice
 
 
 class VedaPlanner:
@@ -61,6 +115,22 @@ class VedaPlanner:
         self.post_copy_lattice: dict[str, _LatticeNode] = {}
         self.node_by_roles: dict[tuple[int, ...], str] = {}
         self._generated_node_counter = 0
+        self._pattern_sizes: dict[int, int] = {}
+        self._pattern_roles: dict[int, frozenset[int]] = {}
+        self._role_authorized_patterns: dict[int, frozenset[int]] = {}
+        self._node_size_cache: dict[frozenset[int], int] = {}
+        self._authorized_size_cache: dict[tuple[frozenset[int], int], int] = {}
+        self._node_cost_cache: dict[tuple[frozenset[int], int, bool], float] = {}
+        self._pattern_bits: dict[int, int] = {}
+        self._bit_to_pattern: dict[int, int] = {}
+        self._role_authorized_bits: dict[int, int] = {}
+        self._node_pattern_bits_cache: dict[frozenset[int], int] = {}
+        self._role_bits: dict[int, int] = {}
+        self._node_role_bits_cache: dict[tuple[int, ...], int] = {}
+        self._pattern_bits_size_cache: dict[int, int] = {}
+        self._pattern_bits_roles_cache: dict[int, tuple[int, ...]] = {}
+        self._milp_backend = None
+        self._milp_backend_checked = False
 
     def build_plan(
         self,
@@ -81,6 +151,41 @@ class VedaPlanner:
         if not self.roles:
             raise ValueError("Cannot build a Veda plan without roles")
 
+        self._pattern_sizes = {
+            int(pattern.pattern_id): max(0, int(pattern.vector_count))
+            for pattern in patterns
+        }
+        self._pattern_roles = {
+            int(pattern.pattern_id): frozenset(int(role_id) for role_id in pattern.role_ids)
+            for pattern in patterns
+        }
+        self._role_authorized_patterns = {
+            int(role_id): frozenset(
+                int(pattern.pattern_id)
+                for pattern in patterns
+                if int(role_id) in pattern.role_ids and int(pattern.vector_count) > 0
+            )
+            for role_id in self.roles
+        }
+        ordered_role_ids = sorted({int(role_id) for role_id in self.roles} | {int(role_id) for pattern in patterns for role_id in pattern.role_ids})
+        self._role_bits = {int(role_id): 1 << index for index, role_id in enumerate(ordered_role_ids)}
+        ordered_pattern_ids = sorted(int(pattern.pattern_id) for pattern in patterns)
+        self._pattern_bits = {pattern_id: 1 << index for index, pattern_id in enumerate(ordered_pattern_ids)}
+        self._bit_to_pattern = {index: pattern_id for index, pattern_id in enumerate(ordered_pattern_ids)}
+        self._role_authorized_bits = {
+            int(role_id): self._patterns_to_bits(pattern_ids)
+            for role_id, pattern_ids in self._role_authorized_patterns.items()
+        }
+        self._node_size_cache.clear()
+        self._authorized_size_cache.clear()
+        self._node_cost_cache.clear()
+        self._node_pattern_bits_cache.clear()
+        self._node_role_bits_cache.clear()
+        self._pattern_bits_size_cache.clear()
+        self._pattern_bits_roles_cache.clear()
+        self._milp_backend = None
+        self._milp_backend_checked = False
+
         self.exclusive_lattice = self._build_exclusive_lattice(patterns)
         self.node_by_roles = {
             node.role_ids: node_id
@@ -95,7 +200,7 @@ class VedaPlanner:
             lattice, operation_metadata = self._run_effveda(lattice, show_progress=show_progress)
 
         lattice, finalize_metadata = self._finalize_lattice(lattice)
-        role_plans = self._build_role_query_plans(lattice, exact=True)
+        role_plans = self._build_role_query_plans(lattice, exact=True, final=True)
         if self._storage_amplification(lattice) < self.storage_amplification:
             lattice, role_plans, super_impure_metadata = self._handle_super_impure_nodes(lattice, role_plans)
         else:
@@ -166,32 +271,148 @@ class VedaPlanner:
             for node_id, node in lattice.items()
         }
 
+
+    def _patterns_to_bits(self, pattern_ids: Iterable[int]) -> int:
+        bits = 0
+        for pattern_id in pattern_ids:
+            bits |= int(self._pattern_bits.get(int(pattern_id), 0))
+        return int(bits)
+
+    def _node_pattern_bits(self, node: _LatticeNode) -> int:
+        cached = self._node_pattern_bits_cache.get(node.pattern_ids)
+        if cached is not None:
+            return int(cached)
+        bits = self._patterns_to_bits(node.pattern_ids)
+        self._node_pattern_bits_cache[node.pattern_ids] = int(bits)
+        return int(bits)
+
+    def _roles_to_bits(self, role_ids: Iterable[int]) -> int:
+        bits = 0
+        for role_id in role_ids:
+            bits |= int(self._role_bits.get(int(role_id), 0))
+        return int(bits)
+
+    def _node_role_bits(self, node: _LatticeNode) -> int:
+        key = tuple(node.role_ids)
+        cached = self._node_role_bits_cache.get(key)
+        if cached is not None:
+            return int(cached)
+        bits = self._roles_to_bits(key)
+        self._node_role_bits_cache[key] = int(bits)
+        return int(bits)
+
+    def _pattern_bits_size(self, bits: int) -> int:
+        bits = int(bits)
+        cached = self._pattern_bits_size_cache.get(bits)
+        if cached is not None:
+            return int(cached)
+        total = 0
+        value = bits
+        while value:
+            low = value & -value
+            index = low.bit_length() - 1
+            pattern_id = self._bit_to_pattern.get(index)
+            if pattern_id is not None:
+                total += int(self._pattern_sizes.get(int(pattern_id), 0))
+            value ^= low
+        self._pattern_bits_size_cache[bits] = int(total)
+        return int(total)
+
+    def _roles_for_pattern_bits(self, bits: int) -> tuple[int, ...]:
+        bits = int(bits)
+        cached = self._pattern_bits_roles_cache.get(bits)
+        if cached is not None:
+            return cached
+        roles: set[int] = set()
+        value = bits
+        while value:
+            low = value & -value
+            index = low.bit_length() - 1
+            pattern_id = self._bit_to_pattern.get(index)
+            if pattern_id is not None:
+                roles.update(self._pattern_roles.get(int(pattern_id), frozenset()))
+            value ^= low
+        result = tuple(sorted(roles))
+        self._pattern_bits_roles_cache[bits] = result
+        return result
+
+    def _bits_to_patterns(self, bits: int) -> set[int]:
+        values: set[int] = set()
+        value = int(bits)
+        while value:
+            low = value & -value
+            index = low.bit_length() - 1
+            pattern_id = self._bit_to_pattern.get(index)
+            if pattern_id is not None:
+                values.add(int(pattern_id))
+            value ^= low
+        return values
+
     def _exclusive_vector_count(self) -> int:
+        if self._pattern_sizes:
+            return int(sum(self._pattern_sizes.values()))
         return int(sum(max(0, int(pattern.vector_count)) for pattern in self.patterns.values()))
 
     def _node_size(self, node: _LatticeNode | Iterable[int]) -> int:
-        pattern_ids = node.pattern_ids if isinstance(node, _LatticeNode) else node
-        return int(sum(max(0, int(self.patterns[int(pattern_id)].vector_count)) for pattern_id in pattern_ids))
+        pattern_ids = node.pattern_ids if isinstance(node, _LatticeNode) else frozenset(int(pattern_id) for pattern_id in node)
+        cached = self._node_size_cache.get(pattern_ids)
+        if cached is not None:
+            return int(cached)
+        total = int(
+            sum(
+                self._pattern_sizes.get(int(pattern_id), max(0, int(self.patterns[int(pattern_id)].vector_count)))
+                for pattern_id in pattern_ids
+            )
+        )
+        self._node_size_cache[pattern_ids] = int(total)
+        return int(total)
 
     def _authorized_size(self, node: _LatticeNode, role_id: int) -> int:
         role_id = int(role_id)
-        return int(
-            sum(
-                max(0, int(self.patterns[int(pattern_id)].vector_count))
-                for pattern_id in node.pattern_ids
-                if role_id in self.patterns[int(pattern_id)].role_ids
+        key = (node.pattern_ids, role_id)
+        cached = self._authorized_size_cache.get(key)
+        if cached is not None:
+            return int(cached)
+        authorized_patterns = self._role_authorized_patterns.get(role_id)
+        if authorized_patterns is None:
+            authorized_patterns = frozenset(
+                int(pattern_id)
+                for pattern_id, pattern in self.patterns.items()
+                if role_id in pattern.role_ids and int(pattern.vector_count) > 0
             )
-        )
+        if len(node.pattern_ids) <= len(authorized_patterns):
+            total = sum(
+                self._pattern_sizes.get(int(pattern_id), max(0, int(self.patterns[int(pattern_id)].vector_count)))
+                for pattern_id in node.pattern_ids
+                if int(pattern_id) in authorized_patterns
+            )
+        else:
+            total = sum(
+                self._pattern_sizes.get(int(pattern_id), max(0, int(self.patterns[int(pattern_id)].vector_count)))
+                for pattern_id in authorized_patterns
+                if int(pattern_id) in node.pattern_ids
+            )
+        self._authorized_size_cache[key] = int(total)
+        return int(total)
 
     def _node_cost_for_role(self, node: _LatticeNode, role_id: int, *, final: bool = False) -> float:
+        role_id = int(role_id)
+        key = (node.pattern_ids, role_id, bool(final))
+        cached = self._node_cost_cache.get(key)
+        if cached is not None:
+            return float(cached)
         node_size = max(1, int(self._node_size(node)))
-        authorized_size = int(self._authorized_size(node, int(role_id)))
+        authorized_size = int(self._authorized_size(node, role_id))
         if authorized_size <= 0:
             return float("inf")
         if final and node_size < self.indexing_threshold:
-            return float(self.linear_scan_cost * authorized_size)
+            cost = float(self.linear_scan_cost * authorized_size)
+            self._node_cost_cache[key] = cost
+            return cost
         impurity = float(node_size) / float(max(1, authorized_size))
-        return float(self.cost_a * math.log2(node_size + 1) + self.cost_b * impurity * self.ef_search + self.cost_c)
+        cost = float(self.cost_a * math.log2(node_size + 1) + self.cost_b * impurity * self.ef_search + self.cost_c)
+        self._node_cost_cache[key] = cost
+        return cost
 
     def _plan_cost(self, lattice: dict[str, _LatticeNode], role_plans: Optional[dict[int, tuple[str, ...]]] = None) -> float:
         plans = role_plans if role_plans is not None else self._build_role_query_plans(lattice)
@@ -206,23 +427,218 @@ class VedaPlanner:
                 total += self._node_cost_for_role(node, int(role_id))
         return float(total / max(1, len(plans)))
 
+
+    def _role_plan_cost(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_id: int,
+        node_ids: Iterable[str],
+        *,
+        final: bool = False,
+    ) -> float:
+        total = 0.0
+        for node_id in node_ids:
+            node = lattice.get(str(node_id))
+            if node is None:
+                continue
+            total += self._node_cost_for_role(node, int(role_id), final=final)
+        return float(total)
+
+    def _role_costs(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+        *,
+        final: bool = False,
+    ) -> dict[int, float]:
+        return {
+            int(role_id): self._role_plan_cost(lattice, int(role_id), node_ids, final=final)
+            for role_id, node_ids in role_plans.items()
+        }
+
+    def _lattice_locations(self, lattice: dict[str, _LatticeNode]) -> dict[int, list[str]]:
+        locations: dict[int, list[str]] = defaultdict(list)
+        for node_id, node in lattice.items():
+            for pattern_id in node.pattern_ids:
+                locations[int(pattern_id)].append(str(node_id))
+        return locations
+
+    def _authorized_patterns_for_role(self, role_id: int) -> set[int]:
+        role_id = int(role_id)
+        cached = self._role_authorized_patterns.get(role_id)
+        if cached is not None:
+            return set(cached)
+        return {
+            int(pattern_id)
+            for pattern_id, pattern in self.patterns.items()
+            if role_id in pattern.role_ids and int(pattern.vector_count) > 0
+        }
+
+    def _build_role_query_plan(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_id: int,
+        *,
+        exact: bool = False,
+        final: bool = False,
+        locations: Optional[dict[int, list[str]]] = None,
+    ) -> tuple[str, ...]:
+        role_id = int(role_id)
+        authorized_patterns = self._authorized_patterns_for_role(role_id)
+        if not authorized_patterns:
+            return tuple()
+
+        if locations is None:
+            locations = self._lattice_locations(lattice)
+
+        selected: set[str] = set()
+        pending_bits = 0
+        for pattern_id in authorized_patterns:
+            single_node_id = None
+            candidate_count = 0
+            for candidate_node_id in locations.get(int(pattern_id), []):
+                if candidate_node_id in lattice:
+                    candidate_count += 1
+                    if candidate_count == 1:
+                        single_node_id = str(candidate_node_id)
+                    else:
+                        break
+            if candidate_count == 1 and single_node_id is not None:
+                selected.add(single_node_id)
+            else:
+                pending_bits |= int(self._pattern_bits.get(int(pattern_id), 0))
+
+        covered_bits = 0
+        for node_id in selected:
+            node = lattice.get(node_id)
+            if node is not None:
+                covered_bits |= self._node_pattern_bits(node)
+        pending_bits &= int(self._role_authorized_bits.get(role_id, self._patterns_to_bits(authorized_patterns)))
+        pending_bits &= ~covered_bits
+
+        if exact and pending_bits:
+            pending = self._bits_to_patterns(pending_bits)
+            exact_nodes = self._solve_exact_coverage(lattice, pending, locations, role_id, final=final)
+            if exact_nodes is not None:
+                selected.update(exact_nodes)
+                return tuple(sorted(selected))
+
+        self._greedy_extend_coverage_bits(lattice, selected, pending_bits, locations, role_id, final=final)
+        return tuple(sorted(selected))
+
+    def _single_owner_for_pattern(self, lattice, locations, pattern_id: int) -> str | None:
+        single_node_id = None
+        candidate_count = 0
+        for candidate_node_id in locations.get(int(pattern_id), []):
+            if candidate_node_id in lattice:
+                candidate_count += 1
+                if candidate_count == 1:
+                    single_node_id = str(candidate_node_id)
+                else:
+                    break
+        return single_node_id if candidate_count == 1 else None
+
+    def _build_role_query_seed(self, lattice, role_id: int, locations) -> _RolePlanSeed:
+        role_id = int(role_id)
+        authorized_patterns = self._authorized_patterns_for_role(role_id)
+        selected_counts: dict[str, int] = {}
+        pending_bits = 0
+        for pattern_id in authorized_patterns:
+            single_node_id = self._single_owner_for_pattern(lattice, locations, int(pattern_id))
+            if single_node_id is None:
+                pending_bits |= int(self._pattern_bits.get(int(pattern_id), 0))
+            else:
+                selected_counts[single_node_id] = int(selected_counts.get(single_node_id, 0)) + 1
+        return _RolePlanSeed(selected_counts=selected_counts, pending_bits=int(pending_bits))
+
+    def _build_role_query_plan_from_seed(
+        self,
+        candidate_lattice,
+        role_id: int,
+        locations,
+        seed: _RolePlanSeed,
+        touched_patterns: Iterable[int],
+        *,
+        exact: bool = False,
+        final: bool = False,
+    ) -> tuple[str, ...]:
+        role_id = int(role_id)
+        auth_bits = int(self._role_authorized_bits.get(role_id, 0))
+        if auth_bits == 0:
+            return tuple()
+        base_locations = getattr(locations, "base", None)
+        base_lattice = getattr(candidate_lattice, "base", None)
+        if base_locations is None or base_lattice is None:
+            return self._build_role_query_plan(candidate_lattice, role_id, exact=exact, final=final, locations=locations)
+
+        selected_counts = dict(seed.selected_counts)
+        pending_bits = int(seed.pending_bits)
+        for pattern_id in touched_patterns:
+            pattern_id = int(pattern_id)
+            bit = int(self._pattern_bits.get(pattern_id, 0))
+            if bit == 0 or not (auth_bits & bit):
+                continue
+
+            base_single = self._single_owner_for_pattern(base_lattice, base_locations, pattern_id)
+            if base_single is None:
+                pending_bits &= ~bit
+            else:
+                next_count = int(selected_counts.get(base_single, 0)) - 1
+                if next_count > 0:
+                    selected_counts[base_single] = next_count
+                else:
+                    selected_counts.pop(base_single, None)
+
+            candidate_single = self._single_owner_for_pattern(candidate_lattice, locations, pattern_id)
+            if candidate_single is None:
+                pending_bits |= bit
+            else:
+                selected_counts[candidate_single] = int(selected_counts.get(candidate_single, 0)) + 1
+                pending_bits &= ~bit
+
+        selected = {
+            str(node_id)
+            for node_id, count in selected_counts.items()
+            if int(count) > 0 and str(node_id) in candidate_lattice
+        }
+        covered_bits = 0
+        for node_id in selected:
+            node = candidate_lattice.get(node_id)
+            if node is not None:
+                covered_bits |= self._node_pattern_bits(node)
+        pending_bits &= auth_bits
+        pending_bits &= ~covered_bits
+
+        if exact and pending_bits:
+            pending = self._bits_to_patterns(pending_bits)
+            exact_nodes = self._solve_exact_coverage(candidate_lattice, pending, locations, role_id, final=final)
+            if exact_nodes is not None:
+                selected.update(exact_nodes)
+                return tuple(sorted(selected))
+
+        self._greedy_extend_coverage_bits(candidate_lattice, selected, pending_bits, locations, role_id, final=final)
+        return tuple(sorted(selected))
+
     def _storage_amplification(self, lattice: dict[str, _LatticeNode]) -> float:
         return float(sum(self._node_size(node) for node in lattice.values()) / max(1, self._exclusive_vector_count()))
 
     def _descendant_ancestor_pairs(self, lattice: dict[str, _LatticeNode]) -> list[tuple[str, str]]:
         pairs: list[tuple[str, str]] = []
         nodes = list(lattice.values())
+        role_bits_by_node = {node.node_id: self._node_role_bits(node) for node in nodes}
+        role_len_by_node = {node.node_id: len(node.role_ids) for node in nodes}
         for child in nodes:
-            child_roles = set(child.role_ids)
-            if not child_roles:
+            child_bits = int(role_bits_by_node.get(child.node_id, 0))
+            if child_bits == 0:
                 continue
+            child_role_len = int(role_len_by_node.get(child.node_id, 0))
             for ancestor in nodes:
                 if child.node_id == ancestor.node_id:
                     continue
-                ancestor_roles = set(ancestor.role_ids)
-                if ancestor_roles and ancestor_roles < child_roles:
+                ancestor_bits = int(role_bits_by_node.get(ancestor.node_id, 0))
+                if ancestor_bits and ancestor_bits != child_bits and (ancestor_bits & child_bits) == ancestor_bits:
                     pairs.append((child.node_id, ancestor.node_id))
-        pairs.sort(key=lambda item: (len(lattice[item[0]].role_ids), len(lattice[item[1]].role_ids), item[0], item[1]), reverse=True)
+        pairs.sort(key=lambda item: (role_len_by_node[item[0]], role_len_by_node[item[1]], item[0], item[1]), reverse=True)
         return pairs
 
     def _copy_delta_size(self, lattice: dict[str, _LatticeNode], child_id: str, ancestor_id: str) -> int:
@@ -230,7 +646,8 @@ class VedaPlanner:
         ancestor = lattice.get(ancestor_id)
         if child_exclusive is None or ancestor is None:
             return 0
-        return int(self._node_size(child_exclusive.pattern_ids - ancestor.pattern_ids))
+        missing_bits = self._node_pattern_bits(child_exclusive) & ~self._node_pattern_bits(ancestor)
+        return int(self._pattern_bits_size(missing_bits))
 
     def _simulate_copy(self, lattice: dict[str, _LatticeNode], child_id: str, ancestor_id: str) -> dict[str, _LatticeNode]:
         child_exclusive = self.exclusive_lattice[child_id]
@@ -250,12 +667,470 @@ class VedaPlanner:
         ancestor = next_lattice[ancestor_id]
         next_lattice[ancestor_id] = _LatticeNode(
             node_id=ancestor.node_id,
-            role_ids=normalize_int_tuple(set(ancestor.role_ids) | set(child.role_ids)),
+            role_ids=ancestor.role_ids,
             pattern_ids=frozenset(set(ancestor.pattern_ids) | set(child.pattern_ids)),
             virtual_components=tuple(dict.fromkeys((*ancestor.virtual_components, *child.virtual_components))),
         )
         del next_lattice[child_id]
         return next_lattice
+
+
+    def _candidate_copy_lattice(
+        self,
+        lattice: dict[str, _LatticeNode],
+        child_id: str,
+        ancestor_id: str,
+    ) -> _LatticeOverlay | None:
+        child_exclusive = self.exclusive_lattice.get(child_id)
+        ancestor = lattice.get(ancestor_id)
+        if child_exclusive is None or ancestor is None:
+            return None
+        new_ancestor = _LatticeNode(
+            node_id=ancestor.node_id,
+            role_ids=ancestor.role_ids,
+            pattern_ids=frozenset(set(ancestor.pattern_ids) | set(child_exclusive.pattern_ids)),
+            virtual_components=tuple(dict.fromkeys((*ancestor.virtual_components, *child_exclusive.virtual_components))),
+        )
+        return _LatticeOverlay(lattice, {str(ancestor_id): new_ancestor})
+
+    def _candidate_merge_lattice(
+        self,
+        lattice: dict[str, _LatticeNode],
+        child_id: str,
+        ancestor_id: str,
+    ) -> _LatticeOverlay | None:
+        child = lattice.get(child_id)
+        ancestor = lattice.get(ancestor_id)
+        if child is None or ancestor is None:
+            return None
+        new_ancestor = _LatticeNode(
+            node_id=ancestor.node_id,
+            role_ids=ancestor.role_ids,
+            pattern_ids=frozenset(set(ancestor.pattern_ids) | set(child.pattern_ids)),
+            virtual_components=tuple(dict.fromkeys((*ancestor.virtual_components, *child.virtual_components))),
+        )
+        return _LatticeOverlay(lattice, {str(ancestor_id): new_ancestor}, removed=(str(child_id),))
+
+    def _roles_for_patterns(self, pattern_ids: Iterable[int]) -> set[int]:
+        roles: set[int] = set()
+        if self._pattern_roles:
+            for pattern_id in pattern_ids:
+                roles.update(self._pattern_roles.get(int(pattern_id), frozenset()))
+            return roles
+        for pattern_id in pattern_ids:
+            pattern = self.patterns.get(int(pattern_id))
+            if pattern is not None:
+                roles.update(int(role_id) for role_id in pattern.role_ids)
+        return roles
+
+    def _copy_affected_roles(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+        child_id: str,
+        ancestor_id: str,
+        role_plan_index: Optional[dict[str, set[int]]] = None,
+    ) -> tuple[int, ...]:
+        if role_plan_index is None:
+            affected = {
+                int(role_id)
+                for role_id, node_ids in role_plans.items()
+                if str(ancestor_id) in node_ids
+            }
+        else:
+            affected = {int(role_id) for role_id in role_plan_index.get(str(ancestor_id), set())}
+        return tuple(sorted(affected))
+
+    def _merge_affected_roles(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+        child_id: str,
+        ancestor_id: str,
+        role_plan_index: Optional[dict[str, set[int]]] = None,
+    ) -> tuple[int, ...]:
+        if role_plan_index is None:
+            affected = {
+                int(role_id)
+                for role_id, node_ids in role_plans.items()
+                if str(child_id) in node_ids or str(ancestor_id) in node_ids
+            }
+        else:
+            affected = set()
+            affected.update(int(role_id) for role_id in role_plan_index.get(str(child_id), set()))
+            affected.update(int(role_id) for role_id in role_plan_index.get(str(ancestor_id), set()))
+        return tuple(sorted(affected))
+
+    def _candidate_locations_overlay_for_patterns(
+        self,
+        base_locations: dict[int, list[str]],
+        candidate_lattice: dict[str, _LatticeNode],
+        changed_node_ids: Iterable[str],
+        touched_patterns: Iterable[int],
+    ) -> _LocationOverlay:
+        touched_tuple = tuple(dict.fromkeys(int(pattern_id) for pattern_id in touched_patterns))
+        if not touched_tuple:
+            return _LocationOverlay(base_locations, {})
+        changed = tuple(dict.fromkeys(str(node_id) for node_id in changed_node_ids))
+        changed_nodes = [(node_id, candidate_lattice.get(str(node_id))) for node_id in changed]
+        overrides: dict[int, list[str]] = {}
+        for pattern_id in touched_tuple:
+            owners = [
+                str(node_id)
+                for node_id in base_locations.get(pattern_id, [])
+                if str(node_id) in candidate_lattice
+            ]
+            owner_set = set(owners)
+            for node_id, node in changed_nodes:
+                if node is not None and pattern_id in node.pattern_ids and node_id not in owner_set:
+                    owners.append(str(node_id))
+                    owner_set.add(str(node_id))
+            overrides[pattern_id] = owners
+        return _LocationOverlay(base_locations, overrides)
+
+    def _candidate_locations_overlay(
+        self,
+        base_locations: dict[int, list[str]],
+        candidate_lattice: dict[str, _LatticeNode],
+        changed_node_ids: Iterable[str],
+    ) -> _LocationOverlay:
+        changed = tuple(dict.fromkeys(str(node_id) for node_id in changed_node_ids))
+        touched_patterns: set[int] = set()
+        for node_id in changed:
+            node = candidate_lattice.get(str(node_id))
+            if node is not None:
+                touched_patterns.update(int(pattern_id) for pattern_id in node.pattern_ids)
+        return self._candidate_locations_overlay_for_patterns(base_locations, candidate_lattice, changed, touched_patterns)
+
+
+    def _replace_locations_for_nodes(
+        self,
+        locations: dict[int, list[str]],
+        old_nodes: Iterable[_LatticeNode | None],
+        new_nodes: Iterable[_LatticeNode | None],
+    ) -> None:
+        old_nodes_tuple = tuple(node for node in old_nodes if node is not None)
+        new_nodes_tuple = tuple(node for node in new_nodes if node is not None)
+        old_node_ids = {str(node.node_id) for node in old_nodes_tuple}
+        touched_patterns: set[int] = set()
+        for node in old_nodes_tuple:
+            touched_patterns.update(int(pattern_id) for pattern_id in node.pattern_ids)
+        for node in new_nodes_tuple:
+            touched_patterns.update(int(pattern_id) for pattern_id in node.pattern_ids)
+
+        for pattern_id in touched_patterns:
+            owners = [
+                str(node_id)
+                for node_id in locations.get(int(pattern_id), [])
+                if node_id and str(node_id) not in old_node_ids
+            ]
+            owner_set = set(owners)
+            for node in new_nodes_tuple:
+                node_id = str(node.node_id)
+                if int(pattern_id) in node.pattern_ids and node_id not in owner_set:
+                    owners.append(node_id)
+                    owner_set.add(node_id)
+            if owners:
+                locations[int(pattern_id)] = owners
+            else:
+                locations.pop(int(pattern_id), None)
+
+    def _candidate_plan_delta(
+        self,
+        lattice: dict[str, _LatticeNode],
+        candidate_lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+        role_costs: dict[int, float],
+        affected_roles: Iterable[int],
+        locations,
+        role_plan_seed_cache: Optional[dict[int, _RolePlanSeed]] = None,
+        touched_patterns: Optional[Iterable[int]] = None,
+    ) -> tuple[float, dict[int, tuple[tuple[str, ...], float]]]:
+        affected = tuple(dict.fromkeys(int(role_id) for role_id in affected_roles))
+        if not affected:
+            return 0.0, {}
+
+        updates: dict[int, tuple[tuple[str, ...], float]] = {}
+        total_delta = 0.0
+        for role_id in affected:
+            old_cost = role_costs.get(int(role_id))
+            if old_cost is None:
+                old_cost = self._role_plan_cost(lattice, int(role_id), role_plans.get(int(role_id), tuple()))
+            if role_plan_seed_cache is not None and isinstance(locations, _LocationOverlay):
+                seed = role_plan_seed_cache.get(int(role_id))
+                if seed is None:
+                    seed = self._build_role_query_seed(lattice, int(role_id), locations.base)
+                    role_plan_seed_cache[int(role_id)] = seed
+                new_plan = self._build_role_query_plan_from_seed(
+                    candidate_lattice,
+                    int(role_id),
+                    locations,
+                    seed,
+                    locations.overrides.keys() if touched_patterns is None else touched_patterns,
+                )
+            else:
+                new_plan = self._build_role_query_plan(candidate_lattice, int(role_id), locations=locations)
+            new_cost = self._role_plan_cost(candidate_lattice, int(role_id), new_plan)
+            total_delta += float(old_cost) - float(new_cost)
+            updates[int(role_id)] = (new_plan, float(new_cost))
+        return float(total_delta / max(1, len(role_plans))), updates
+
+    def _role_plan_node_index(self, role_plans: dict[int, tuple[str, ...]]) -> dict[str, set[int]]:
+        index: dict[str, set[int]] = defaultdict(set)
+        for role_id, node_ids in role_plans.items():
+            for node_id in node_ids:
+                index[str(node_id)].add(int(role_id))
+        return index
+
+    def _apply_role_plan_updates(
+        self,
+        role_plans: dict[int, tuple[str, ...]],
+        role_costs: dict[int, float],
+        updates: dict[int, tuple[tuple[str, ...], float]],
+        role_plan_index: Optional[dict[str, set[int]]] = None,
+    ) -> None:
+        for role_id, (new_plan, new_cost) in updates.items():
+            role_id = int(role_id)
+            old_plan = tuple(role_plans.get(role_id, tuple()))
+            new_plan = tuple(new_plan)
+            if role_plan_index is not None:
+                for node_id in old_plan:
+                    roles = role_plan_index.get(str(node_id))
+                    if roles is not None:
+                        roles.discard(role_id)
+                        if not roles:
+                            role_plan_index.pop(str(node_id), None)
+                for node_id in new_plan:
+                    role_plan_index.setdefault(str(node_id), set()).add(role_id)
+            role_plans[role_id] = new_plan
+            role_costs[role_id] = float(new_cost)
+
+    def _node_log_cost(self, node: _LatticeNode | None) -> float:
+        if node is None:
+            return 0.0
+        return float(math.log2(max(1, self._node_size(node)) + 1))
+
+    def _role_log_plan_cost(self, lattice: dict[str, _LatticeNode], node_ids: Iterable[str]) -> float:
+        return float(sum(self._node_log_cost(lattice.get(str(node_id))) for node_id in node_ids))
+
+    def _node_plan_cost_for_role(self, lattice: dict[str, _LatticeNode], node_id: str, role_id: int) -> float:
+        node = lattice.get(str(node_id))
+        if node is None:
+            return float("inf")
+        return self._node_cost_for_role(node, int(role_id))
+
+    def _renew_role_plans_for_candidate(
+        self,
+        candidate_lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+        affected_roles: Iterable[int],
+    ) -> None:
+        affected = tuple(dict.fromkeys(int(role_id) for role_id in affected_roles))
+        if not affected:
+            return
+        locations = self._lattice_locations(candidate_lattice)
+        for role_id in affected:
+            new_plan = self._build_role_query_plan(candidate_lattice, int(role_id), locations=locations)
+            role_plans[int(role_id)] = tuple(new_plan)
+
+    def _renew_all_role_plans(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+    ) -> None:
+        role_plans.clear()
+        role_plans.update(self._build_role_query_plans(lattice))
+
+
+    def _pair_role_index(
+        self,
+        pairs: Iterable[tuple[str, str]],
+        *,
+        mode: str,
+    ) -> dict[int, set[tuple[str, str]]]:
+        index: dict[int, set[tuple[str, str]]] = defaultdict(set)
+        for child_id, ancestor_id in pairs:
+            pair = (str(child_id), str(ancestor_id))
+            pattern_ids: set[int] = set()
+            if mode == "copy":
+                child = self.exclusive_lattice.get(pair[0])
+                if child is not None:
+                    pattern_ids.update(int(pattern_id) for pattern_id in child.pattern_ids)
+            else:
+                child = self.exclusive_lattice.get(pair[0])
+                ancestor = self.exclusive_lattice.get(pair[1])
+                if child is not None:
+                    pattern_ids.update(int(pattern_id) for pattern_id in child.pattern_ids)
+                if ancestor is not None:
+                    pattern_ids.update(int(pattern_id) for pattern_id in ancestor.pattern_ids)
+            for role_id in self._roles_for_patterns(pattern_ids):
+                index[int(role_id)].add(pair)
+        return index
+
+    def _phase_pair_indexes(
+        self,
+        pairs: Iterable[tuple[str, str]],
+        *,
+        mode: str,
+    ) -> tuple[dict[str, set[tuple[str, str]]], dict[int, set[tuple[str, str]]]]:
+        pairs_by_node: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        pairs_by_role: dict[int, set[tuple[str, str]]] = defaultdict(set)
+        for child_id, ancestor_id in pairs:
+            pair = (str(child_id), str(ancestor_id))
+            pairs_by_node[pair[0]].add(pair)
+            pairs_by_node[pair[1]].add(pair)
+            pattern_ids: set[int] = set()
+            child = self.exclusive_lattice.get(pair[0])
+            if child is not None:
+                pattern_ids.update(int(pattern_id) for pattern_id in child.pattern_ids)
+            if mode != "copy":
+                ancestor = self.exclusive_lattice.get(pair[1])
+                if ancestor is not None:
+                    pattern_ids.update(int(pattern_id) for pattern_id in ancestor.pattern_ids)
+            for role_id in self._roles_for_patterns(pattern_ids):
+                pairs_by_role[int(role_id)].add(pair)
+        return pairs_by_node, pairs_by_role
+
+    def _rebuild_copy_heap(
+        self,
+        scores: dict[tuple[str, str], tuple[float, int]],
+        versions: dict[tuple[str, str], int],
+    ) -> list[tuple[float, int, tuple[str, str], int]]:
+        heap = [
+            (-float(score), int(delta), pair, int(versions.get(pair, 0)))
+            for pair, (score, delta) in scores.items()
+        ]
+        heapq.heapify(heap)
+        return heap
+
+    def _rebuild_merge_heap(
+        self,
+        scores: dict[tuple[str, str], float],
+        versions: dict[tuple[str, str], int],
+    ) -> list[tuple[float, tuple[str, str], int]]:
+        heap = [
+            (-float(score), pair, int(versions.get(pair, 0)))
+            for pair, score in scores.items()
+        ]
+        heapq.heapify(heap)
+        return heap
+
+    def _push_copy_score(
+        self,
+        heap: list[tuple[float, int, tuple[str, str], int]],
+        scores: dict[tuple[str, str], tuple[float, int]],
+        versions: dict[tuple[str, str], int],
+        pair: tuple[str, str],
+        score: float,
+        delta: int,
+    ) -> None:
+        versions[pair] = int(versions.get(pair, 0)) + 1
+        scores[pair] = (float(score), int(delta))
+        heapq.heappush(heap, (-float(score), int(delta), pair, versions[pair]))
+
+    def _push_merge_score(
+        self,
+        heap: list[tuple[float, tuple[str, str], int]],
+        scores: dict[tuple[str, str], float],
+        versions: dict[tuple[str, str], int],
+        pair: tuple[str, str],
+        score: float,
+    ) -> None:
+        versions[pair] = int(versions.get(pair, 0)) + 1
+        scores[pair] = float(score)
+        heapq.heappush(heap, (-float(score), pair, versions[pair]))
+
+
+    def _score_veda_copy_pair(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+        role_costs: dict[int, float],
+        locations: dict[int, list[str]],
+        child_id: str,
+        ancestor_id: str,
+        role_plan_index: Optional[dict[str, set[int]]] = None,
+        role_plan_seed_cache: Optional[dict[int, _RolePlanSeed]] = None,
+    ) -> tuple[float, int, _LatticeOverlay, dict[int, tuple[tuple[str, ...], float]]] | None:
+        if child_id not in lattice or ancestor_id not in lattice:
+            return None
+        delta = self._copy_delta_size(lattice, child_id, ancestor_id)
+        if delta <= 0:
+            return None
+        candidate_lattice = self._candidate_copy_lattice(lattice, child_id, ancestor_id)
+        if candidate_lattice is None:
+            return None
+
+        ancestor = lattice.get(str(ancestor_id))
+        child_exclusive = self.exclusive_lattice.get(str(child_id))
+        touched_bits = 0
+        if child_exclusive is not None:
+            touched_bits = self._node_pattern_bits(child_exclusive)
+            if ancestor is not None:
+                touched_bits &= ~self._node_pattern_bits(ancestor)
+        affected_roles = self._copy_affected_roles(lattice, role_plans, child_id, ancestor_id, role_plan_index)
+        touched_patterns = self._bits_to_patterns(touched_bits)
+        candidate_locations = self._candidate_locations_overlay_for_patterns(
+            locations,
+            candidate_lattice,
+            (ancestor_id,),
+            touched_patterns,
+        )
+        avg_delta_cost, updates = self._candidate_plan_delta(
+            lattice,
+            candidate_lattice,
+            role_plans,
+            role_costs,
+            affected_roles,
+            candidate_locations,
+            role_plan_seed_cache,
+            touched_patterns,
+        )
+        return float(avg_delta_cost / float(delta + 1)), int(delta), candidate_lattice, updates
+
+    def _score_veda_merge_pair(
+        self,
+        lattice: dict[str, _LatticeNode],
+        role_plans: dict[int, tuple[str, ...]],
+        role_costs: dict[int, float],
+        locations: dict[int, list[str]],
+        child_id: str,
+        ancestor_id: str,
+        role_plan_index: Optional[dict[str, set[int]]] = None,
+        role_plan_seed_cache: Optional[dict[int, _RolePlanSeed]] = None,
+    ) -> tuple[float, _LatticeOverlay, dict[int, tuple[tuple[str, ...], float]]] | None:
+        if child_id not in lattice or ancestor_id not in lattice:
+            return None
+        candidate_lattice = self._candidate_merge_lattice(lattice, child_id, ancestor_id)
+        if candidate_lattice is None:
+            return None
+
+        child = lattice.get(str(child_id))
+        ancestor = lattice.get(str(ancestor_id))
+        touched_bits = 0
+        if child is not None:
+            touched_bits |= self._node_pattern_bits(child)
+        if ancestor is not None:
+            touched_bits |= self._node_pattern_bits(ancestor)
+        affected_roles = self._merge_affected_roles(lattice, role_plans, child_id, ancestor_id, role_plan_index)
+        touched_patterns = self._bits_to_patterns(touched_bits)
+        candidate_locations = self._candidate_locations_overlay_for_patterns(
+            locations,
+            candidate_lattice,
+            (child_id, ancestor_id),
+            touched_patterns,
+        )
+        avg_delta_cost, updates = self._candidate_plan_delta(
+            lattice,
+            candidate_lattice,
+            role_plans,
+            role_costs,
+            affected_roles,
+            candidate_locations,
+            role_plan_seed_cache,
+            touched_patterns,
+        )
+        return float(avg_delta_cost), candidate_lattice, updates
 
     def _run_veda(self, lattice: dict[str, _LatticeNode], *, show_progress: bool) -> tuple[dict[str, _LatticeNode], dict[str, object]]:
         budget_vectors = int(math.floor(self.storage_amplification * self._exclusive_vector_count()))
@@ -263,73 +1138,265 @@ class VedaPlanner:
         merge_count = 0
         rounds = 0
         pairs = self._descendant_ancestor_pairs(self.exclusive_lattice)
-        iterator = range(self.max_veda_rounds)
-        if show_progress:
-            iterator = tqdm(iterator, desc="Veda greedy rounds", unit="round")
-        for _ in iterator:
-            rounds += 1
-            copied = self._veda_copy_phase(lattice, pairs, budget_vectors)
-            copy_count += copied
-            merged = self._veda_merge_phase(lattice, pairs)
-            merge_count += merged
-            if copied <= 0 and merged <= 0:
-                break
+        copy_pairs_by_node, copy_pairs_by_role = self._phase_pair_indexes(pairs, mode="copy")
+        merge_pairs_by_node, merge_pairs_by_role = self._phase_pair_indexes(pairs, mode="merge")
+        role_plans = self._build_role_query_plans(lattice)
+        role_costs = self._role_costs(lattice, role_plans)
+        progress = tqdm(desc="Veda greedy rounds", unit="round", disable=not show_progress)
+        first_round = True
+        try:
+            while True:
+                rounds += 1
+                progress.update(1)
+                copied = self._veda_copy_phase(
+                    lattice,
+                    pairs,
+                    budget_vectors,
+                    role_plans,
+                    role_costs,
+                    copy_pairs_by_node,
+                    copy_pairs_by_role,
+                )
+                copy_count += copied
+                merged = self._veda_merge_phase(
+                    lattice,
+                    pairs,
+                    role_plans,
+                    role_costs,
+                    merge_pairs_by_node,
+                    merge_pairs_by_role,
+                )
+                merge_count += merged
+                if copied <= 0 and merged <= 0:
+                    break
+                first_round = False
+        finally:
+            progress.close()
         return lattice, {
             "copy_operations": int(copy_count),
             "merge_operations": int(merge_count),
             "rounds": int(rounds),
             "storage_budget_vectors": int(budget_vectors),
-            "benefit_function": "full AvgCost query-plan re-derivation over descendant-ancestor pairs",
+            "benefit_function": "incremental affected-role QP benefit with C_theta and impurity inflation; final QP rebuilt after greedy operations",
         }
 
-    def _veda_copy_phase(self, lattice: dict[str, _LatticeNode], pairs: list[tuple[str, str]], budget_vectors: int) -> int:
+    def _veda_copy_phase(
+        self,
+        lattice: dict[str, _LatticeNode],
+        pairs: list[tuple[str, str]],
+        budget_vectors: int,
+        role_plans: dict[int, tuple[str, ...]],
+        role_costs: dict[int, float],
+        pairs_by_node: dict[str, set[tuple[str, str]]],
+        pairs_by_role: dict[int, set[tuple[str, str]]],
+    ) -> int:
         applied = 0
+        scores: dict[tuple[str, str], tuple[float, int]] = {}
+        score_results: dict[tuple[str, str], tuple[float, int, _LatticeOverlay, dict[int, tuple[tuple[str, ...], float]]]] = {}
+        versions: dict[tuple[str, str], int] = {}
+        heap: list[tuple[float, int, tuple[str, str], int]] = []
+        locations = self._lattice_locations(lattice)
+        role_plan_index = self._role_plan_node_index(role_plans)
+        role_plan_seed_cache: dict[int, _RolePlanSeed] = {}
+        current_storage = int(sum(self._node_size(node) for node in lattice.values()))
+
+        def refresh_scores(target_pairs: Iterable[tuple[str, str]] | None = None) -> None:
+            if target_pairs is None:
+                targets = pairs
+            else:
+                targets = sorted({(str(child_id), str(ancestor_id)) for child_id, ancestor_id in target_pairs})
+            for child_id, ancestor_id in targets:
+                pair = (str(child_id), str(ancestor_id))
+                scored = self._score_veda_copy_pair(lattice, role_plans, role_costs, locations, pair[0], pair[1], role_plan_index, role_plan_seed_cache)
+                if scored is None:
+                    scores.pop(pair, None)
+                    score_results.pop(pair, None)
+                    versions[pair] = int(versions.get(pair, 0)) + 1
+                    continue
+                score, delta, _candidate_lattice, _updates = scored
+                score_results[pair] = scored
+                self._push_copy_score(heap, scores, versions, pair, float(score), int(delta))
+
+        def related_pairs_for_ancestor(ancestor_id: str) -> set[tuple[str, str]]:
+            return {
+                pair
+                for pair in pairs_by_node.get(str(ancestor_id), set())
+                if str(pair[1]) == str(ancestor_id)
+            }
+
+        refresh_scores(None)
+        stop_refresh_done = False
         while True:
-            current_storage = int(sum(self._node_size(node) for node in lattice.values()))
             buffer = int(budget_vectors - current_storage)
             if buffer <= 0:
                 return applied
-            current_cost = self._plan_cost(lattice)
-            best = None
-            best_benefit = 0.0
-            for child_id, ancestor_id in pairs:
-                if child_id not in lattice or ancestor_id not in lattice:
-                    continue
-                delta = self._copy_delta_size(lattice, child_id, ancestor_id)
-                if delta <= 0 or delta > buffer:
-                    continue
-                next_lattice = self._simulate_copy(lattice, child_id, ancestor_id)
-                benefit = (current_cost - self._plan_cost(next_lattice)) / float(delta + 1)
-                if benefit > best_benefit:
-                    best_benefit = float(benefit)
-                    best = (child_id, ancestor_id, next_lattice)
-            if best is None or best_benefit < 0.0:
-                return applied
-            _child_id, _ancestor_id, next_lattice = best
-            lattice.clear()
-            lattice.update(next_lattice)
-            applied += 1
 
-    def _veda_merge_phase(self, lattice: dict[str, _LatticeNode], pairs: list[tuple[str, str]]) -> int:
-        applied = 0
-        while True:
-            current_cost = self._plan_cost(lattice)
-            best = None
-            best_benefit = 0.0
-            for child_id, ancestor_id in pairs:
-                if child_id not in lattice or ancestor_id not in lattice:
+            selected = None
+            if len(heap) > max(4096, len(scores) * 4):
+                heap = self._rebuild_copy_heap(scores, versions)
+            while heap:
+                neg_score, delta, pair, version = heapq.heappop(heap)
+                current = scores.get(pair)
+                if current is None or versions.get(pair) != version:
                     continue
-                next_lattice = self._simulate_merge(lattice, child_id, ancestor_id)
-                benefit = current_cost - self._plan_cost(next_lattice)
-                if benefit > best_benefit:
-                    best_benefit = float(benefit)
-                    best = (child_id, ancestor_id, next_lattice)
-            if best is None or best_benefit <= 0.0:
+                score = -float(neg_score)
+                if (float(current[0]), int(current[1])) != (score, int(delta)):
+                    continue
+                if score < 0.0:
+                    if not stop_refresh_done:
+                        refresh_scores(None)
+                        stop_refresh_done = True
+                        selected = None
+                        break
+                    return applied
+                if int(delta) > buffer:
+                    continue
+                selected = (pair, score, int(delta))
+                break
+            if selected is None:
+                if not stop_refresh_done:
+                    refresh_scores(None)
+                    stop_refresh_done = True
+                    continue
                 return applied
-            _child_id, _ancestor_id, next_lattice = best
+
+            stop_refresh_done = False
+            (child_id, ancestor_id), _score, _delta = selected
+            pair = (str(child_id), str(ancestor_id))
+            rescored = self._score_veda_copy_pair(lattice, role_plans, role_costs, locations, child_id, ancestor_id, role_plan_index, role_plan_seed_cache)
+            if rescored is None:
+                scores.pop(pair, None)
+                score_results.pop(pair, None)
+                versions[pair] = int(versions.get(pair, 0)) + 1
+                continue
+            current_score, current_delta, candidate_lattice, updates = rescored
+            score_results[pair] = rescored
+            if float(current_score) != float(_score) or int(current_delta) != int(_delta):
+                self._push_copy_score(heap, scores, versions, pair, float(current_score), int(current_delta))
+                continue
+            if current_score < 0.0 or current_delta > buffer:
+                continue
+
+            old_ancestor = lattice.get(str(ancestor_id))
+            new_ancestor = candidate_lattice.get(str(ancestor_id))
+            next_lattice = candidate_lattice.materialize()
             lattice.clear()
             lattice.update(next_lattice)
+            self._replace_locations_for_nodes(locations, (old_ancestor,), (new_ancestor,))
+            self._apply_role_plan_updates(role_plans, role_costs, updates, role_plan_index)
+            current_storage += int(current_delta)
             applied += 1
+            stop_refresh_done = False
+            role_plan_seed_cache.clear()
+            refresh_scores(related_pairs_for_ancestor(str(ancestor_id)))
+
+    def _veda_merge_phase(
+        self,
+        lattice: dict[str, _LatticeNode],
+        pairs: list[tuple[str, str]],
+        role_plans: dict[int, tuple[str, ...]],
+        role_costs: dict[int, float],
+        pairs_by_node: dict[str, set[tuple[str, str]]],
+        pairs_by_role: dict[int, set[tuple[str, str]]],
+    ) -> int:
+        applied = 0
+        scores: dict[tuple[str, str], float] = {}
+        score_results: dict[tuple[str, str], tuple[float, _LatticeOverlay, dict[int, tuple[tuple[str, ...], float]]]] = {}
+        versions: dict[tuple[str, str], int] = {}
+        heap: list[tuple[float, tuple[str, str], int]] = []
+        locations = self._lattice_locations(lattice)
+        role_plan_index = self._role_plan_node_index(role_plans)
+        role_plan_seed_cache: dict[int, _RolePlanSeed] = {}
+
+        def refresh_scores(target_pairs: Iterable[tuple[str, str]] | None = None) -> None:
+            if target_pairs is None:
+                targets = pairs
+            else:
+                targets = sorted({(str(child_id), str(ancestor_id)) for child_id, ancestor_id in target_pairs})
+            for child_id, ancestor_id in targets:
+                pair = (str(child_id), str(ancestor_id))
+                scored = self._score_veda_merge_pair(lattice, role_plans, role_costs, locations, pair[0], pair[1], role_plan_index, role_plan_seed_cache)
+                if scored is None:
+                    scores.pop(pair, None)
+                    score_results.pop(pair, None)
+                    versions[pair] = int(versions.get(pair, 0)) + 1
+                    continue
+                score, _candidate_lattice, _updates = scored
+                score_results[pair] = scored
+                self._push_merge_score(heap, scores, versions, pair, float(score))
+
+        def related_pairs_for_merge(child_id: str, ancestor_id: str) -> set[tuple[str, str]]:
+            targets = {
+                pair
+                for pair in pairs_by_node.get(str(ancestor_id), set())
+                if str(pair[1]) == str(ancestor_id)
+            }
+            targets.update(
+                pair
+                for pair in pairs_by_node.get(str(child_id), set())
+                if str(pair[0]) == str(child_id)
+            )
+            return targets
+
+        refresh_scores(None)
+        stop_refresh_done = False
+        while True:
+            selected = None
+            if len(heap) > max(4096, len(scores) * 4):
+                heap = self._rebuild_merge_heap(scores, versions)
+            while heap:
+                neg_score, pair, version = heapq.heappop(heap)
+                current = scores.get(pair)
+                if current is None or versions.get(pair) != version:
+                    continue
+                score = -float(neg_score)
+                if float(current) != score:
+                    continue
+                if score <= 0.0:
+                    if not stop_refresh_done:
+                        refresh_scores(None)
+                        stop_refresh_done = True
+                        selected = None
+                        break
+                    return applied
+                selected = (pair, score)
+                break
+            if selected is None:
+                if not stop_refresh_done:
+                    refresh_scores(None)
+                    stop_refresh_done = True
+                    continue
+                return applied
+
+            stop_refresh_done = False
+            (child_id, ancestor_id), _score = selected
+            pair = (str(child_id), str(ancestor_id))
+            rescored = self._score_veda_merge_pair(lattice, role_plans, role_costs, locations, child_id, ancestor_id, role_plan_index, role_plan_seed_cache)
+            if rescored is None:
+                scores.pop(pair, None)
+                score_results.pop(pair, None)
+                versions[pair] = int(versions.get(pair, 0)) + 1
+                continue
+            current_score, candidate_lattice, updates = rescored
+            score_results[pair] = rescored
+            if float(current_score) != float(_score):
+                self._push_merge_score(heap, scores, versions, pair, float(current_score))
+                continue
+            if current_score <= 0.0:
+                continue
+
+            old_child = lattice.get(str(child_id))
+            old_ancestor = lattice.get(str(ancestor_id))
+            new_ancestor = candidate_lattice.get(str(ancestor_id))
+            next_lattice = candidate_lattice.materialize()
+            lattice.clear()
+            lattice.update(next_lattice)
+            self._replace_locations_for_nodes(locations, (old_child, old_ancestor), (new_ancestor,))
+            self._apply_role_plan_updates(role_plans, role_costs, updates, role_plan_index)
+            applied += 1
+            stop_refresh_done = False
+            role_plan_seed_cache.clear()
+            refresh_scores(related_pairs_for_merge(str(child_id), str(ancestor_id)))
 
     def _run_effveda(self, lattice: dict[str, _LatticeNode], *, show_progress: bool) -> tuple[dict[str, _LatticeNode], dict[str, object]]:
         copy_count = self._effveda_copy_phase(lattice, show_progress=show_progress)
@@ -598,24 +1665,32 @@ class VedaPlanner:
 
     def _finalize_lattice(self, lattice: dict[str, _LatticeNode]) -> tuple[dict[str, _LatticeNode], dict[str, object]]:
         finalized: dict[str, _LatticeNode] = {}
+        leftover_by_pattern: dict[int, str] = {}
         split_count = 0
+        deduplicated_leftovers = 0
         for node in lattice.values():
             if self._node_size(node) >= self.indexing_threshold:
                 finalized[node.node_id] = node
                 continue
             for pattern_id in sorted(node.pattern_ids):
-                pattern = self.patterns[int(pattern_id)]
+                pattern_id = int(pattern_id)
+                if pattern_id in leftover_by_pattern:
+                    deduplicated_leftovers += 1
+                    continue
+                pattern = self.patterns[pattern_id]
                 node_id = self._new_node_id("leftover", pattern.role_ids, suffix=str(pattern_id))
                 finalized[node_id] = _LatticeNode(
                     node_id=node_id,
                     role_ids=pattern.role_ids,
-                    pattern_ids=frozenset({int(pattern_id)}),
+                    pattern_ids=frozenset({pattern_id}),
                     virtual_components=(role_key(pattern.role_ids),),
                 )
+                leftover_by_pattern[pattern_id] = node_id
                 split_count += 1
         return finalized, {
             "split_small_nodes_into_leftovers": True,
             "small_group_split_count": int(split_count),
+            "deduplicated_leftover_count": int(deduplicated_leftovers),
         }
 
     def _standalone_node_for_pattern(self, lattice: dict[str, _LatticeNode], pattern_id: int) -> str | None:
@@ -743,44 +1818,26 @@ class VedaPlanner:
             "deleted_unref_node_count": int(deleted_nodes),
         }
 
-    def _build_role_query_plans(self, lattice: dict[str, _LatticeNode], *, exact: bool = False) -> dict[int, tuple[str, ...]]:
-        locations: dict[int, list[str]] = defaultdict(list)
-        for node_id, node in lattice.items():
-            for pattern_id in node.pattern_ids:
-                locations[int(pattern_id)].append(node_id)
+    def _build_role_query_plans(self, lattice: dict[str, _LatticeNode], *, exact: bool = False, final: bool = False) -> dict[int, tuple[str, ...]]:
+        locations = self._lattice_locations(lattice)
+        return {
+            int(role_id): self._build_role_query_plan(lattice, int(role_id), exact=exact, final=final, locations=locations)
+            for role_id in self.roles
+        }
 
-        role_plans: dict[int, tuple[str, ...]] = {}
-        for role_id in self.roles:
-            authorized_patterns = {
-                int(pattern_id)
-                for pattern_id, pattern in self.patterns.items()
-                if int(role_id) in pattern.role_ids and int(pattern.vector_count) > 0
-            }
-            if not authorized_patterns:
-                role_plans[int(role_id)] = tuple()
-                continue
-
-            selected: set[str] = set()
-            pending: set[int] = set()
-            for pattern_id in authorized_patterns:
-                candidate_nodes = [node_id for node_id in locations.get(pattern_id, []) if node_id in lattice]
-                if len(candidate_nodes) == 1:
-                    selected.add(candidate_nodes[0])
-                else:
-                    pending.add(pattern_id)
-
-            covered = self._covered_patterns(lattice, selected) & authorized_patterns
-            pending -= covered
-            if exact and pending:
-                exact_nodes = self._solve_exact_coverage(lattice, pending, locations, int(role_id))
-                if exact_nodes is not None:
-                    selected.update(exact_nodes)
-                    role_plans[int(role_id)] = tuple(sorted(selected))
-                    continue
-
-            self._greedy_extend_coverage(lattice, selected, pending, locations, int(role_id))
-            role_plans[int(role_id)] = tuple(sorted(selected))
-        return role_plans
+    def _get_milp_backend(self):
+        if self._milp_backend_checked:
+            return self._milp_backend
+        self._milp_backend_checked = True
+        try:
+            import numpy as np
+            from scipy.optimize import Bounds, LinearConstraint, milp
+            from scipy.sparse import coo_matrix
+        except Exception:
+            self._milp_backend = None
+        else:
+            self._milp_backend = (np, Bounds, LinearConstraint, milp, coo_matrix)
+        return self._milp_backend
 
     def _solve_exact_coverage(
         self,
@@ -788,6 +1845,8 @@ class VedaPlanner:
         pending: set[int],
         locations: dict[int, list[str]],
         role_id: int,
+        *,
+        final: bool = False,
     ) -> set[str] | None:
         candidate_node_ids = sorted({
             node_id
@@ -797,24 +1856,36 @@ class VedaPlanner:
         })
         if not candidate_node_ids:
             return None
-        try:
-            import numpy as np
-            from scipy.optimize import Bounds, LinearConstraint, milp
-            from scipy.sparse import lil_matrix
-        except Exception:
+        backend = self._get_milp_backend()
+        if backend is None:
             return None
+        np, Bounds, LinearConstraint, milp, coo_matrix = backend
 
         pending_list = sorted(int(pattern_id) for pattern_id in pending)
-        node_index = {node_id: index for index, node_id in enumerate(candidate_node_ids)}
         pattern_index = {pattern_id: index for index, pattern_id in enumerate(pending_list)}
-        matrix = lil_matrix((len(pending_list), len(candidate_node_ids)), dtype=float)
-        for node_id in candidate_node_ids:
+        pending_set = set(pending_list)
+        row_indices: list[int] = []
+        col_indices: list[int] = []
+        for column, node_id in enumerate(candidate_node_ids):
             node = lattice[node_id]
-            column = node_index[node_id]
-            for pattern_id in set(node.pattern_ids) & set(pending_list):
-                matrix[pattern_index[int(pattern_id)], column] = 1.0
+            if len(node.pattern_ids) <= len(pending_set):
+                for pattern_id in node.pattern_ids:
+                    pattern_id = int(pattern_id)
+                    row = pattern_index.get(pattern_id)
+                    if row is not None:
+                        row_indices.append(int(row))
+                        col_indices.append(int(column))
+            else:
+                for pattern_id in pending_set:
+                    if int(pattern_id) in node.pattern_ids:
+                        row_indices.append(int(pattern_index[int(pattern_id)]))
+                        col_indices.append(int(column))
+        matrix = coo_matrix(
+            (np.ones(len(row_indices), dtype=float), (row_indices, col_indices)),
+            shape=(len(pending_list), len(candidate_node_ids)),
+        )
         costs = np.array(
-            [self._node_cost_for_role(lattice[node_id], int(role_id), final=True) for node_id in candidate_node_ids],
+            [self._node_cost_for_role(lattice[node_id], int(role_id), final=final) for node_id in candidate_node_ids],
             dtype=float,
         )
         constraints = LinearConstraint(matrix.tocsr(), np.ones(len(pending_list)), np.full(len(pending_list), np.inf))
@@ -836,6 +1907,58 @@ class VedaPlanner:
             return selected
         return None
 
+
+    def _greedy_extend_coverage_bits(
+        self,
+        lattice: dict[str, _LatticeNode],
+        selected: set[str],
+        pending_bits: int,
+        locations,
+        role_id: int,
+        *,
+        final: bool = False,
+    ) -> None:
+        pending = int(pending_bits)
+        while pending:
+            best_node_id = None
+            best_rank = None
+            seen_nodes: set[str] = set()
+            scan = pending
+            while scan:
+                low = scan & -scan
+                index = low.bit_length() - 1
+                pattern_id = self._bit_to_pattern.get(index)
+                if pattern_id is not None:
+                    for candidate_node_id in locations.get(int(pattern_id), []):
+                        node_id = str(candidate_node_id)
+                        if node_id in seen_nodes:
+                            continue
+                        seen_nodes.add(node_id)
+                        node = lattice.get(node_id)
+                        if node is None:
+                            continue
+                        covered_bits = self._node_pattern_bits(node) & pending
+                        cover_count = int(covered_bits.bit_count())
+                        if cover_count <= 0:
+                            continue
+                        rank = (
+                            -cover_count,
+                            self._node_cost_for_role(node, int(role_id), final=final),
+                            self._node_size(node),
+                            node_id,
+                        )
+                        if best_rank is None or rank < best_rank:
+                            best_rank = rank
+                            best_node_id = node_id
+                scan ^= low
+            if best_node_id is None:
+                break
+            selected.add(best_node_id)
+            node = lattice.get(best_node_id)
+            if node is None:
+                break
+            pending &= ~self._node_pattern_bits(node)
+
     def _greedy_extend_coverage(
         self,
         lattice: dict[str, _LatticeNode],
@@ -843,36 +1966,35 @@ class VedaPlanner:
         pending: set[int],
         locations: dict[int, list[str]],
         role_id: int,
+        *,
+        final: bool = False,
     ) -> None:
         while pending:
             best_node_id = None
             best_rank = None
-            fallback_node_id = None
-            fallback_rank = None
             for pattern_id in sorted(pending):
-                for candidate_node_id in locations.get(pattern_id, []):
-                    node = lattice.get(candidate_node_id)
+                for candidate_node_id in locations.get(int(pattern_id), []):
+                    node_id = str(candidate_node_id)
+                    node = lattice.get(node_id)
                     if node is None:
                         continue
-                    cover_count = len((set(node.pattern_ids) & pending))
+                    covered = set(int(pid) for pid in node.pattern_ids) & pending
+                    cover_count = len(covered)
+                    if cover_count <= 0:
+                        continue
                     rank = (
-                        -max(1, cover_count),
-                        self._node_cost_for_role(node, int(role_id), final=True),
+                        -cover_count,
+                        self._node_cost_for_role(node, int(role_id), final=final),
                         self._node_size(node),
-                        candidate_node_id,
+                        node_id,
                     )
-                    if cover_count > 0 and (best_rank is None or rank < best_rank):
+                    if best_rank is None or rank < best_rank:
                         best_rank = rank
-                        best_node_id = candidate_node_id
-                    if fallback_rank is None or rank < fallback_rank:
-                        fallback_rank = rank
-                        fallback_node_id = candidate_node_id
+                        best_node_id = node_id
             if best_node_id is None:
-                best_node_id = fallback_node_id
-            if best_node_id is None or best_node_id not in lattice:
                 break
             selected.add(best_node_id)
-            pending -= (set(lattice[best_node_id].pattern_ids) & pending)
+            pending -= (set(int(pid) for pid in lattice[best_node_id].pattern_ids) & pending)
 
     def _translate_role_plans(
         self,

@@ -11,7 +11,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 ALGORITHM="${ALGORITHM:-effveda}"
 
 # Space-separated ef_search values. Override with: EFS_VALUES="40 80 120" ./script/run_veda_efs.sh
-EFS_VALUES="${EFS_VALUES:-8 13 15 17 23 28 33 35 38 43 45 48 50 53}"
+EFS_VALUES="${EFS_VALUES:-25}"
 read -r -a EFS_LIST <<< "${EFS_VALUES}"
 
 PREPARE="${PREPARE:-false}"
@@ -26,17 +26,18 @@ RECORD_RECALL="${RECORD_RECALL:-true}"
 WARM_UP="${WARM_UP:-true}"
 ENABLE_INDEX="${ENABLE_INDEX:-true}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-true}"
-USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-false}"
+USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-true}"
 
 INDEXING_THRESHOLD="${INDEXING_THRESHOLD:-2900}"
 STORAGE_AMPLIFICATION="${STORAGE_AMPLIFICATION:-3.0}"
 SEARCH_MODE="${SEARCH_MODE:-coordinated}"
-SQL_TIMING_MODE="${SQL_TIMING_MODE:-fair}"
+SQL_TIMING_MODE="${SQL_TIMING_MODE:-legacy}"
 HNSW_ITERATIVE_SCAN="${HNSW_ITERATIVE_SCAN:-off}"
 HNSW_MAX_SCAN_TUPLES="${HNSW_MAX_SCAN_TUPLES:-}"
 GENERATOR_TYPE="${GENERATOR_TYPE:-tree-based}"
 RESULT_TAG_PREFIX="${RESULT_TAG_PREFIX:-veda_efs}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/efs_logs}"
+USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-true}"
 
 # Optional. Leave empty to use the full dataset/default query dataset.
 DOCUMENT_LIMIT="${DOCUMENT_LIMIT:-}"
@@ -80,6 +81,7 @@ run_case() {
     --use-ground-truth-cache "${USE_GROUND_TRUTH_CACHE}"
     --show-progress "${SHOW_PROGRESS}"
     --result-tag "${result_tag}"
+    --use-ground-truth-cache "${USE_GROUND_TRUTH_CACHE}"
   )
 
   if [[ -n "${HNSW_MAX_SCAN_TUPLES}" ]]; then

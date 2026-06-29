@@ -10,17 +10,20 @@ from typing import Optional
 
 from tqdm import tqdm
 
-from controller.baseline.veda.common import DEFAULT_COST_A, DEFAULT_COST_B, DEFAULT_COST_C
+from .cost_model import DEFAULT_COST_MODEL, DEFAULT_COST_TOPK, cost_model_metadata, estimate_partition_query_cost
 
 from .common import ACLPattern, KMeansPartition, KMeansPlan, TenantRoute, get_partition_table_name
 
 
-_COST_TOPK = 5
+_COST_TOPK = int(DEFAULT_COST_TOPK)
 _PRIVATE_MERGE_NEIGHBOR_LIMIT = 128
 _PRIVATE_FALLBACK_POOL_LIMIT = 128
 _SHARED_MERGE_NEIGHBOR_LIMIT = 128
 _SHARED_TENANT_PATTERN_CAP = 512
 _SHARED_FALLBACK_POOL_LIMIT = 128
+
+
+_PRIVATE_PLANNER_TRACE_HOOK = None
 
 
 def _shared_pattern_count_at_threshold(patterns: list[ACLPattern], threshold: float) -> int:
@@ -218,12 +221,9 @@ class HybridACLKMeansPlanner:
             "private_edge_top_d": int(private_edge_top_d),
             "ef_search_for_cost": int(ef_search),
             "topk_for_cost": int(_COST_TOPK),
-            "cost_model": "HNSW-filter latency: C(t,P)=q_t*(a*h+b*ef_search*(1/r+log2(1/r)*h)+c), h=log2(1+|P|), r=A(t,P)/|P| in (0,1], q_t=1 for every tenant",
-            "cost_a": float(DEFAULT_COST_A),
-            "cost_b": float(DEFAULT_COST_B),
-            "cost_c": float(DEFAULT_COST_C),
-            "shared_cost_model": "bottom-up ACL group merge using exact pre/post VEDA-calibrated tenant query cost",
-            "private_cost_model": "v16 core-star private merge: edge first chooses the memory-saving operation with minimum delta_latency; heap ranks by unit_latency_cost = delta_latency / memory_saved",
+            **cost_model_metadata(DEFAULT_COST_MODEL),
+            "shared_cost_model": "bottom-up ACL group merge using exact pre/post adaptive-ef latency cost",
+            "private_cost_model": "v16 core-star private merge: edge first chooses the memory-saving operation with minimum delta_latency; heap first takes delta_latency<=0 memory-saving candidates, then ranks positive-loss candidates by delta_latency/memory_saved",
             "shared_score_rule": "adaptive ACL marginal cost split with reference private groups and storage multiplier",
             "query_weight_rule": "all tenants use q_t=1; query_dataset workload frequencies are ignored",
             "split_query_weight_rule": "all tenants use q_t=1 in shared/private split",
@@ -628,7 +628,7 @@ class HybridACLKMeansPlanner:
             "reference_group_vector_min": int(min(reference_group_vectors)) if reference_group_vectors else 0,
             "reference_group_vector_mean": float(sum(reference_group_vectors) / len(reference_group_vectors)) if reference_group_vectors else 0.0,
             "reference_group_vector_max": int(max(reference_group_vectors)) if reference_group_vectors else 0,
-            "cost_model": "HNSW-filter C=q*(a*h+b*ef*(1/r+log2(1/r)*h)+c), h=log2(1+V), r=A/V in (0,1]; split shape follows SQUID reference-group admission",
+            "cost_model": str(cost_model_metadata(DEFAULT_COST_MODEL)["cost_model"]),
         }
         return shared, private, None
 
@@ -657,21 +657,14 @@ class HybridACLKMeansPlanner:
     ) -> float:
         if int(partition_vectors) <= 0 or int(accessible_vectors) <= 0 or float(tenant_weight) <= 0.0:
             return 0.0
-        partition_vectors = max(1, int(partition_vectors))
-        accessible_vectors = max(1, int(accessible_vectors))
-        selectivity = min(1.0, max(1e-12, float(accessible_vectors) / float(partition_vectors)))
-        inverse_selectivity = 1.0 / float(selectivity)  #选择性要倒数
-        efs = float(max(1, int(ef_search)))
-        log_vectors = math.log2(float(partition_vectors) + 1.0)
-        #filter_walk = float(inverse_selectivity) + math.log2(float(inverse_selectivity)) * float(log_vectors)
-
-        filter_walk = float(inverse_selectivity) #+ math.log2(float(inverse_selectivity)) * float(log_vectors)
-        base_cost = (
-            float(DEFAULT_COST_A) * float(log_vectors)
-            + float(DEFAULT_COST_B) * efs * filter_walk # k=10, 代表recall@10的召回max(efs * float(inverse_selectivity), 10 * float(inverse_selectivity), 10)
-            + float(DEFAULT_COST_C)
+        return estimate_partition_query_cost(
+            partition_vectors=max(1, int(partition_vectors)),
+            accessible_vectors=max(1, int(accessible_vectors)),
+            tenant_weight=float(tenant_weight),
+            ef_search=int(ef_search),
+            topk=int(_COST_TOPK),
+            use_adaptive_ef=True,
         )
-        return float(tenant_weight) * float(base_cost)
 
     def _assign_shared_groups_by_cost_split(
         self,
@@ -1208,17 +1201,20 @@ class HybridACLKMeansPlanner:
             partition_vectors = int(partition_vectors)
             if partition_vectors <= 0:
                 return 0.0
+            partition_vectors = max(1, int(partition_vectors))
             total = 0.0
             for tenant_id, accessible_vectors in tenant_access.items():
                 accessible_vectors = int(accessible_vectors)
-                if accessible_vectors <= 0:
+                tenant_weight = float(tenant_query_weights.get(int(tenant_id), 1.0))
+                if accessible_vectors <= 0 or tenant_weight <= 0.0:
                     continue
-                total += self._partition_query_cost(
+                total += estimate_partition_query_cost(
                     partition_vectors=int(partition_vectors),
                     accessible_vectors=int(accessible_vectors),
-                    tenant_weight=float(tenant_query_weights.get(int(tenant_id), 1.0)),
-                    total_vectors=int(total_original_vectors),
+                    tenant_weight=float(tenant_weight),
                     ef_search=int(ef_search),
+                    topk=int(_COST_TOPK),
+                    use_adaptive_ef=True,
                 )
             return float(total)
 
@@ -1247,16 +1243,21 @@ class HybridACLKMeansPlanner:
             data_bits &= int(service_data_bits)
             tenant_access = tenant_access_from_bits(service_bits, data_bits)
             vectors = int(vector_count_bits(data_bits))
+            pattern_ids = pattern_ids_from_bits(data_bits)
+            tenant_patterns = tenant_bits_to_pattern_map(service_bits)
+            tenant_count_for_core = int(len(service_bits))
             return {
                 "group_id": int(group_id),
-                "pattern_ids": pattern_ids_from_bits(data_bits),
+                "pattern_ids": pattern_ids,
                 "pattern_bits": int(data_bits),
-                "tenant_patterns": tenant_bits_to_pattern_map(service_bits),
-                "service_tenant_patterns": tenant_bits_to_pattern_map(service_bits),
+                "tenant_patterns": tenant_patterns,
+                "service_tenant_patterns": tenant_patterns,
                 "tenant_pattern_bits": service_bits,
                 "service_tenant_pattern_bits": service_bits,
                 "tenant_access": tenant_access,
                 "vector_count": int(vectors),
+                "pattern_count": int(len(pattern_ids)),
+                "tenant_count": int(tenant_count_for_core),
                 "cost": float(group_cost_from_access(tenant_access, int(vectors))),
                 "version": int(version),
             }
@@ -1359,15 +1360,85 @@ class HybridACLKMeansPlanner:
                     (overlap, int(overlap_bits)),
                     (right_remain, int(right_stored_bits & ~overlap_bits)),
                 ]
+            if operation == "merge_extract_overlap":
+                left_remain = remove_bits_from_tenants(left_bits, overlap_bits)
+                right_remain = remove_bits_from_tenants(right_bits, overlap_bits)
+                merged_remain = union_tenant_bits(left_remain, right_remain)
+                overlap = union_tenant_bits(mask_tenant_bits(left_bits, overlap_bits), mask_tenant_bits(right_bits, overlap_bits))
+                return [
+                    (merged_remain, int((left_stored_bits | right_stored_bits) & ~overlap_bits)),
+                    (overlap, int(overlap_bits)),
+                ]
             raise ValueError(f"Unknown private core-star operation: {operation}")
 
         operation_rank = {
             "split_overlap": 0,
-            "move_left": 1,
-            "move_right": 2,
-            "full": 3,
+            "merge_extract_overlap": 1,
+            "move_left": 2,
+            "move_right": 3,
+            "full": 4,
         }
-        operations = ("full", "move_left", "move_right", "split_overlap")
+        operations = ("full", "move_left", "move_right", "split_overlap", "merge_extract_overlap")
+
+        def group_selectivity_profile(group_id: int, group: dict[str, object]) -> dict[str, object] | None:
+            partition_vectors = int(group.get("vector_count", 0))
+            if partition_vectors <= 0:
+                return None
+            raw_tenant_access = group.get("tenant_access", {}) or {}
+            tenant_access = {
+                int(tenant_id): int(accessible_vectors)
+                for tenant_id, accessible_vectors in dict(raw_tenant_access).items()
+                if int(accessible_vectors) > 0
+            }
+            if not tenant_access:
+                return None
+            total_selectivity = 0.0
+            worst_tenant = None
+            worst_access = 0
+            worst_selectivity = 1.0
+            worst_rank: tuple[float, int, int] | None = None
+            is_pure = True
+            for tenant_id, accessible_vectors in tenant_access.items():
+                capped_access = min(int(partition_vectors), max(0, int(accessible_vectors)))
+                selectivity = float(capped_access) / float(partition_vectors)
+                total_selectivity += float(selectivity)
+                if int(capped_access) < int(partition_vectors):
+                    is_pure = False
+                rank = (float(selectivity), int(capped_access), int(tenant_id))
+                if worst_rank is None or rank < worst_rank:
+                    worst_rank = rank
+                    worst_tenant = int(tenant_id)
+                    worst_access = int(capped_access)
+                    worst_selectivity = float(selectivity)
+            if worst_tenant is None:
+                return None
+            avg_selectivity = float(total_selectivity) / float(max(1, len(tenant_access)))
+            return {
+                "group_id": int(group_id),
+                "partition_vectors": int(partition_vectors),
+                "tenant_count": int(len(tenant_access)),
+                "avg_selectivity": float(avg_selectivity),
+                "worst_selectivity": float(worst_selectivity),
+                "worst_tenant": int(worst_tenant),
+                "worst_access": int(worst_access),
+                "is_pure": bool(is_pure),
+            }
+
+        def selectivity_extract_specs(
+            group: dict[str, object],
+            worst_tenant: int,
+        ) -> list[tuple[dict[int, int], int | None]]:
+            tenant_bits = group_tenant_bits(group)
+            stored_bits = int(group_pattern_bits(group))
+            extract_bits = int(tenant_bits.get(int(worst_tenant), 0)) & int(stored_bits)
+            if int(extract_bits) == 0 or int(extract_bits) == int(stored_bits):
+                return []
+            remain_bits = remove_bits_from_tenants(tenant_bits, int(extract_bits))
+            extract_tenant_bits = mask_tenant_bits(tenant_bits, int(extract_bits))
+            return [
+                (remain_bits, int(stored_bits & ~int(extract_bits))),
+                (extract_tenant_bits, int(extract_bits)),
+            ]
 
         tenant_pattern_bits: dict[int, int] = {int(tenant_id): 0 for tenant_id in tenant_ids}
         for pattern in sorted(patterns, key=lambda item: int(item.pattern_id)):
@@ -1408,6 +1479,7 @@ class HybridACLKMeansPlanner:
 
         pattern_group_ids: dict[int, set[int]] = defaultdict(set)
         pattern_star_edges: dict[int, dict[tuple[int, int], float]] = defaultdict(dict)
+        pattern_core_ids: dict[int, int] = {}
         edge_refcounts: Counter = Counter()
         edge_signal_scores: dict[tuple[int, int], float] = defaultdict(float)
         adjacency: dict[int, set[int]] = defaultdict(set)
@@ -1439,59 +1511,103 @@ class HybridACLKMeansPlanner:
         last_candidate_score = None
         last_candidate_delta_latency = None
         last_candidate_memory_saved = None
+        selectivity_refine_count = 0
+        selectivity_refine_cost_delta = 0.0
+        selectivity_refine_stop_reason = "not_started"
+        selectivity_refine_last_group_id = None
+        selectivity_refine_last_worst_tenant = None
+        selectivity_refine_last_avg_selectivity = None
+        selectivity_refine_last_worst_selectivity = None
 
         def edge_key(left_id: int, right_id: int) -> tuple[int, int]:
             left_id = int(left_id)
             right_id = int(right_id)
             return (left_id, right_id) if left_id < right_id else (right_id, left_id)
 
+        def pattern_core_key(pattern_id: int, group_id: int) -> tuple[int, float, int, int, int]:
+            group = groups[int(group_id)]
+            group_vectors = max(1, int(group.get("vector_count", 0)))
+            acl_vectors = max(0, int(pattern_weights.get(int(pattern_id), 0)))
+            acl_share = float(acl_vectors) / float(group_vectors)
+            pattern_count = int(group.get("pattern_count", bit_count(group_pattern_bits(group))))
+            tenant_count = int(group.get("tenant_count", len(group_tenant_bits(group))))
+            return (
+                int(pattern_count),
+                -float(acl_share),
+                int(group_vectors),
+                int(tenant_count),
+                int(group_id),
+            )
+
         def register_group(group_id: int) -> None:
             group = groups.get(int(group_id))
             if group is None:
                 return
             for pattern_id in group.get("pattern_ids", set()):  # type: ignore[union-attr]
-                pattern_group_ids[int(pattern_id)].add(int(group_id))
+                pattern_id = int(pattern_id)
+                pattern_group_ids[pattern_id].add(int(group_id))
+                cached_core = pattern_core_ids.get(pattern_id)
+                if cached_core is not None and cached_core in groups:
+                    if pattern_core_key(pattern_id, int(group_id)) < pattern_core_key(pattern_id, int(cached_core)):
+                        pattern_core_ids[pattern_id] = int(group_id)
 
         def unregister_group(group_id: int) -> None:
             group = groups.get(int(group_id))
             if group is None:
                 return
             for pattern_id in group.get("pattern_ids", set()):  # type: ignore[union-attr]
-                owners = pattern_group_ids.get(int(pattern_id))
+                pattern_id = int(pattern_id)
+                owners = pattern_group_ids.get(pattern_id)
                 if owners is not None:
                     owners.discard(int(group_id))
                     if not owners:
-                        pattern_group_ids.pop(int(pattern_id), None)
+                        pattern_group_ids.pop(pattern_id, None)
+                        pattern_core_ids.pop(pattern_id, None)
+                if int(pattern_core_ids.get(pattern_id, -1)) == int(group_id):
+                    pattern_core_ids.pop(pattern_id, None)
 
-        def choose_core_group(owner_ids: set[int]) -> int | None:
+        def choose_core_group(pattern_id: int, owner_ids: set[int]) -> int | None:
             live_owner_ids = [int(group_id) for group_id in owner_ids if int(group_id) in groups]
             if not live_owner_ids:
                 return None
-            return min(
-                live_owner_ids,
-                key=lambda group_id: (
-                    int(groups[int(group_id)]["vector_count"]),
-                    int(bit_count(group_pattern_bits(groups[int(group_id)]))),
-                    int(len(group_tenant_bits(groups[int(group_id)]))),
-                    int(group_id),
-                ),
-            )
+            return min(live_owner_ids, key=lambda group_id: pattern_core_key(int(pattern_id), int(group_id)))
 
-        def compute_pattern_star_edges(pattern_id: int) -> dict[tuple[int, int], float]:
+        def compute_pattern_star_edges(
+            pattern_id: int,
+            *,
+            focus_owner_ids: set[int] | None = None,
+        ) -> dict[tuple[int, int], float]:
             pattern_id = int(pattern_id)
             owners = {int(group_id) for group_id in pattern_group_ids.get(pattern_id, set()) if int(group_id) in groups}
             if len(owners) <= 1:
+                pattern_core_ids.pop(pattern_id, None)
                 return {}
-            core_id = choose_core_group(owners)
-            if core_id is None:
-                return {}
-            signal = float(pattern_weights.get(pattern_id, 0)) / float(max(1, int(len(owners)) - 1))
+            core_id = pattern_core_ids.get(pattern_id)
+            if core_id not in owners or int(core_id) not in groups:
+                core_id = choose_core_group(pattern_id, owners)
+                if core_id is None:
+                    pattern_core_ids.pop(pattern_id, None)
+                    return {}
+                pattern_core_ids[pattern_id] = int(core_id)
+            elif focus_owner_ids:
+                for focus_id in sorted(int(group_id) for group_id in focus_owner_ids if int(group_id) in owners):
+                    if pattern_core_key(pattern_id, int(focus_id)) < pattern_core_key(pattern_id, int(core_id)):
+                        core_id = int(focus_id)
+                pattern_core_ids[pattern_id] = int(core_id)
+            signal = float(pattern_weights.get(pattern_id, 0))
             if signal <= 0.0:
                 return {}
+            if focus_owner_ids and int(core_id) not in focus_owner_ids:
+                target_owner_ids = {
+                    int(group_id)
+                    for group_id in focus_owner_ids
+                    if int(group_id) in owners and int(group_id) != int(core_id)
+                }
+            else:
+                target_owner_ids = {int(group_id) for group_id in owners if int(group_id) != int(core_id)}
             return {
                 edge_key(int(core_id), int(owner_id)): float(signal)
-                for owner_id in sorted(owners)
-                if int(owner_id) != int(core_id)
+                for owner_id in sorted(target_owner_ids)
             }
 
         def store_edge_candidate_cache(cache_key: tuple[int, int, int, int], value: dict[str, object] | None) -> None:
@@ -1569,14 +1685,27 @@ class HybridACLKMeansPlanner:
 
             all_new_edges_by_pattern: dict[int, dict[tuple[int, int], float]] = {}
             edge_scores: dict[tuple[int, int], float] = defaultdict(float)
+            edge_acl_counts: Counter = Counter()
             target_group_ids: set[int] = set()
+            full_refresh_patterns: set[int] = set()
             for pattern_id in sorted(normalized_pattern_ids):
-                new_edges = compute_pattern_star_edges(int(pattern_id))
-                all_new_edges_by_pattern[int(pattern_id)] = new_edges
+                pattern_id = int(pattern_id)
+                old_core_id = pattern_core_ids.get(pattern_id)
+                focus_for_pattern = focus_ids if focus_ids else None
+                new_edges = compute_pattern_star_edges(
+                    pattern_id,
+                    focus_owner_ids=focus_for_pattern,
+                )
+                new_core_id = pattern_core_ids.get(pattern_id)
+                if focus_ids and old_core_id != new_core_id:
+                    new_edges = compute_pattern_star_edges(pattern_id, focus_owner_ids=None)
+                    full_refresh_patterns.add(pattern_id)
+                all_new_edges_by_pattern[pattern_id] = new_edges
                 for edge, signal in new_edges.items():
                     if edge[0] not in groups or edge[1] not in groups:
                         continue
                     edge_scores[edge] += float(signal)
+                    edge_acl_counts[edge] += 1
                     target_group_ids.add(int(edge[0]))
                     target_group_ids.add(int(edge[1]))
                 for edge in pattern_star_edges.get(int(pattern_id), {}):
@@ -1587,11 +1716,15 @@ class HybridACLKMeansPlanner:
                 target_group_ids = set(focus_ids)
 
             incident_edges_by_group: dict[int, list[tuple[float, tuple[int, int]]]] = defaultdict(list)
-            for edge, score in edge_scores.items():
+            for edge, _score in edge_scores.items():
                 if edge[0] not in groups or edge[1] not in groups:
                     continue
-                incident_edges_by_group[int(edge[0])].append((float(score), edge))
-                incident_edges_by_group[int(edge[1])].append((float(score), edge))
+                left_acl_count = max(1, len(groups[int(edge[0])].get("pattern_ids", set())))
+                right_acl_count = max(1, len(groups[int(edge[1])].get("pattern_ids", set())))
+                shared_acl_count = max(1, int(edge_acl_counts.get(edge, 1)))
+                edge_rank_score = float(shared_acl_count) / math.sqrt(float(left_acl_count) * float(right_acl_count))
+                incident_edges_by_group[int(edge[0])].append((float(edge_rank_score), edge))
+                incident_edges_by_group[int(edge[1])].append((float(edge_rank_score), edge))
 
             selected_edges: set[tuple[int, int]] = set()
             for group_id in sorted(group_id for group_id in target_group_ids if int(group_id) in groups):
@@ -1610,7 +1743,7 @@ class HybridACLKMeansPlanner:
                     for edge, signal in all_new_edges_by_pattern.get(int(pattern_id), {}).items()
                     if edge in selected_edges
                 }
-                if focus_ids:
+                if focus_ids and int(pattern_id) not in full_refresh_patterns:
                     preserved_edges = {
                         edge: float(signal)
                         for edge, signal in old_edges.items()
@@ -1666,7 +1799,7 @@ class HybridACLKMeansPlanner:
                 if cached is None:
                     return None
                 candidate = dict(cached)
-                if include_specs:
+                if include_specs and not candidate.get("result_specs"):
                     specs = operation_specs(left, right, str(candidate["operation"]))
                     if not specs:
                         return None
@@ -1706,11 +1839,22 @@ class HybridACLKMeansPlanner:
             score_memory_gain = float(max(1, int(memory_saved)))
             score_memory_m0 = 0.0
             unit_latency_cost = float(delta_latency) / max(float(score_memory_gain), 1e-12)
+            if float(delta_latency) <= 0.0:
+                latency_class = 0
+                memory_per_latency_gain = float(score_memory_gain)
+                heap_score = -float(score_memory_gain)
+            else:
+                latency_class = 1
+                memory_per_latency_gain = float(score_memory_gain) / max(float(delta_latency), 1e-12)
+                heap_score = float(unit_latency_cost)
             candidate: dict[str, object] = {
                 "left_id": int(left_id),
                 "right_id": int(right_id),
                 "operation": str(operation),
-                "score": -float(unit_latency_cost),
+                "score": float(unit_latency_cost),
+                "latency_class": int(latency_class),
+                "heap_score": float(heap_score),
+                "memory_per_latency_gain": float(memory_per_latency_gain),
                 "unit_latency_cost": float(unit_latency_cost),
                 "delta_latency": float(delta_latency),
                 "memory_saved": int(memory_saved),
@@ -1721,13 +1865,9 @@ class HybridACLKMeansPlanner:
                 "max_result_partition_size": int(max_partition_size),
                 "left_version": int(left["version"]),
                 "right_version": int(right["version"]),
+                "result_specs": _specs,
             }
             store_edge_candidate_cache(cache_key, candidate)
-            if include_specs:
-                specs = operation_specs(left, right, str(operation))
-                if not specs:
-                    return None
-                candidate["result_specs"] = specs
             return candidate
 
         def push_candidate(left_id: int, right_id: int) -> bool:
@@ -1746,7 +1886,8 @@ class HybridACLKMeansPlanner:
             heapq.heappush(
                 candidate_heap,
                 (
-                    float(candidate["unit_latency_cost"]),
+                    int(candidate["latency_class"]),
+                    float(candidate["heap_score"]),
                     float(candidate["delta_latency"]),
                     int(candidate["max_result_partition_size"]),
                     -int(candidate["memory_saved"]),
@@ -1789,6 +1930,7 @@ class HybridACLKMeansPlanner:
             edge_candidate_cache.clear()
             edge_candidate_cache_groups.clear()
             pattern_star_edges.clear()
+            pattern_core_ids.clear()
             edge_refcounts.clear()
             edge_signal_scores.clear()
             _refreshed, added_edges, _removed = refresh_star_edges_for_patterns(set(pattern_group_ids), push=True)
@@ -1832,7 +1974,8 @@ class HybridACLKMeansPlanner:
             nonlocal stale_candidates
             while candidate_heap:
                 (
-                    _unit_latency_cost,
+                    _latency_class,
+                    _heap_score,
                     _delta_latency,
                     _max_partition_size,
                     _negative_memory_saved,
@@ -1903,6 +2046,8 @@ class HybridACLKMeansPlanner:
             affected_patterns = set(int(pattern_id) for pattern_id in left.get("pattern_ids", set())) | set(
                 int(pattern_id) for pattern_id in right.get("pattern_ids", set())
             )
+            if _PRIVATE_PLANNER_TRACE_HOOK is not None:
+                _PRIVATE_PLANNER_TRACE_HOOK(locals())
 
             prune_edge_candidate_cache({int(left_id), int(right_id)})
             unregister_group(left_id)
@@ -1970,6 +2115,113 @@ class HybridACLKMeansPlanner:
         if int(total_current_storage) <= int(allowed_total_storage):
             stop_reason = "memory_satisfied"
 
+        selectivity_refine_stop_reason = "not_started"
+        selectivity_heap: list[tuple[float, float, int, int, int, int]] = []
+        for group_id, group in groups.items():
+            profile = group_selectivity_profile(int(group_id), group)
+            if profile is None:
+                continue
+            heapq.heappush(
+                selectivity_heap,
+                (
+                    float(profile["avg_selectivity"]),
+                    float(profile["worst_selectivity"]),
+                    -int(profile["partition_vectors"]),
+                    int(group_id),
+                    int(group.get("version", 0)),
+                    int(profile["worst_tenant"]),
+                ),
+            )
+        if not selectivity_heap:
+            selectivity_refine_stop_reason = "no_refine_group"
+        while selectivity_heap:
+            (
+                _avg_selectivity,
+                _worst_selectivity,
+                _negative_vectors,
+                group_id,
+                group_version,
+                _worst_tenant_from_heap,
+            ) = heapq.heappop(selectivity_heap)
+            if int(group_id) not in groups:
+                continue
+            group = groups[int(group_id)]
+            if int(group.get("version", 0)) != int(group_version):
+                continue
+            profile = group_selectivity_profile(int(group_id), group)
+            if profile is None:
+                continue
+            selectivity_refine_last_group_id = int(group_id)
+            selectivity_refine_last_worst_tenant = int(profile["worst_tenant"])
+            selectivity_refine_last_avg_selectivity = float(profile["avg_selectivity"])
+            selectivity_refine_last_worst_selectivity = float(profile["worst_selectivity"])
+            if bool(profile["is_pure"]):
+                selectivity_refine_stop_reason = "worst_group_pure"
+                break
+            refine_specs = selectivity_extract_specs(group, int(profile["worst_tenant"]))
+            if not refine_specs:
+                selectivity_refine_stop_reason = "no_extractable_worst_tenant_bits"
+                break
+            before_cost = float(group["cost"])
+            before_memory = int(group["vector_count"])
+            after_cost, after_memory, _max_partition_size, live_count = specs_cost_memory(refine_specs)
+            if int(live_count) <= 1 or int(after_memory) != int(before_memory):
+                selectivity_refine_stop_reason = "invalid_extract_specs"
+                break
+            delta_latency = float(after_cost) - float(before_cost)
+            if float(delta_latency) >= 0.0:
+                selectivity_refine_stop_reason = "worst_group_not_beneficial"
+                break
+
+            prune_edge_candidate_cache({int(group_id)})
+            unregister_group(int(group_id))
+            groups.pop(int(group_id), None)
+
+            new_group_ids: set[int] = set()
+            for spec in refine_specs:
+                new_group_bits, new_group_stored_bits = normalize_spec(spec)
+                new_group = make_group_from_bits(int(next_group_id), new_group_bits, stored_bits=new_group_stored_bits)
+                if not is_live_group(new_group):
+                    continue
+                new_group_id = int(next_group_id)
+                next_group_id += 1
+                groups[new_group_id] = new_group
+                new_group_ids.add(new_group_id)
+                new_profile = group_selectivity_profile(int(new_group_id), new_group)
+                if new_profile is not None:
+                    heapq.heappush(
+                        selectivity_heap,
+                        (
+                            float(new_profile["avg_selectivity"]),
+                            float(new_profile["worst_selectivity"]),
+                            -int(new_profile["partition_vectors"]),
+                            int(new_group_id),
+                            int(new_group.get("version", 0)),
+                            int(new_profile["worst_tenant"]),
+                        ),
+                    )
+            if not new_group_ids:
+                selectivity_refine_stop_reason = "extract_created_no_live_group"
+                break
+            current_cost += float(delta_latency)
+            selectivity_refine_cost_delta += float(delta_latency)
+            selectivity_refine_count += 1
+            operation_counts["selectivity_extract"] += 1
+            selectivity_refine_stop_reason = "refine_candidate_pending"
+        else:
+            if selectivity_refine_stop_reason == "not_started" or selectivity_refine_stop_reason == "refine_candidate_pending":
+                selectivity_refine_stop_reason = "no_refine_group"
+        if int(selectivity_refine_count) > 0:
+            adjacency.clear()
+            candidate_heap.clear()
+            edge_heap_tokens.clear()
+            edge_candidate_cache.clear()
+            edge_candidate_cache_groups.clear()
+            pattern_star_edges.clear()
+            pattern_core_ids.clear()
+            edge_refcounts.clear()
+            edge_signal_scores.clear()
+
         compact_ids = {group_id: index for index, group_id in enumerate(sorted(groups))}
         private_groups_for_partitions: list[dict[str, object]] = []
         tenant_to_cluster: dict[int, int] = {}
@@ -2025,7 +2277,7 @@ class HybridACLKMeansPlanner:
         self._last_private_metadata = {
             "enabled": True,
             "planner": "private_core_star_split_merge_v16",
-            "objective": "v16 rollback: start from one private group per tenant; compress replicated ACLs with ACL-core star graph and four operations until total storage reaches budget",
+            "objective": "v16 rollback: start from one private group per tenant; compress replicated ACLs with ACL-core star graph and five operations until total storage reaches budget",
             "target_cluster_count": int(target_cluster_count),
             "target_cluster_count_enforced": False,
             "replication_budget_ratio": float(max(0.0, float(replication_budget_ratio))),
@@ -2048,15 +2300,24 @@ class HybridACLKMeansPlanner:
             "move_left_count": int(operation_counts.get("move_left", 0)),
             "move_right_count": int(operation_counts.get("move_right", 0)),
             "split_overlap_count": int(operation_counts.get("split_overlap", 0)),
+            "merge_extract_overlap_count": int(operation_counts.get("merge_extract_overlap", 0)),
+            "selectivity_extract_count": int(selectivity_refine_count),
+            "selectivity_extract_cost_delta": float(selectivity_refine_cost_delta),
+            "selectivity_extract_stop_reason": str(selectivity_refine_stop_reason),
+            "selectivity_extract_last_group_id": None if selectivity_refine_last_group_id is None else int(selectivity_refine_last_group_id),
+            "selectivity_extract_last_worst_tenant": None if selectivity_refine_last_worst_tenant is None else int(selectivity_refine_last_worst_tenant),
+            "selectivity_extract_last_avg_selectivity": None if selectivity_refine_last_avg_selectivity is None else float(selectivity_refine_last_avg_selectivity),
+            "selectivity_extract_last_worst_selectivity": None if selectivity_refine_last_worst_selectivity is None else float(selectivity_refine_last_worst_selectivity),
             "total_storage_reduction": int(total_storage_reduction),
-            "total_latency_delta": float(total_latency_delta),
+            "total_latency_delta": float(total_latency_delta) + float(selectivity_refine_cost_delta),
             "cost_initial": float(initial_cost),
             "cost_final": float(current_cost),
-            "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; heap ranks by unit_latency_cost = delta_latency / memory_saved, smaller is better",
-            "cost_model": "same VEDA-calibrated kmeans route model, q_t=1 for every tenant",
-            "graph_rule": "ACL-core star graph: for each ACL choose smallest owner as core and connect core to other owners; edge signal n_a/(support(a)-1); each group keeps top-d incident candidates",
-            "graph_update_rule": "v16 incremental core-star: maintain pattern_star_edges, edge_refcounts, edge_signal_scores, and group-indexed candidate cache; after each operation refresh only new groups' ACL patterns and their top-d incident star edges; rebuild graph only as fallback when heap is empty",
-            "operation_rule": "four operations: full keeps whole-group A+B merge; move_left, move_right, and split_overlap use I as the full ACL intersection between the two groups",
+            "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; heap first takes delta_latency<=0 memory-saving candidates, then ranks positive-loss candidates by delta_latency/memory_saved",
+            "cost_model": str(cost_model_metadata(DEFAULT_COST_MODEL)["cost_model"]),
+            "graph_rule": "ACL-core star graph: for each ACL choose the owner with the fewest ACLs as core, then largest in-group vector share as tie-break and connect core to other owners; edge signal vector_count(a); top-d rank uses shared_acl_count/sqrt(|ACL(Gi)|*|ACL(Gj)|); each group keeps top-d incident candidates",
+            "graph_update_rule": "v16 incremental core-star: maintain pattern_star_edges, pattern_core_ids, edge_refcounts, edge_signal_scores, and group-indexed candidate cache; after each operation refresh only new groups' ACL patterns and their top-d incident star edges; rebuild graph only as fallback when heap is empty",
+            "operation_rule": "five operations: full keeps whole-group A+B merge; move_left, move_right, split_overlap, and merge_extract_overlap use I as the full ACL intersection; merge_extract_overlap produces (A-minus-I)+(B-minus-I) and I",
+            "selectivity_refinement_rule": "after memory compression, repeatedly take the globally worst average-selectivity private group, extract the worst tenant route ACL block into a separate partition if route-level Cost Model decreases; stop immediately when that worst group is pure or not beneficial",
             "private_edge_top_d": int(top_d),
             "initial_candidate_edges": int(initial_candidate_edges),
             "active_adjacency_edges": int(active_adjacency_edges),

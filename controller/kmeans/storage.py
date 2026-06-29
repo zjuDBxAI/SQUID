@@ -4,6 +4,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
+import math
 import os
 import time
 from typing import Optional
@@ -48,6 +49,20 @@ def _safe_index_name(table_name: str, suffix: str) -> str:
     digest = hashlib.blake2b(candidate.encode("utf-8"), digest_size=8).hexdigest()
     compact_suffix = suffix.replace("_", "")
     return f"idx_{digest}_{compact_suffix}"[:_POSTGRES_IDENTIFIER_LIMIT]
+
+
+def _json_safe(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(child) for child in value]
+    return value
+
+
+def _json_dumps(value) -> str:
+    return json.dumps(_json_safe(value), allow_nan=False)
 
 
 def _drop_non_constraint_indexes_for_table(cur, table_name: str) -> None:
@@ -238,7 +253,7 @@ def save_plan(plan: KMeansPlan, *, db_connection_factory=_default_db_connection_
                     int(len(plan.partitions)),
                     int(plan.metadata.get("document_count", 0)),
                     int(plan.metadata.get("partition_vector_count", 0)),
-                    json.dumps(plan.metadata),
+                    _json_dumps(plan.metadata),
                 ],
             )
             plan_id = int(cur.fetchone()[0])
@@ -251,7 +266,7 @@ def save_plan(plan: KMeansPlan, *, db_connection_factory=_default_db_connection_
                     int(pattern.document_count),
                     int(pattern.vector_count),
                     float(pattern.weight),
-                    json.dumps({"score": float(pattern.score), "zone": str(pattern.zone)}),
+                    _json_dumps({"score": float(pattern.score), "zone": str(pattern.zone)}),
                 )
                 for pattern in plan.patterns
             ]
@@ -280,8 +295,8 @@ def save_plan(plan: KMeansPlan, *, db_connection_factory=_default_db_connection_
                     list(partition.tenant_ids),
                     list(partition.pattern_ids),
                     list(partition.document_ids),
-                    json.dumps([[int(d), int(p)] for d, p in partition.document_pattern_pairs]),
-                    json.dumps(partition.metadata),
+                    _json_dumps([[int(d), int(p)] for d, p in partition.document_pattern_pairs]),
+                    _json_dumps(partition.metadata),
                 )
                 for partition in plan.partitions
             ]

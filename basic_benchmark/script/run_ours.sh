@@ -21,7 +21,7 @@ SHOW_PROGRESS="${SHOW_PROGRESS:-true}"
 USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-true}"
 RESULT_TAG="${RESULT_TAG:-OURS}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/efs_logs}"
-EFS_LIST="${EFS_LIST:-5 10 15 20 25 30 35 40 45 50}"
+EFS_LIST="${EFS_LIST:-10 20 30 40 50}"
 
 # This script only evaluates existing materialized kmeans partitions.
 # It intentionally passes --prepare false for every ef_search value.

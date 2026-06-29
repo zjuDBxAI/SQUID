@@ -1,0 +1,133 @@
+{
+  "floor_fit": {
+    "T0": 0.264,
+    "a": 0.1231468318359884,
+    "active_count": 7,
+    "c1": -1.277360510363875,
+    "mae": 0.07028171396521209,
+    "max_abs_error": 0.17700000000000002,
+    "r2": 0.9179303116261522,
+    "rmse": 0.08581862368821776
+  },
+  "logN_plus_inv_sqrtN": {
+    "a": 0.18918923571601648,
+    "c1": -2.4688505840345947,
+    "mae": 0.05683950548292965,
+    "max_abs_error": 0.1353317166112763,
+    "r2": 0.9490926665867099,
+    "rmse": 0.06758967022246735,
+    "s": 25.60994250495124
+  },
+  "loo": {
+    "floor": {
+      "mae": 0.10853756626719697,
+      "max_abs_error": 0.17725900000000003,
+      "r2": 0.8349105892653769,
+      "rmse": 0.12171658581691445
+    },
+    "logN_plus_inv_sqrtN": {
+      "mae": 0.10213353153711857,
+      "max_abs_error": 0.3271066940836569,
+      "r2": 0.7962883572337546,
+      "rmse": 0.135206658138525
+    },
+    "original_logN": {
+      "mae": 0.12568671570581857,
+      "max_abs_error": 0.379598128700654,
+      "r2": 0.7141274189531217,
+      "rmse": 0.1601682404060662
+    }
+  },
+  "model": "T(N)=max(T0,a*log2(1+N)+c1)",
+  "original_logN": {
+    "a": 0.10718037140163453,
+    "c1": -1.0273473368099577,
+    "mae": 0.09217750514372423,
+    "max_abs_error": 0.22305632454379176,
+    "r2": 0.8679013075745754,
+    "rmse": 0.10887781895690973
+  },
+  "plot": "/data/Multitenanthakes/controller/baseline/veda/train/result_appendix_moredata_300k_20260619/veda_size_a_floor_fit.png",
+  "points": [
+    {
+      "actual_ms": 0.264,
+      "floor_error_ms": 0.0,
+      "floor_loo_error_ms": -0.17725900000000003,
+      "floor_loo_pred_ms": 0.08674099999999998,
+      "floor_pred_ms": 0.264,
+      "n_vectors": 1000
+    },
+    {
+      "actual_ms": 0.087,
+      "floor_error_ms": 0.17700000000000002,
+      "floor_loo_error_ms": 0.17700000000000002,
+      "floor_loo_pred_ms": 0.264,
+      "floor_pred_ms": 0.264,
+      "n_vectors": 3000
+    },
+    {
+      "actual_ms": 0.154,
+      "floor_error_ms": 0.11000000000000001,
+      "floor_loo_error_ms": 0.11000000000000001,
+      "floor_loo_pred_ms": 0.264,
+      "floor_pred_ms": 0.264,
+      "n_vectors": 5000
+    },
+    {
+      "actual_ms": 0.4365,
+      "floor_error_ms": -0.07750306303041576,
+      "floor_loo_error_ms": -0.1685008706664265,
+      "floor_loo_pred_ms": 0.2679991293335735,
+      "floor_pred_ms": 0.35899693696958423,
+      "n_vectors": 10000
+    },
+    {
+      "actual_ms": 0.486,
+      "floor_error_ms": -0.0038651136944214404,
+      "floor_loo_error_ms": -0.005522011682297601,
+      "floor_loo_pred_ms": 0.4804779883177024,
+      "floor_pred_ms": 0.48213488630557855,
+      "n_vectors": 20000
+    },
+    {
+      "actual_ms": 0.584,
+      "floor_error_ms": 0.06092081339277289,
+      "floor_loo_error_ms": 0.07171441950810709,
+      "floor_loo_pred_ms": 0.655714419508107,
+      "floor_pred_ms": 0.6449208133927729,
+      "n_vectors": 50000
+    },
+    {
+      "actual_ms": 0.6335,
+      "floor_error_ms": 0.09492188781111266,
+      "floor_loo_error_ms": 0.11139802425460599,
+      "floor_loo_pred_ms": 0.7448980242546059,
+      "floor_pred_ms": 0.7284218878111126,
+      "n_vectors": 80000
+    },
+    {
+      "actual_ms": 0.716,
+      "floor_error_ms": 0.052065868622174216,
+      "floor_loo_error_ms": 0.06229898507175502,
+      "floor_loo_pred_ms": 0.778298985071755,
+      "floor_pred_ms": 0.7680658686221742,
+      "n_vectors": 100000
+    },
+    {
+      "actual_ms": 0.935,
+      "floor_error_ms": -0.04378818785179295,
+      "floor_loo_error_ms": -0.06143967352243629,
+      "floor_loo_pred_ms": 0.8735603264775638,
+      "floor_pred_ms": 0.8912118121482071,
+      "n_vectors": 200000
+    },
+    {
+      "actual_ms": 1.0459999999999998,
+      "floor_error_ms": -0.08275220524943094,
+      "floor_loo_error_ms": -0.14024267796634127,
+      "floor_loo_pred_ms": 0.9057573220336586,
+      "floor_pred_ms": 0.9632477947505689,
+      "n_vectors": 300000
+    }
+  ]
+}

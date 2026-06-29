@@ -625,3 +625,35 @@ def calculate_veda(condition=None, *, enable_index=None):
     if not existing_tables:
         return 0.0
     return calculate_table_storage_in_mb(existing_tables)
+
+
+def calculate_acl_partition(condition=None, *, enable_index=None):
+    """Calculate total physical storage for the ACL-per-partition baseline."""
+    tables = [
+        'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
+        'acl_partition_current_plan', 'acl_partition_current_patterns',
+        'acl_partition_current_routes',
+    ]
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        existing_tables = []
+        for table_name in tables:
+            cur.execute('SELECT to_regclass(%s);', [table_name])
+            if cur.fetchone()[0] is not None:
+                existing_tables.append(table_name)
+
+        cur.execute("""
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'acl_documentblocks_partition_%';
+        """)
+        existing_tables.extend(row[0] for row in cur.fetchall())
+    finally:
+        cur.close()
+        conn.close()
+
+    if not existing_tables:
+        return 0.0
+    return calculate_table_storage_in_mb(existing_tables)

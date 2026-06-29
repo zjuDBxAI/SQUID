@@ -1,0 +1,68 @@
+{
+  "model_name": "veda_appendix_b_hnsw_cost",
+  "formula": "C_theta(N,efs)=a*log2(1+N)+b*efs+c",
+  "latency_unit": "ms",
+  "latency_stat": "median",
+  "a": 0.045031711341757666,
+  "b": 0.01687400786628281,
+  "c": 0.3060789740983843,
+  "c1_size_intercept": 1.6364521337242685e-10,
+  "c2_efs_intercept": 1.4483662816109995,
+  "c_from_size": -0.016874007702637597,
+  "c_from_efs": 0.6290319558994062,
+  "selected_efs_term_by_r2": "linear_efs",
+  "size_sweep": {
+    "formula": "T_size(N)=a*log2(1+N)+c1",
+    "rmse_ms": 0.25419530965973663,
+    "mae_ms": 0.23455221853267394,
+    "r2": 0.571445460478408
+  },
+  "efs_sweep_linear": {
+    "formula": "T_efs(efs)=b*efs+c2",
+    "b": 0.01687400786628281,
+    "c2": 1.4483662816109995,
+    "rmse_ms": 0.441668200784524,
+    "mae_ms": 0.3517805541791431,
+    "r2": 0.988365991240041
+  },
+  "efs_sweep_log": {
+    "formula": "T_efs(efs)=b_log*efs*log2(efs)+c2_log",
+    "b_log": 0.0017376568007699844,
+    "c2_log": 1.7775041397756333,
+    "rmse_ms": 0.6505309175288806,
+    "mae_ms": 0.5612052051679117,
+    "r2": 0.9747609498713784
+  },
+  "sizes": [
+    1000,
+    3000,
+    10000,
+    30000,
+    100000,
+    300000,
+    600000,
+    1000000
+  ],
+  "efs_values": [
+    1,
+    5,
+    10,
+    20,
+    40,
+    80,
+    120,
+    200,
+    400,
+    800
+  ],
+  "fixed_size": 300000,
+  "query_file": "/data/Multitenanthakes/basic_benchmark/query_dataset.json",
+  "query_count": 200,
+  "query_topk": 1,
+  "source_table": "documentblocks",
+  "table_prefix": "veda_cost_test_appendix",
+  "hnsw_m": 16,
+  "hnsw_ef_construction": 200,
+  "size_sweep_csv": "/data/Multitenanthakes/controller/baseline/veda/train/result_appendix_test_20260619/veda_cost_size_sweep.csv",
+  "efs_sweep_csv": "/data/Multitenanthakes/controller/baseline/veda/train/result_appendix_test_20260619/veda_cost_efs_sweep.csv"
+}
