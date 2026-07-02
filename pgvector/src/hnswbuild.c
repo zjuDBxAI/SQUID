@@ -167,7 +167,6 @@ CreateGraphPages(HnswBuildState * buildstate)
 		Size		etupSize;
 		Size		ntupSize;
 		Size		combinedSize;
-		Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
 		/* Update iterator */
 		iter = element->next;
@@ -176,7 +175,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
 		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		etupSize = HnswElementTupleSize(base, element);
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -316,7 +315,7 @@ AddDuplicateInMemory(HnswElement element, HnswElement dup)
 		return false;
 	}
 
-	HnswAddHeapTid(dup, &element->heaptids[0]);
+	HnswAddHeapTidWithPattern(dup, &element->heaptids[0], element->patternIds[0]);
 
 	LWLockRelease(&dup->lock);
 
@@ -466,6 +465,92 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
 	LWLockRelease(entryLock);
 }
 
+
+static int64
+SquidPatternFromIndexValues(Datum *values, bool *isnull)
+{
+	if (isnull[1])
+		ereport(ERROR,
+				(errcode(ERRCODE_NOT_NULL_VIOLATION),
+				 errmsg("squidhnsw pattern payload cannot be null")));
+
+	return DatumGetInt64(values[1]);
+}
+
+/*
+ * Insert tuple
+ */
+static bool
+SquidInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, HnswBuildState * buildstate)
+{
+	HnswGraph  *graph = buildstate->graph;
+	HnswElement element;
+	HnswAllocator *allocator = &buildstate->allocator;
+	HnswSupport *support = &buildstate->support;
+	Size		valueSize;
+	Pointer		valuePtr;
+	LWLock	   *flushLock = &graph->flushLock;
+	char	   *base = buildstate->hnswarea;
+	Datum		value;
+	int64		patternId;
+
+	/* Form index value */
+	if (!HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, support))
+		return false;
+	patternId = SquidPatternFromIndexValues(values, isnull);
+
+	/* Get datum size */
+	valueSize = VARSIZE_ANY(DatumGetPointer(value));
+
+	/* Ensure graph not flushed when inserting */
+	LWLockAcquire(flushLock, LW_SHARED);
+
+	/* Are we in the on-disk phase? */
+	if (graph->flushed)
+	{
+		LWLockRelease(flushLock);
+
+		return SquidHnswInsertTupleOnDisk(index, support, value, heaptid, patternId, true);
+	}
+
+	LWLockAcquire(&graph->allocatorLock, LW_EXCLUSIVE);
+
+	if (graph->memoryUsed >= graph->memoryTotal)
+	{
+		LWLockRelease(&graph->allocatorLock);
+
+		LWLockRelease(flushLock);
+		LWLockAcquire(flushLock, LW_EXCLUSIVE);
+
+		if (!graph->flushed)
+		{
+			ereport(NOTICE,
+					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
+					 errdetail("Building will take significantly more time."),
+					 errhint("Increase maintenance_work_mem to speed up builds.")));
+			FlushPages(buildstate);
+		}
+
+		LWLockRelease(flushLock);
+
+		return SquidHnswInsertTupleOnDisk(index, support, value, heaptid, patternId, true);
+	}
+
+	element = HnswInitElement(base, heaptid, buildstate->m, buildstate->ml, buildstate->maxLevel, allocator);
+	element->hasPayload = true;
+	element->patternIds[0] = patternId;
+	valuePtr = HnswAlloc(allocator, valueSize);
+	LWLockRelease(&graph->allocatorLock);
+
+	memcpy(valuePtr, DatumGetPointer(value), valueSize);
+	HnswPtrStore(base, element->value, valuePtr);
+	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
+	InsertTupleInMemory(buildstate, element);
+	LWLockRelease(flushLock);
+
+	return true;
+}
+
 /*
  * Insert tuple
  */
@@ -587,6 +672,32 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	}
 
 	/* Reset memory context */
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextReset(buildstate->tmpCtx);
+}
+
+
+static void
+SquidBuildCallback(Relation index, ItemPointer tid, Datum *values,
+				   bool *isnull, bool tupleIsAlive, void *state)
+{
+	HnswBuildState *buildstate = (HnswBuildState *) state;
+	HnswGraph  *graph = buildstate->graph;
+	MemoryContext oldCtx;
+
+	/* Skip null vectors */
+	if (isnull[0])
+		return;
+
+	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
+
+	if (SquidInsertTuple(index, values, isnull, tid, buildstate))
+	{
+		SpinLockAcquire(&graph->lock);
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, ++graph->indtuples);
+		SpinLockRelease(&graph->lock);
+	}
+
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextReset(buildstate->tmpCtx);
 }
@@ -1054,14 +1165,14 @@ ComputeParallelWorkers(Relation heap, Relation index)
  * Build graph
  */
 static void
-BuildGraph(HnswBuildState * buildstate)
+BuildGraph(HnswBuildState * buildstate, IndexBuildCallback callback, bool allowParallel)
 {
 	int			parallel_workers = 0;
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
 
 	/* Calculate parallel workers */
-	if (buildstate->heap != NULL)
+	if (allowParallel && buildstate->heap != NULL)
 		parallel_workers = ComputeParallelWorkers(buildstate->heap, buildstate->index);
 
 	/* Attempt to launch parallel worker scan when required */
@@ -1075,7 +1186,7 @@ BuildGraph(HnswBuildState * buildstate)
 			buildstate->reltuples = ParallelHeapScan(buildstate);
 		else
 			buildstate->reltuples = table_index_build_scan(buildstate->heap, buildstate->index, buildstate->indexInfo,
-														   true, true, BuildCallback, (void *) buildstate, NULL);
+														   true, true, callback, (void *) buildstate, NULL);
 
 		buildstate->indtuples = buildstate->graph->indtuples;
 	}
@@ -1094,7 +1205,7 @@ BuildGraph(HnswBuildState * buildstate)
  */
 static void
 BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
-		   HnswBuildState * buildstate, ForkNumber forkNum)
+		   HnswBuildState * buildstate, ForkNumber forkNum, IndexBuildCallback callback, bool allowParallel)
 {
 #ifdef HNSW_MEMORY
 	SeedRandom(42);
@@ -1102,7 +1213,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 
 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
 
-	BuildGraph(buildstate);
+	BuildGraph(buildstate, callback, allowParallel);
 
 	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
 		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
@@ -1119,7 +1230,28 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	IndexBuildResult *result;
 	HnswBuildState buildstate;
 
-	BuildIndex(heap, index, indexInfo, &buildstate, MAIN_FORKNUM);
+	BuildIndex(heap, index, indexInfo, &buildstate, MAIN_FORKNUM, BuildCallback, true);
+
+	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
+	result->heap_tuples = buildstate.reltuples;
+	result->index_tuples = buildstate.indtuples;
+
+	return result;
+}
+
+
+IndexBuildResult *
+squidhnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
+{
+	IndexBuildResult *result;
+	HnswBuildState buildstate;
+
+	if (indexInfo->ii_NumIndexAttrs < 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("squidhnsw index requires INCLUDE (pattern_id)")));
+
+	BuildIndex(heap, index, indexInfo, &buildstate, MAIN_FORKNUM, SquidBuildCallback, false);
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
 	result->heap_tuples = buildstate.reltuples;
@@ -1137,5 +1269,5 @@ hnswbuildempty(Relation index)
 	IndexInfo  *indexInfo = BuildIndexInfo(index);
 	HnswBuildState buildstate;
 
-	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM);
+	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM, BuildCallback, true);
 }

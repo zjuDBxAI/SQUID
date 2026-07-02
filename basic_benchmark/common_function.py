@@ -53,6 +53,8 @@ def get_index_type(table_name):
         index_definition = index[0].lower()
         if 'ivfflat' in index_definition:
             return 'ivfflat'
+        elif 'squidhnsw' in index_definition:
+            return 'squidhnsw'
         elif 'hnsw' in index_definition:
             return 'hnsw'
 

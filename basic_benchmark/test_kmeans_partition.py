@@ -76,7 +76,7 @@ def _ensure_index_state(partitions, index_type: str) -> None:
 def test_kmeans_partition_search(
     iterations=1,
     enable_index=True,
-    index_type="hnsw",
+    index_type="squidhnsw",
     statistics_type="sql",
     generator_type="tree-based",
     record_recall=True,
@@ -134,6 +134,7 @@ def test_kmeans_partition_search(
     else:
         drop_indexes_for_materialized_partitions()
 
+    _sync_efconfig_value("kmeans_index_type", str(index_type))
     if ef_search is not None:
         _sync_efconfig_value("ef_search", int(ef_search))
         _sync_efconfig_value("kmeans_ef_search", int(ef_search))
@@ -160,7 +161,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run kmeans tenant-cluster partition benchmark.")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--enable-index", type=_str_to_bool, default=True)
-    parser.add_argument("--index-type", choices=["hnsw", "ivfflat"], default="hnsw")
+    parser.add_argument("--index-type", choices=["squidhnsw", "hnsw", "ivfflat"], default="squidhnsw")
     parser.add_argument("--statistics-type", choices=["sql", "system"], default="sql")
     parser.add_argument("--generator-type", default="tree-based")
     parser.add_argument("--record-recall", type=_str_to_bool, default=True)

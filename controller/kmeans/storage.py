@@ -629,7 +629,7 @@ def materialize_plan(
     plan: KMeansPlan,
     *,
     create_indexes: bool = False,
-    index_type: str = "hnsw",
+    index_type: str = "squidhnsw",
     show_progress: bool = True,
     db_connection_factory=_default_db_connection_factory,
 ) -> KMeansPlan:
@@ -665,7 +665,7 @@ def materialize_plan(
 
 def create_index_for_partition(
     table_name: str,
-    index_type: str = "hnsw",
+    index_type: str = "squidhnsw",
     *,
     hnsw_m: int = 16,
     hnsw_ef_construction: int = 64,
@@ -688,22 +688,26 @@ def create_index_for_partition(
                     sql.Identifier(table_name),
                 )
             )
-            if index_type.lower() == "hnsw":
+            normalized_index_type = index_type.lower()
+            if normalized_index_type in {"hnsw", "squidhnsw"}:
+                include_clause = sql.SQL(" INCLUDE (pattern_id)") if normalized_index_type == "squidhnsw" else sql.SQL("")
                 cur.execute(
                     sql.SQL(
                         """
                         CREATE INDEX IF NOT EXISTS {}
-                        ON {} USING hnsw (vector vector_l2_ops)
+                        ON {} USING {} (vector vector_l2_ops){}
                         WITH (m = {m}, ef_construction = {ef});
                         """
                     ).format(
                         sql.Identifier(_safe_index_name(table_name, "vector_idx")),
                         sql.Identifier(table_name),
+                        sql.SQL(normalized_index_type),
+                        include_clause,
                         m=sql.Literal(int(hnsw_m)),
                         ef=sql.Literal(int(hnsw_ef_construction)),
                     )
                 )
-            elif index_type.lower() == "ivfflat":
+            elif normalized_index_type == "ivfflat":
                 cur.execute(
                     sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING ivfflat (vector vector_l2_ops);").format(
                         sql.Identifier(_safe_index_name(table_name, "vector_idx")),
@@ -724,7 +728,7 @@ def _create_index_for_partition_timed(table_name: str, index_type: str) -> tuple
 
 
 def create_indexes_for_materialized_partitions(
-    index_type: str = "hnsw",
+    index_type: str = "squidhnsw",
     *,
     parallel: bool = True,
     max_workers: Optional[int] = None,
@@ -805,7 +809,7 @@ def build_and_materialize_kmeans_plan(
     document_limit: Optional[int] = None,
     query_dataset_path: Optional[str] = None,
     create_indexes: bool = False,
-    index_type: str = "hnsw",
+    index_type: str = "squidhnsw",
     show_progress: bool = True,
     enable_split: bool = True,
     private_edge_top_d: int = 32,

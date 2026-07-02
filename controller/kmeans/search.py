@@ -44,6 +44,13 @@ def _configured_ef_min() -> int:
     return max(1, int(configured))
 
 
+def _configured_index_type() -> str:
+    efconfig = _resolve_efconfig_module()
+    if efconfig is None:
+        return "squidhnsw"
+    return str(getattr(efconfig, "kmeans_index_type", "squidhnsw") or "squidhnsw").strip().lower()
+
+
 def _clamp_ef(value: int, route: TenantRoute | None = None) -> int:
     ef = max(1, int(value))
     if route is not None:
@@ -63,6 +70,18 @@ def _try_set(cur, statement: str) -> None:
         cur.execute("RELEASE SAVEPOINT kmeans_search_config;")
 
 
+def _set_if_supported(cur, statement: str) -> bool:
+    try:
+        cur.execute("SAVEPOINT kmeans_search_config;")
+        cur.execute(statement)
+        cur.execute("RELEASE SAVEPOINT kmeans_search_config;")
+        return True
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT kmeans_search_config;")
+        cur.execute("RELEASE SAVEPOINT kmeans_search_config;")
+        return False
+
+
 def _configure_search_session(cur) -> None:
     cur.execute("SET max_parallel_workers_per_gather = 0;")
     cur.execute("SET jit = off;")
@@ -70,6 +89,22 @@ def _configure_search_session(cur) -> None:
 
 def _result_key(row) -> tuple[int, int]:
     return (int(row[1]), int(row[0]))
+
+
+def _global_bound(results, topk: int) -> float:
+    if len(results) < int(topk):
+        return float("inf")
+    seen = set()
+    unique = []
+    for row in sorted(results, key=lambda item: item[3]):
+        key = _result_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+        if len(unique) == int(topk):
+            return float(unique[-1][3])
+    return float("inf")
 
 
 def _merge_results(all_results, topk: int):
@@ -120,6 +155,114 @@ def _probe_adaptive_ef(route: TenantRoute, *, probe_rows, base_ef: int) -> int:
     candidate_count = max(1, len(probe_rows))
     expanded = int(math.ceil(float(base_ef) * float(candidate_count) / float(hit_count)))
     return _clamp_ef(max(int(base_ef), expanded), route)
+
+
+def _route_selectivity(route: TenantRoute) -> float:
+    accessible_vectors = int(getattr(route, "accessible_vector_count", 0) or 0)
+    partition_vectors = int(getattr(route, "partition_vector_count", 0) or 0)
+    if accessible_vectors <= 0 or partition_vectors <= 0:
+        return 1.0
+    return min(1.0, max(0.000001, float(accessible_vectors) / float(partition_vectors)))
+
+
+def _allowed_patterns_csv(route: TenantRoute) -> str:
+    return ",".join(str(int(pattern_id)) for pattern_id in route.pattern_ids)
+
+
+def _build_authorized_query(
+    route: TenantRoute,
+    *,
+    query_vector,
+    limit: int,
+):
+    return (
+        sql.SQL(
+            """
+            SELECT block_id, document_id, block_content, distance
+            FROM (
+                SELECT p.block_id, p.document_id, p.block_content,
+                       p.vector <-> %s::vector AS distance
+                FROM {} p
+                WHERE p.pattern_id = ANY(%s)
+                ORDER BY p.vector <-> %s::vector
+                LIMIT %s
+            ) candidates
+            ORDER BY distance;
+            """
+        ).format(sql.Identifier(route.table_name)),
+        [query_vector, list(int(pattern_id) for pattern_id in route.pattern_ids), query_vector, int(limit)],
+    )
+
+
+def _configure_squidhnsw_route(cur, route: TenantRoute, *, base_ef: int, max_ef: int, global_bound: float) -> bool:
+    supported = _set_if_supported(cur, f"SET squidhnsw.base_ef = {int(base_ef)};")
+    supported = _set_if_supported(cur, f"SET squidhnsw.max_ef = {int(max_ef)};") and supported
+    supported = _set_if_supported(cur, f"SET squidhnsw.route_selectivity = {_route_selectivity(route):.12f};") and supported
+    bound = float(global_bound)
+    bound_sql = "1e308" if math.isinf(bound) else repr(max(0.0, bound))
+    supported = _set_if_supported(cur, f"SET squidhnsw.global_bound = {bound_sql};") and supported
+    supported = _set_if_supported(cur, sql.SQL("SET squidhnsw.allowed_patterns = {};").format(sql.Literal(_allowed_patterns_csv(route))).as_string(cur)) and supported
+    return supported
+
+
+def _execute_authorized_search(cur, route: TenantRoute, *, query_vector, topk: int, base_ef: int, max_ef: int, global_bound: float):
+    _configure_squidhnsw_route(cur, route, base_ef=int(base_ef), max_ef=int(max_ef), global_bound=float(global_bound))
+    query, params = _build_authorized_query(route, query_vector=query_vector, limit=int(topk))
+    cur.execute(query, params)
+    return cur.fetchall()
+
+
+def _explain_authorized_search_time(cur, route: TenantRoute, *, query_vector, topk: int, base_ef: int, max_ef: int, global_bound: float) -> float:
+    _configure_squidhnsw_route(cur, route, base_ef=int(base_ef), max_ef=int(max_ef), global_bound=float(global_bound))
+    query, params = _build_authorized_query(route, query_vector=query_vector, limit=int(topk))
+    cur.execute(sql.SQL("EXPLAIN ANALYZE {}").format(query), params)
+    return _extract_execution_time_seconds(cur.fetchall())
+
+
+def _search_squidhnsw_route(
+    cur,
+    route: TenantRoute,
+    *,
+    query_vector,
+    topk: int,
+    ef_min: int,
+    collect_sql_time: bool,
+    global_bound: float,
+):
+    base_ef = _base_ef(topk=int(topk), ef_min=int(ef_min))
+    max_ef = _clamp_ef(_HNSW_EF_SEARCH_MAX, route)
+    if collect_sql_time:
+        elapsed = _explain_authorized_search_time(
+            cur,
+            route,
+            query_vector=query_vector,
+            topk=int(topk),
+            base_ef=int(base_ef),
+            max_ef=int(max_ef),
+            global_bound=float(global_bound),
+        )
+        rows = _execute_authorized_search(
+            cur,
+            route,
+            query_vector=query_vector,
+            topk=int(topk),
+            base_ef=int(base_ef),
+            max_ef=int(max_ef),
+            global_bound=float(global_bound),
+        )
+    else:
+        started = time.perf_counter()
+        rows = _execute_authorized_search(
+            cur,
+            route,
+            query_vector=query_vector,
+            topk=int(topk),
+            base_ef=int(base_ef),
+            max_ef=int(max_ef),
+            global_bound=float(global_bound),
+        )
+        elapsed = time.perf_counter() - started
+    return rows, float(elapsed)
 
 
 def _build_candidate_query(
@@ -246,15 +389,27 @@ def _kmeans_partition_search_impl(user_id: int, query_vector, topk: int, *, coll
         with conn.cursor() as cur:
             _configure_search_session(cur)
             ef_min = _configured_ef_min()
+            index_type = _configured_index_type()
             for route in routes:
-                route_results, route_time = _probe_then_search_route(
-                    cur,
-                    route,
-                    query_vector=query_vector,
-                    topk=int(topk),
-                    ef_min=int(ef_min),
-                    collect_sql_time=bool(collect_sql_time),
-                )
+                if index_type == "squidhnsw":
+                    route_results, route_time = _search_squidhnsw_route(
+                        cur,
+                        route,
+                        query_vector=query_vector,
+                        topk=int(topk),
+                        ef_min=int(ef_min),
+                        collect_sql_time=bool(collect_sql_time),
+                        global_bound=_global_bound(all_results, int(topk)),
+                    )
+                else:
+                    route_results, route_time = _probe_then_search_route(
+                        cur,
+                        route,
+                        query_vector=query_vector,
+                        topk=int(topk),
+                        ef_min=int(ef_min),
+                        collect_sql_time=bool(collect_sql_time),
+                    )
                 total_query_time += float(route_time)
                 all_results.extend(route_results)
     finally:

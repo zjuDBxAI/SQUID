@@ -133,6 +133,13 @@ def _explain_analyze_time(cur, query, params) -> float:
     return total_query_time
 
 
+def _release_statement_locks(conn) -> None:
+    # Long SQL-statistics runs touch many partition tables. Ending the
+    # transaction after each route releases relation locks accumulated by
+    # EXPLAIN ANALYZE and avoids exhausting PostgreSQL shared lock memory.
+    conn.commit()
+
+
 def _route_query(route: VedaRoute, *, query_vector, topk: int, limit: int):
     return (
         sql.SQL(
@@ -227,6 +234,7 @@ def _veda_search_impl(user_id: int, query_vector, topk: int, *, collect_sql_time
                     total_query_time += _explain_analyze_time(cur, query, params)
                 cur.execute(query, params)
                 all_results.extend(cur.fetchall())
+                _release_statement_locks(conn)
 
             if search_mode == "ours":
                 for route in routes:
@@ -256,6 +264,7 @@ def _veda_search_impl(user_id: int, query_vector, topk: int, *, collect_sql_time
                             collect_sql_time=count_probe_sql_time,
                         )
                         total_query_time += probe_time
+                        _release_statement_locks(conn)
                         all_results.extend(_authorized_probe_results(local_unfiltered, route))
                         local_bound = float(local_unfiltered[int(topk) - 1][4]) if len(local_unfiltered) >= int(topk) else float("inf")
                         global_bound = _global_bound(all_results, int(topk))

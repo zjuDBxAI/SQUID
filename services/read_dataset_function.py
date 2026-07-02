@@ -26,7 +26,9 @@ from tqdm import tqdm
 
 
 SIFT_DOCUMENT_VECTOR_COUNT = 100  # Group 100 vectors into a single synthetic document
+YFCC_DOCUMENT_VECTOR_COUNT = 1  # YFCC metadata is per image/vector, so each vector is one document
 SIFT10M_FEATURES_MEMBER = "SIFT10M/SIFT10Mfeatures.mat"
+YFCC100M_SUBSAMPLED_VECS = "yfcc100m/yfcc_subsampled_nvec_1000000_nlabel_1000_vecs.npy"
 
 
 def store_document(document_id, document_name):
@@ -308,7 +310,7 @@ def process_subset(data_subset, start_index, dataset_type):
     print(f"Processed subset starting at index {start_index}")
 
 def _ingest_numeric_vector_dataset(total_vectors, vector_dim, fetch_chunk, load_number, start_row,
-                                   dataset_label):
+                                   dataset_label, document_vector_count=SIFT_DOCUMENT_VECTOR_COUNT):
     if start_row >= total_vectors:
         print(f"Start row ({start_row}) is beyond {dataset_label} size ({total_vectors}); nothing to load.")
         return
@@ -336,7 +338,7 @@ def _ingest_numeric_vector_dataset(total_vectors, vector_dim, fetch_chunk, load_
         document_blocks = []
         for offset, vector in enumerate(vectors):
             global_index = batch_start + offset
-            document_id = (global_index // SIFT_DOCUMENT_VECTOR_COUNT) + 1
+            document_id = (global_index // document_vector_count) + 1
             block_id = global_index + 1
             vector_bytes = vector.tobytes()
             block_content = Binary(b"")
@@ -418,7 +420,8 @@ def read_and_store_sift_dataset(load_number=1000, start_row=0):
             fetch_chunk=fetch_chunk,
             load_number=load_number,
             start_row=start_row,
-            dataset_label="sift-128-euclidean"
+            dataset_label="sift-128-euclidean",
+            document_vector_count=SIFT_DOCUMENT_VECTOR_COUNT,
         )
 
 
@@ -510,8 +513,45 @@ def read_and_store_sift10m_dataset(load_number=1000, start_row=0):
             fetch_chunk=fetch_chunk,
             load_number=load_number,
             start_row=start_row,
-            dataset_label="SIFT10M"
+            dataset_label="SIFT10M",
+            document_vector_count=SIFT_DOCUMENT_VECTOR_COUNT,
         )
+
+
+def read_and_store_yfcc100m_dataset(load_number=1000, start_row=0):
+    """
+    Read vectors from the Curator/YFCC100M subset and persist them as document
+    blocks. Each YFCC vector is an image with its own metadata labels, so each
+    vector is kept as one document to preserve ABAC permission semantics.
+    """
+    dataset_path = get_dataset_path()
+    vecs_path = os.path.join(dataset_path, YFCC100M_SUBSAMPLED_VECS)
+
+    if not os.path.exists(vecs_path):
+        raise FileNotFoundError(f"YFCC100M vector file not found at {vecs_path}. Please download it first.")
+
+    vectors = np.load(vecs_path, mmap_mode="r")
+    if len(vectors.shape) != 2:
+        raise ValueError("Expected a 2D array for YFCC100M vectors.")
+
+    total_vectors, vector_dim = vectors.shape
+
+    def fetch_chunk(start, end):
+        return np.asarray(vectors[start:end, :], dtype=np.float32)
+
+    print(f"Loading YFCC100M vectors from row {start_row} to "
+          f"{'end' if load_number is None or load_number <= 0 else min(total_vectors, start_row + load_number)} "
+          f"(exclusive). Detected dimension: {vector_dim}.")
+
+    _ingest_numeric_vector_dataset(
+        total_vectors=total_vectors,
+        vector_dim=vector_dim,
+        fetch_chunk=fetch_chunk,
+        load_number=load_number,
+        start_row=start_row,
+        dataset_label="YFCC100M",
+        document_vector_count=YFCC_DOCUMENT_VECTOR_COUNT,
+    )
 
 
 def read_and_store_dataset_parallel(load_number=1000, start_row=0, num_threads=4, dataset="wikipedia-22-12"):
@@ -524,6 +564,9 @@ def read_and_store_dataset_parallel(load_number=1000, start_row=0, num_threads=4
         return
     elif dataset == "sift-128-euclidean":
         read_and_store_sift_dataset(load_number=load_number, start_row=start_row)
+        return
+    elif dataset == "yfcc100m":
+        read_and_store_yfcc100m_dataset(load_number=load_number, start_row=start_row)
         return
     elif dataset == "arxiv":
         arxiv_data_file = os.path.join(dataset_path, "arxiv/arxiv-metadata-oai-snapshot.json")

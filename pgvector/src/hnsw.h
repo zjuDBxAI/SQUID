@@ -60,7 +60,9 @@
 #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
+#define HNSW_ELEMENT_TUPLE_PAYLOAD_SIZE(payloadCount)	MAXALIGN(sizeof(int64) * (payloadCount))
 #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
+#define HNSW_ELEMENT_TUPLE_SIZE_WITH_PAYLOAD(size, payloadCount)	(HNSW_ELEMENT_TUPLE_SIZE(size) + HNSW_ELEMENT_TUPLE_PAYLOAD_SIZE(payloadCount))
 #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
@@ -113,6 +115,11 @@ extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
+extern int	squidhnsw_base_ef;
+extern int	squidhnsw_max_ef;
+extern double squidhnsw_route_selectivity;
+extern double squidhnsw_global_bound;
+extern char *squidhnsw_allowed_patterns;
 
 typedef enum HnswIterativeScanMode
 {
@@ -139,6 +146,8 @@ struct HnswElementData
 {
 	HnswElementPtr next;
 	ItemPointerData heaptids[HNSW_HEAPTIDS];
+	int64		patternIds[HNSW_HEAPTIDS];
+	bool		hasPayload;
 	uint8		heaptidsLength;
 	uint8		level;
 	uint8		deleted;
@@ -263,6 +272,17 @@ typedef struct HnswQuery
 	Datum		value;
 }			HnswQuery;
 
+typedef bool (*HnswPatternAllowedCallback) (void *arg, int64 pattern);
+
+typedef struct HnswSquidAdaptiveContext
+{
+	int			baseEf;
+	int			maxEf;
+	double		routeSelectivity;
+	HnswPatternAllowedCallback patternAllowed;
+	void	   *patternAllowedArg;
+}			HnswSquidAdaptiveContext;
+
 typedef struct HnswBuildState
 {
 	/* Info */
@@ -333,7 +353,7 @@ typedef struct HnswElementTupleData
 	uint8		version;
 	ItemPointerData heaptids[HNSW_HEAPTIDS];
 	ItemPointerData neighbortid;
-	uint16		unused;
+	uint16		payloadCount;
 	Vector		data;
 }			HnswElementTupleData;
 
@@ -375,6 +395,12 @@ typedef struct HnswScanOpaqueData
 	double		previousDistance;
 	Size		maxMemory;
 	MemoryContext tmpCtx;
+
+	/* SQUIDHNSW scan state */
+	bool		squidFilterInitialized;
+	bool		squidFilterEnabled;
+	int64	   *squidAllowedPatterns;
+	int			squidAllowedPatternCount;
 
 	/* Support functions */
 	HnswSupport support;
@@ -418,6 +444,7 @@ Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
+List	   *HnswSearchLayerAdaptive(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, bool initVisited, int64 *tuples, HnswSquidAdaptiveContext *adaptive);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
@@ -428,14 +455,18 @@ HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * 
 void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
 void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
+void		HnswAddHeapTidWithPattern(HnswElement element, ItemPointer heaptid, int64 patternId);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
 void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
 bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
+bool		SquidHnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, int64 patternId, bool building);
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
+Size		HnswElementTupleSize(char *base, HnswElement element);
+int64	  *HnswElementTuplePayload(HnswElementTuple etup);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
@@ -444,6 +475,7 @@ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
+IndexBuildResult *squidhnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
 void		hnswbuildempty(Relation index);
 bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
 #if PG_VERSION_NUM >= 140000
@@ -451,11 +483,18 @@ bool		hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_t
 #endif
 					   ,IndexInfo *indexInfo
 );
+bool		squidhnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid, Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+						,bool indexUnchanged
+#endif
+						,IndexInfo *indexInfo
+);
 IndexBulkDeleteResult *hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
 IndexBulkDeleteResult *hnswvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
 IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
+bool		squidhnswgettuple(IndexScanDesc scan, ScanDirection dir);
 void		hnswendscan(IndexScanDesc scan);
 
 static inline HnswNeighborArray *

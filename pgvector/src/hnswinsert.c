@@ -158,7 +158,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	char	   *base = NULL;
 
 	/* Calculate sizes */
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
+	etupSize = HnswElementTupleSize(base, e);
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
@@ -618,6 +618,18 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 
 	/* Add heap TID, modifying the tuple on the page directly */
 	etup->heaptids[i] = element->heaptids[0];
+	if (element->hasPayload)
+	{
+		int64 *payload;
+
+		if (etup->payloadCount != HNSW_HEAPTIDS)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("squidhnsw duplicate tuple is missing payload space")));
+
+		payload = HnswElementTuplePayload(etup);
+		payload[i] = element->patternIds[0];
+	}
 
 	/* Commit */
 	if (building)
@@ -686,8 +698,8 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 /*
  * Insert a tuple into the index
  */
-bool
-HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
+static bool
+HnswInsertTupleOnDiskInternal(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, int64 patternId, bool hasPayload, bool building)
 {
 	HnswElement entryPoint;
 	HnswElement element;
@@ -708,6 +720,8 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
+	element->hasPayload = hasPayload;
+	element->patternIds[0] = patternId;
 	HnswPtrStore(base, element->value, DatumGetPointer(value));
 
 	/* Prevent concurrent inserts when likely updating entry point */
@@ -736,6 +750,20 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	return true;
 }
 
+
+
+bool
+HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
+{
+	return HnswInsertTupleOnDiskInternal(index, support, value, heaptid, 0, false, building);
+}
+
+bool
+SquidHnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, int64 patternId, bool building)
+{
+	return HnswInsertTupleOnDiskInternal(index, support, value, heaptid, patternId, true, building);
+}
+
 /*
  * Insert a tuple into the index
  */
@@ -753,6 +781,68 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 		return;
 
 	HnswInsertTupleOnDisk(index, &support, value, heaptid, false);
+}
+
+
+static int64
+SquidPatternFromIndexValues(Datum *values, bool *isnull)
+{
+	if (isnull[1])
+		ereport(ERROR,
+				(errcode(ERRCODE_NOT_NULL_VIOLATION),
+				 errmsg("squidhnsw pattern payload cannot be null")));
+
+	return DatumGetInt64(values[1]);
+}
+
+static void
+SquidHnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid)
+{
+	Datum		value;
+	int64		patternId;
+	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
+	HnswSupport support;
+
+	HnswInitSupport(&support, index);
+
+	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
+		return;
+	patternId = SquidPatternFromIndexValues(values, isnull);
+
+	SquidHnswInsertTupleOnDisk(index, &support, value, heaptid, patternId, false);
+}
+
+bool
+squidhnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
+				Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+				,bool indexUnchanged
+#endif
+				,IndexInfo *indexInfo
+)
+{
+	MemoryContext oldCtx;
+	MemoryContext insertCtx;
+
+	if (isnull[0])
+		return false;
+
+	if (indexInfo->ii_NumIndexAttrs < 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("squidhnsw index requires INCLUDE (pattern_id)")));
+
+	insertCtx = AllocSetContextCreate(CurrentMemoryContext,
+									  "SquidHnsw insert temporary context",
+									  ALLOCSET_DEFAULT_SIZES);
+	oldCtx = MemoryContextSwitchTo(insertCtx);
+
+	SquidHnswInsertTuple(index, values, isnull, heap_tid);
+
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextDelete(insertCtx);
+
+	return false;
 }
 
 /*

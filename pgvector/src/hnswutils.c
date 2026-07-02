@@ -12,6 +12,7 @@
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
+#include "utils/float.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 
@@ -247,6 +248,7 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 		level = maxLevel;
 
 	element->heaptidsLength = 0;
+	element->hasPayload = false;
 	HnswAddHeapTid(element, heaptid);
 
 	element->level = level;
@@ -267,7 +269,15 @@ HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel,
 void
 HnswAddHeapTid(HnswElement element, ItemPointer heaptid)
 {
-	element->heaptids[element->heaptidsLength++] = *heaptid;
+	HnswAddHeapTidWithPattern(element, heaptid, 0);
+}
+
+void
+HnswAddHeapTidWithPattern(HnswElement element, ItemPointer heaptid, int64 patternId)
+{
+	element->heaptids[element->heaptidsLength] = *heaptid;
+	element->patternIds[element->heaptidsLength] = patternId;
+	element->heaptidsLength++;
 }
 
 /*
@@ -281,6 +291,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
 
 	element->blkno = blkno;
 	element->offno = offno;
+	element->hasPayload = false;
 	HnswPtrStore(base, element->neighbors, (HnswNeighborArrayPtr *) NULL);
 	HnswPtrStore(base, element->value, (Pointer) NULL);
 	return element;
@@ -424,10 +435,29 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 /*
  * Set element tuple, except for neighbor info
  */
+Size
+HnswElementTupleSize(char *base, HnswElement element)
+{
+	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	int			payloadCount = 0;
+
+	if (element->hasPayload)
+		payloadCount = HNSW_HEAPTIDS;
+
+	return HNSW_ELEMENT_TUPLE_SIZE_WITH_PAYLOAD(VARSIZE_ANY(valuePtr), payloadCount);
+}
+
+int64 *
+HnswElementTuplePayload(HnswElementTuple etup)
+{
+	return (int64 *) ((char *) etup + HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(&etup->data)));
+}
+
 void
 HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 {
 	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	int			payloadCount = 0;
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
@@ -441,6 +471,18 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
 	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+
+	if (element->hasPayload)
+		payloadCount = HNSW_HEAPTIDS;
+
+	etup->payloadCount = payloadCount;
+	if (payloadCount > 0)
+	{
+		int64	   *payload = HnswElementTuplePayload(etup);
+
+		for (int i = 0; i < payloadCount; i++)
+			payload[i] = i < element->heaptidsLength ? element->patternIds[i] : 0;
+	}
 }
 
 /*
@@ -490,16 +532,22 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	element->neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
 	element->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
 	element->heaptidsLength = 0;
+	element->hasPayload = etup->payloadCount > 0;
 
 	if (loadHeaptids)
 	{
+		int64	   *payload = NULL;
+
+		if (etup->payloadCount > 0)
+			payload = HnswElementTuplePayload(etup);
+
 		for (int i = 0; i < HNSW_HEAPTIDS; i++)
 		{
 			/* Can stop at first invalid */
 			if (!ItemPointerIsValid(&etup->heaptids[i]))
 				break;
 
-			HnswAddHeapTid(element, &etup->heaptids[i]);
+			HnswAddHeapTidWithPattern(element, &etup->heaptids[i], payload != NULL && i < etup->payloadCount ? payload[i] : 0);
 		}
 	}
 
@@ -807,11 +855,100 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 	}
 }
 
+static void
+SquidCountElementCandidates(HnswSquidAdaptiveContext *adaptive, HnswElement element, int *candidateCount, int *authorizedCount)
+{
+	if (adaptive == NULL || element == NULL)
+		return;
+
+	for (int i = 0; i < element->heaptidsLength; i++)
+	{
+		(*candidateCount)++;
+		if (adaptive->patternAllowed == NULL || adaptive->patternAllowed(adaptive->patternAllowedArg, element->patternIds[i]))
+			(*authorizedCount)++;
+	}
+}
+
+static void
+SquidMeasureCurrentW(char *base, HnswSquidAdaptiveContext *adaptive, pairingheap *W, int *candidateCount, int *authorizedCount)
+{
+	List	   *items = NIL;
+	ListCell   *lc;
+
+	*candidateCount = 0;
+	*authorizedCount = 0;
+
+	while (!pairingheap_is_empty(W))
+	{
+		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+		HnswElement element = HnswPtrAccess(base, sc->element);
+
+		SquidCountElementCandidates(adaptive, element, candidateCount, authorizedCount);
+		items = lappend(items, sc);
+	}
+
+	foreach(lc, items)
+	{
+		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc);
+
+		pairingheap_add(W, &sc->w_node);
+	}
+}
+
+static int
+SquidChooseAdaptiveEf(HnswSquidAdaptiveContext *adaptive, int candidateCount, int authorizedCount)
+{
+	int			maxEf = adaptive->maxEf;
+	int			finalEf = adaptive->baseEf;
+	double		selectivity;
+
+	if (maxEf < adaptive->baseEf)
+		maxEf = adaptive->baseEf;
+	if (maxEf > HNSW_MAX_EF_SEARCH)
+		maxEf = HNSW_MAX_EF_SEARCH;
+	if (maxEf < HNSW_MIN_EF_SEARCH)
+		maxEf = HNSW_MIN_EF_SEARCH;
+
+	if (candidateCount > 0 && authorizedCount > 0)
+		finalEf = (int) ceil(((double) adaptive->baseEf * (double) candidateCount) / (double) authorizedCount);
+	else if (candidateCount > 0)
+	{
+		selectivity = adaptive->routeSelectivity;
+		if (selectivity <= 0)
+			selectivity = 0.000001;
+		finalEf = (int) ceil((double) adaptive->baseEf / selectivity);
+	}
+
+	if (finalEf < adaptive->baseEf)
+		finalEf = adaptive->baseEf;
+	if (finalEf > maxEf)
+		finalEf = maxEf;
+	if (finalEf < HNSW_MIN_EF_SEARCH)
+		finalEf = HNSW_MIN_EF_SEARCH;
+
+	return finalEf;
+}
+
+static void
+SquidMaybeExpandEf(char *base, HnswSquidAdaptiveContext *adaptive, bool *expanded, int *ef, pairingheap *W)
+{
+	int			candidateCount;
+	int			authorizedCount;
+
+	if (adaptive == NULL || *expanded)
+		return;
+
+	SquidMeasureCurrentW(base, adaptive, W, &candidateCount, &authorizedCount);
+
+	*ef = SquidChooseAdaptiveEf(adaptive, candidateCount, authorizedCount);
+	*expanded = true;
+}
+
 /*
  * Algorithm 2 from paper
  */
-List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+static List *
+HnswSearchLayerInternal(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, HnswSquidAdaptiveContext *adaptive)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -825,6 +962,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
+	HnswSquidAdaptiveContext *activeAdaptive = adaptive != NULL && lc == 0 ? adaptive : NULL;
+	bool		adaptiveExpanded = activeAdaptive == NULL;
 
 	if (v == NULL)
 	{
@@ -880,8 +1019,21 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		HnswElement cElement;
 
-		if (c->distance > f->distance)
+		if (wlen >= ef && c->distance > f->distance)
+		{
+			if (activeAdaptive != NULL && !adaptiveExpanded)
+			{
+				SquidMaybeExpandEf(base, activeAdaptive, &adaptiveExpanded, &ef, W);
+
+				if (ef > activeAdaptive->baseEf)
+				{
+					pairingheap_add(C, &c->c_node);
+					continue;
+				}
+			}
+
 			break;
+		}
 
 		cElement = HnswPtrAccess(base, c->element);
 
@@ -973,6 +1125,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	}
 
 	return w;
+}
+
+List *
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+{
+	return HnswSearchLayerInternal(base, q, ep, ef, lc, index, support, m, inserting, skipElement, v, discarded, initVisited, tuples, NULL);
+}
+
+List *
+HnswSearchLayerAdaptive(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, bool initVisited, int64 *tuples, HnswSquidAdaptiveContext *adaptive)
+{
+	return HnswSearchLayerInternal(base, q, ep, ef, lc, index, support, m, inserting, skipElement, v, NULL, initVisited, tuples, adaptive);
 }
 
 /*
