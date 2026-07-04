@@ -10,12 +10,12 @@ PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 # Space-separated algorithms supported by test_all.py:
 #   RLS ROLE USER AnonySys QDTree
 # Override example: ALGORITHMS="AnonySys RLS" ./script/run_baseline.sh
-ALGORITHMS="${ALGORITHMS:-RLS}"
+ALGORITHMS="${ALGORITHMS:-QDTree}"
 read -r -a ALGORITHM_LIST <<< "${ALGORITHMS}"
 
 # Space-separated or comma-separated ef_search values.
 # Override example: EFS_VALUES="40 60 80 100" ./script/run_baseline.sh
-EFS_VALUES="${EFS_VALUES:-500}"
+EFS_VALUES="${EFS_VALUES:-15 20 25 28 30 35 40 45 50 55}"
 EFS_VALUES="${EFS_VALUES//,/ }"
 read -r -a EFS_LIST <<< "${EFS_VALUES}"
 
@@ -26,7 +26,8 @@ STATISTICS_TYPE="${STATISTICS_TYPE:-sql}"
 ITERATIONS="${ITERATIONS:-1}"
 RECORD_RECALL="${RECORD_RECALL:-true}"
 WARM_UP="${WARM_UP:-true}"
-GENERATOR_TYPE="${GENERATOR_TYPE:-tree-based}"
+GENERATOR_TYPE="${GENERATOR_TYPE:-erbac}"
+QDTREE_QUERY_NUM="${QDTREE_QUERY_NUM:-200}"
 
 # test_all.py has no --prepare flag.  This script intentionally does not build
 # partitions; it only changes ef_search and reuses already materialized baseline
@@ -36,15 +37,22 @@ GENERATOR_TYPE="${GENERATOR_TYPE:-tree-based}"
 mkdir -p "${LOG_DIR}"
 
 for ALGORITHM in "${ALGORITHM_LIST[@]}"; do
+  METHOD_LOG_DIR="${LOG_DIR}/${ALGORITHM}"
+  mkdir -p "${METHOD_LOG_DIR}"
   for EFS in "${EFS_LIST[@]}"; do
     TS="$(date +%Y%m%d_%H%M%S)"
-    LOG_FILE="${LOG_DIR}/${ALGORITHM}_efs${EFS}_${TS}.log"
+    LOG_FILE="${METHOD_LOG_DIR}/${ALGORITHM}_efs${EFS}_${TS}.log"
 
     echo "========================================"
     echo "[RUN] algorithm=${ALGORITHM} ef_search=${EFS} prepare=false"
     echo "[LOG] ${LOG_FILE}"
 
-    "${PYTHON_BIN}" test_all.py \
+    EXTRA_ARGS=()
+    if [[ "${ALGORITHM}" == "QDTree" ]]; then
+      EXTRA_ARGS+=(--query-num "${QDTREE_QUERY_NUM}")
+    fi
+
+    python test_all.py \
       --algorithm "${ALGORITHM}" \
       --efs "${EFS}" \
       --enable-index "${ENABLE_INDEX}" \
@@ -54,6 +62,7 @@ for ALGORITHM in "${ALGORITHM_LIST[@]}"; do
       --iterations "${ITERATIONS}" \
       --record-recall "${RECORD_RECALL}" \
       --warm-up "${WARM_UP}" \
+      "${EXTRA_ARGS[@]}" \
       > "${LOG_FILE}" 2>&1
 
     echo "[DONE] algorithm=${ALGORITHM} ef_search=${EFS}"

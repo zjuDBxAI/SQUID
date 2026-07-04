@@ -117,9 +117,16 @@ extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
 extern int	squidhnsw_base_ef;
 extern int	squidhnsw_max_ef;
-extern double squidhnsw_route_selectivity;
+extern int	squidhnsw_topk;
 extern double squidhnsw_global_bound;
+extern double squidhnsw_route_selectivity;
 extern char *squidhnsw_allowed_patterns;
+extern int	vedahnsw_base_ef;
+extern int	vedahnsw_max_ef;
+extern int	vedahnsw_topk;
+extern double vedahnsw_global_bound;
+extern double vedahnsw_route_selectivity;
+extern char *vedahnsw_allowed_patterns;
 
 typedef enum HnswIterativeScanMode
 {
@@ -184,6 +191,10 @@ typedef struct HnswSearchCandidate
 	pairingheap_node w_node;
 	HnswElementPtr element;
 	double		distance;
+	int			squidCandidateCount;
+	int			squidAuthorizedCount;
+	bool		squidCountsReady;
+	bool		squidInW;
 }			HnswSearchCandidate;
 
 /* HNSW index options */
@@ -278,6 +289,8 @@ typedef struct HnswSquidAdaptiveContext
 {
 	int			baseEf;
 	int			maxEf;
+	int			topK;
+	double		globalBound;
 	double		routeSelectivity;
 	HnswPatternAllowedCallback patternAllowed;
 	void	   *patternAllowedArg;
@@ -401,6 +414,13 @@ typedef struct HnswScanOpaqueData
 	bool		squidFilterEnabled;
 	int64	   *squidAllowedPatterns;
 	int			squidAllowedPatternCount;
+	int64		squidAllowedPatternMin;
+	int64		squidAllowedPatternMax;
+	uint8	   *squidAllowedPatternBitset;
+	Size		squidAllowedPatternBitsetBytes;
+	int64	   *squidAllowedPatternHashKeys;
+	uint8	   *squidAllowedPatternHashUsed;
+	int		squidAllowedPatternHashSize;
 
 	/* Support functions */
 	HnswSupport support;
@@ -495,6 +515,7 @@ IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
 bool		squidhnswgettuple(IndexScanDesc scan, ScanDirection dir);
+bool		vedahnswgettuple(IndexScanDesc scan, ScanDirection dir);
 void		hnswendscan(IndexScanDesc scan);
 
 static inline HnswNeighborArray *

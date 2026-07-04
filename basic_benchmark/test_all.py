@@ -56,6 +56,7 @@ if __name__ == '__main__':
     parser.add_argument('--statistics-type', choices=['sql', 'system'], default='sql', help='Latency source: EXPLAIN SQL time or wall-clock system time.')
     parser.add_argument('--generator-type', default='', help='Tag included in output filenames.')
     parser.add_argument('--iterations', type=int, default=1, help='Repeat each query this many times and average the result.')
+    parser.add_argument('--query-num', type=int, default=1000, help='Number of queries to run for QDTree.')
     parser.add_argument('--record-recall', type=_str_to_bool, default=True, help='Whether to compute recall against ground truth.')
     parser.add_argument('--warm-up', type=_str_to_bool, default=True, help='Whether to warm up each query before measuring.')
 
@@ -65,6 +66,7 @@ if __name__ == '__main__':
     generator_type = args.generator_type
     statistics_type = args.statistics_type
     iterations = args.iterations
+    query_num = args.query_num
     record_recall = args.record_recall
     warm_up = args.warm_up
 
@@ -151,6 +153,7 @@ if __name__ == '__main__':
                 generator_type=generator_type,
                 record_recall=record_recall,
                 warm_up=warm_up,
+                query_num=query_num,
             )
             qdt_space_mb = calculate_qd_tree_storage('qd_tree_partition', enable_index=enable_index)
             logger.info('QDTree partition storage footprint: %.2f MB', qdt_space_mb)

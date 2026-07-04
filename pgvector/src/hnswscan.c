@@ -139,40 +139,110 @@ CompareInt64(const void *a, const void *b)
 	return 0;
 }
 
-static void
-SquidInitFilter(IndexScanDesc scan)
+#define SQUID_PATTERN_BITSET_MAX_BYTES (1024 * 1024)
+#define SQUID_PATTERN_CACHE_SIZE 128
+
+/* Backend-local cache for parsed SQUID ACL lists. */
+typedef struct SquidAllowedPatternSet
 {
-	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
-	const char *raw = squidhnsw_allowed_patterns;
-	int			capacity = 0;
-	char	   *copy;
-	char	   *p;
+	char	   *raw;
+	int64	   *patterns;
+	int		count;
+	int64		min;
+	int64		max;
+	uint8	   *bitset;
+	Size		bitsetBytes;
+	int64	   *hashKeys;
+	uint8	   *hashUsed;
+	int		hashSize;
+} SquidAllowedPatternSet;
 
-	if (so->squidFilterInitialized)
+static SquidAllowedPatternSet squidAllowedPatternCache[SQUID_PATTERN_CACHE_SIZE];
+static int	squidAllowedPatternCacheCount = 0;
+
+static uint32
+SquidHashPattern(int64 value)
+{
+	uint64		x = (uint64) value;
+
+	x ^= x >> 33;
+	x *= UINT64CONST(0xff51afd7ed558ccd);
+	x ^= x >> 33;
+	x *= UINT64CONST(0xc4ceb9fe1a85ec53);
+	x ^= x >> 33;
+	return (uint32) x;
+}
+
+static int
+SquidNextPowerOfTwo(int value)
+{
+	int		result = 1;
+
+	while (result < value)
+		result <<= 1;
+	return result;
+}
+
+static void
+SquidBuildAllowedPatternHash(SquidAllowedPatternSet *set)
+{
+	int		mask;
+
+	if (set->count < 8 || set->bitset != NULL)
 		return;
 
-	so->squidFilterInitialized = true;
-	so->squidFilterEnabled = false;
-	so->squidAllowedPatterns = NULL;
-	so->squidAllowedPatternCount = 0;
+	set->hashSize = SquidNextPowerOfTwo(Max(16, set->count * 2));
+	set->hashKeys = palloc(sizeof(int64) * set->hashSize);
+	set->hashUsed = palloc0(sizeof(uint8) * set->hashSize);
+	mask = set->hashSize - 1;
 
-	if (raw == NULL || raw[0] == '\0')
+	for (int i = 0; i < set->count; i++)
+	{
+		int		pos = SquidHashPattern(set->patterns[i]) & mask;
+
+		while (set->hashUsed[pos] && set->hashKeys[pos] != set->patterns[i])
+			pos = (pos + 1) & mask;
+
+		set->hashUsed[pos] = 1;
+		set->hashKeys[pos] = set->patterns[i];
+	}
+}
+
+static void
+SquidBuildAllowedPatternSet(SquidAllowedPatternSet *set, const char *raw, MemoryContext ctx, bool keepRaw)
+{
+	const char *rawText = raw != NULL ? raw : "";
+	MemoryContext oldCtx;
+	int		capacity = 0;
+	char   *copy;
+	char   *p;
+
+	oldCtx = MemoryContextSwitchTo(ctx);
+	memset(set, 0, sizeof(SquidAllowedPatternSet));
+
+	if (keepRaw)
+		set->raw = pstrdup(rawText);
+
+	if (rawText[0] == '\0')
+	{
+		MemoryContextSwitchTo(oldCtx);
 		return;
+	}
 
-	for (p = (char *) raw; *p != '\0'; p++)
+	for (p = (char *) rawText; *p != '\0'; p++)
 	{
 		if (*p == ',')
 			capacity++;
 	}
 	capacity++;
-	so->squidAllowedPatterns = palloc(sizeof(int64) * capacity);
+	set->patterns = palloc(sizeof(int64) * capacity);
 
-	copy = pstrdup(raw);
+	copy = pstrdup(rawText);
 	p = copy;
 	while (*p != '\0')
 	{
-		char	   *endptr;
-		int64		value;
+		char   *endptr;
+		int64	value;
 
 		while (*p != '\0' && (isspace((unsigned char) *p) || *p == ','))
 			p++;
@@ -183,14 +253,112 @@ SquidInitFilter(IndexScanDesc scan)
 		if (endptr == p)
 			break;
 
-		so->squidAllowedPatterns[so->squidAllowedPatternCount++] = value;
+		set->patterns[set->count++] = value;
 		p = endptr;
 	}
+	pfree(copy);
 
-	if (so->squidAllowedPatternCount > 1)
-		qsort(so->squidAllowedPatterns, so->squidAllowedPatternCount, sizeof(int64), CompareInt64);
+	if (set->count > 1)
+		qsort(set->patterns, set->count, sizeof(int64), CompareInt64);
 
+	if (set->count > 0)
+	{
+		int64	range;
+
+		set->min = set->patterns[0];
+		set->max = set->patterns[set->count - 1];
+		range = set->max - set->min + 1;
+
+		if (set->min >= 0 && range > 0 &&
+			range <= (int64) SQUID_PATTERN_BITSET_MAX_BYTES * 8 &&
+			range <= (int64) set->count * 64)
+		{
+			set->bitsetBytes = (Size) ((range + 7) / 8);
+			set->bitset = palloc0(set->bitsetBytes);
+
+			for (int i = 0; i < set->count; i++)
+			{
+				int64	offset = set->patterns[i] - set->min;
+
+				set->bitset[offset >> 3] |= (uint8) (1 << (offset & 7));
+			}
+		}
+	}
+
+	SquidBuildAllowedPatternHash(set);
+	MemoryContextSwitchTo(oldCtx);
+}
+
+static SquidAllowedPatternSet *
+SquidGetAllowedPatternSet(const char *raw)
+{
+	const char *rawText = raw != NULL ? raw : "";
+	SquidAllowedPatternSet *set;
+
+	for (int i = 0; i < squidAllowedPatternCacheCount; i++)
+	{
+		set = &squidAllowedPatternCache[i];
+		if (set->raw != NULL && strcmp(set->raw, rawText) == 0)
+			return set;
+	}
+
+	if (squidAllowedPatternCacheCount < SQUID_PATTERN_CACHE_SIZE)
+	{
+		set = &squidAllowedPatternCache[squidAllowedPatternCacheCount++];
+		SquidBuildAllowedPatternSet(set, rawText, TopMemoryContext, true);
+		return set;
+	}
+
+	set = palloc0(sizeof(SquidAllowedPatternSet));
+	SquidBuildAllowedPatternSet(set, rawText, CurrentMemoryContext, false);
+	return set;
+}
+
+static void
+SquidInitFilterFromRaw(IndexScanDesc scan, const char *rawPatterns)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	SquidAllowedPatternSet *set;
+
+	if (so->squidFilterInitialized)
+		return;
+
+	so->squidFilterInitialized = true;
+	so->squidFilterEnabled = false;
+	so->squidAllowedPatterns = NULL;
+	so->squidAllowedPatternCount = 0;
+	so->squidAllowedPatternMin = 0;
+	so->squidAllowedPatternMax = 0;
+	so->squidAllowedPatternBitset = NULL;
+	so->squidAllowedPatternBitsetBytes = 0;
+	so->squidAllowedPatternHashKeys = NULL;
+	so->squidAllowedPatternHashUsed = NULL;
+	so->squidAllowedPatternHashSize = 0;
+
+	set = SquidGetAllowedPatternSet(rawPatterns);
+
+	so->squidAllowedPatterns = set->patterns;
+	so->squidAllowedPatternCount = set->count;
+	so->squidAllowedPatternMin = set->min;
+	so->squidAllowedPatternMax = set->max;
+	so->squidAllowedPatternBitset = set->bitset;
+	so->squidAllowedPatternBitsetBytes = set->bitsetBytes;
+	so->squidAllowedPatternHashKeys = set->hashKeys;
+	so->squidAllowedPatternHashUsed = set->hashUsed;
+	so->squidAllowedPatternHashSize = set->hashSize;
 	so->squidFilterEnabled = so->squidAllowedPatternCount > 0;
+}
+
+static void
+SquidInitFilter(IndexScanDesc scan)
+{
+	SquidInitFilterFromRaw(scan, squidhnsw_allowed_patterns);
+}
+
+static void
+VedaInitFilter(IndexScanDesc scan)
+{
+	SquidInitFilterFromRaw(scan, vedahnsw_allowed_patterns);
 }
 
 static bool
@@ -198,6 +366,31 @@ SquidPatternAllowed(HnswScanOpaque so, int64 pattern)
 {
 	int			left = 0;
 	int			right = so->squidAllowedPatternCount - 1;
+
+	if (so->squidAllowedPatternBitset != NULL)
+	{
+		int64		offset;
+
+		if (pattern < so->squidAllowedPatternMin || pattern > so->squidAllowedPatternMax)
+			return false;
+
+		offset = pattern - so->squidAllowedPatternMin;
+		return (so->squidAllowedPatternBitset[offset >> 3] & (uint8) (1 << (offset & 7))) != 0;
+	}
+
+	if (so->squidAllowedPatternHashUsed != NULL)
+	{
+		int			mask = so->squidAllowedPatternHashSize - 1;
+		int			pos = SquidHashPattern(pattern) & mask;
+
+		while (so->squidAllowedPatternHashUsed[pos])
+		{
+			if (so->squidAllowedPatternHashKeys[pos] == pattern)
+				return true;
+			pos = (pos + 1) & mask;
+		}
+		return false;
+	}
 
 	while (left <= right)
 	{
@@ -256,6 +449,112 @@ SquidClampEf(int value)
 	return value;
 }
 
+
+static double
+VedaLocalBound(List *w, int topK)
+{
+	int			length;
+	int			index;
+	HnswSearchCandidate *sc;
+
+	if (topK <= 0)
+		return get_float8_infinity();
+
+	length = list_length(w);
+	if (length < topK)
+		return get_float8_infinity();
+
+	/* HnswSearchLayer returns W in descending distance order; llast is nearest. */
+	index = length - topK;
+	sc = (HnswSearchCandidate *) list_nth(w, index);
+	return sc->distance;
+}
+
+static int
+VedaExpandedEf(int baseEf)
+{
+	double		selectivity = vedahnsw_route_selectivity;
+	int			expandedEf;
+
+	if (selectivity <= 0)
+		selectivity = 0.000001;
+	if (selectivity > 1)
+		selectivity = 1;
+
+	expandedEf = (int) ceil((double) baseEf / selectivity);
+	return SquidClampEf(Max(baseEf, expandedEf));
+}
+
+static List *
+VedaCopyEntryCandidates(List *ep, char *base, HnswQuery *q, Relation index, HnswSupport *support)
+{
+	List	   *copy = NIL;
+	ListCell   *lc;
+
+	foreach(lc, ep)
+	{
+		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc);
+		HnswElement element = HnswPtrAccess(base, sc->element);
+
+		copy = lappend(copy, HnswEntryCandidate(base, element, q, index, support, false));
+	}
+
+	return copy;
+}
+
+static List *
+GetVedaScanItemsAdaptive(IndexScanDesc scan, Datum value, int baseEf)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	HnswSupport *support = &so->support;
+	List	   *ep;
+	List	   *w;
+	List	   *probeW;
+	int			m;
+	int			expandedEf;
+	double		localBound;
+	HnswElement entryPoint;
+	char	   *base = NULL;
+	HnswQuery  *q = &so->q;
+
+	HnswGetMetaPageInfo(index, &m, &entryPoint);
+
+	q->value = value;
+	so->m = m;
+
+	if (entryPoint == NULL)
+		return NIL;
+
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
+
+	for (int lc = entryPoint->level; lc >= 1; lc--)
+	{
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
+		ep = w;
+	}
+
+	/* Pure route fast path: VEDA routing has no ACL filter to apply. */
+	if (!so->squidFilterEnabled)
+		return HnswSearchLayer(base, q, ep, baseEf, 0, index, support, m, false, NULL, &so->v, NULL, true, &so->tuples);
+
+	/* VEDA probe: first search the local node without permission filtering. */
+	probeW = HnswSearchLayer(base, q, ep, baseEf, 0, index, support, m, false, NULL, &so->v, NULL, true, &so->tuples);
+	localBound = VedaLocalBound(probeW, vedahnsw_topk);
+
+	/* VEDA coordinated bound: if local unfiltered top-k cannot improve global top-k, skip expanded search. */
+	if (vedahnsw_global_bound >= 0 && localBound >= vedahnsw_global_bound)
+		return probeW;
+
+	expandedEf = VedaExpandedEf(baseEf);
+	if (expandedEf <= baseEf)
+		return probeW;
+
+	/* VEDA expanded search: use offline impurity/selectivity, not SQUID's online W authorization stats. */
+	ep = VedaCopyEntryCandidates(ep, base, q, index, support);
+	return HnswSearchLayer(base, q, ep, expandedEf, 0, index, support, m, false, NULL, &so->v, NULL, true, &so->tuples);
+}
+
 static List *
 GetScanItemsAdaptive(IndexScanDesc scan, Datum value, int baseEf)
 {
@@ -286,8 +585,13 @@ GetScanItemsAdaptive(IndexScanDesc scan, Datum value, int baseEf)
 		ep = w;
 	}
 
+	if (!so->squidFilterEnabled)
+		return HnswSearchLayer(base, q, ep, baseEf, 0, index, support, m, false, NULL, &so->v, NULL, true, &so->tuples);
+
 	adaptive.baseEf = baseEf;
 	adaptive.maxEf = SquidClampEf(squidhnsw_max_ef);
+	adaptive.topK = squidhnsw_topk;
+	adaptive.globalBound = squidhnsw_global_bound;
 	adaptive.routeSelectivity = squidhnsw_route_selectivity;
 	adaptive.patternAllowed = SquidPatternAllowedCallback;
 	adaptive.patternAllowedArg = so;
@@ -330,6 +634,13 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	so->squidFilterEnabled = false;
 	so->squidAllowedPatterns = NULL;
 	so->squidAllowedPatternCount = 0;
+	so->squidAllowedPatternMin = 0;
+	so->squidAllowedPatternMax = 0;
+	so->squidAllowedPatternBitset = NULL;
+	so->squidAllowedPatternBitsetBytes = 0;
+	so->squidAllowedPatternHashKeys = NULL;
+	so->squidAllowedPatternHashUsed = NULL;
+	so->squidAllowedPatternHashSize = 0;
 
 	scan->opaque = so;
 
@@ -357,6 +668,13 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->squidFilterEnabled = false;
 	so->squidAllowedPatterns = NULL;
 	so->squidAllowedPatternCount = 0;
+	so->squidAllowedPatternMin = 0;
+	so->squidAllowedPatternMax = 0;
+	so->squidAllowedPatternBitset = NULL;
+	so->squidAllowedPatternBitsetBytes = 0;
+	so->squidAllowedPatternHashKeys = NULL;
+	so->squidAllowedPatternHashUsed = NULL;
+	so->squidAllowedPatternHashSize = 0;
 
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
@@ -570,9 +888,99 @@ squidhnswgettuple(IndexScanDesc scan, ScanDirection dir)
 			continue;
 		}
 
+		if (sc->squidCountsReady && sc->squidCandidateCount > 0 && sc->squidAuthorizedCount <= 0)
+		{
+			element->heaptidsLength = 0;
+			continue;
+		}
+
 		heaptid = &element->heaptids[--element->heaptidsLength];
 
-		if (!SquidAuthorizedPattern(scan, element->patternIds[element->heaptidsLength]))
+		if (so->squidFilterEnabled &&
+			!(sc->squidCountsReady && sc->squidCandidateCount > 0 && sc->squidAuthorizedCount >= sc->squidCandidateCount) &&
+			!SquidAuthorizedPattern(scan, element->patternIds[element->heaptidsLength]))
+			continue;
+
+		MemoryContextSwitchTo(oldCtx);
+		scan->xs_heaptid = *heaptid;
+		scan->xs_recheck = false;
+		scan->xs_recheckorderby = false;
+		return true;
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+	return false;
+}
+
+bool
+vedahnswgettuple(IndexScanDesc scan, ScanDirection dir)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
+	Assert(ScanDirectionIsForward(dir));
+
+	if (so->first)
+	{
+		Datum		value;
+		int			baseEf;
+
+		pgstat_count_index_scan(scan->indexRelation);
+
+		if (scan->orderByData == NULL)
+			elog(ERROR, "cannot scan vedahnsw index without order");
+
+		if (!IsMVCCSnapshot(scan->xs_snapshot))
+			elog(ERROR, "non-MVCC snapshots are not supported with vedahnsw");
+
+		value = GetScanValue(scan);
+		baseEf = SquidClampEf(Max(vedahnsw_base_ef, 1));
+
+		VedaInitFilter(scan);
+
+		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+		so->w = GetVedaScanItemsAdaptive(scan, value, baseEf);
+		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+		so->first = false;
+
+#if defined(HNSW_MEMORY)
+		ShowMemoryUsage(so);
+#endif
+	}
+
+	for (;;)
+	{
+		char	   *base = NULL;
+		HnswSearchCandidate *sc;
+		HnswElement element;
+		ItemPointer heaptid;
+
+		if (list_length(so->w) == 0)
+			break;
+
+		sc = llast(so->w);
+		element = HnswPtrAccess(base, sc->element);
+
+		if (element->heaptidsLength == 0)
+		{
+			so->w = list_delete_last(so->w);
+			pfree(element);
+			pfree(sc);
+			continue;
+		}
+
+		if (sc->squidCountsReady && sc->squidCandidateCount > 0 && sc->squidAuthorizedCount <= 0)
+		{
+			element->heaptidsLength = 0;
+			continue;
+		}
+
+		heaptid = &element->heaptids[--element->heaptidsLength];
+
+		if (so->squidFilterEnabled &&
+			!(sc->squidCountsReady && sc->squidCandidateCount > 0 && sc->squidAuthorizedCount >= sc->squidCandidateCount) &&
+			!SquidAuthorizedPattern(scan, element->patternIds[element->heaptidsLength]))
 			continue;
 
 		MemoryContextSwitchTo(oldCtx);

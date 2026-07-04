@@ -639,6 +639,10 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance)
 
 	HnswPtrStore(base, sc->element, element);
 	sc->distance = distance;
+	sc->squidCandidateCount = 0;
+	sc->squidAuthorizedCount = 0;
+	sc->squidCountsReady = false;
+	sc->squidInW = false;
 	return sc;
 }
 
@@ -870,28 +874,39 @@ SquidCountElementCandidates(HnswSquidAdaptiveContext *adaptive, HnswElement elem
 }
 
 static void
-SquidMeasureCurrentW(char *base, HnswSquidAdaptiveContext *adaptive, pairingheap *W, int *candidateCount, int *authorizedCount)
+SquidEnsureCandidateCounts(char *base, HnswSquidAdaptiveContext *adaptive, HnswSearchCandidate *sc)
 {
-	List	   *items = NIL;
+	HnswElement element;
+
+	if (adaptive == NULL || sc == NULL || sc->squidCountsReady)
+		return;
+
+	element = HnswPtrAccess(base, sc->element);
+	SquidCountElementCandidates(adaptive, element, &sc->squidCandidateCount, &sc->squidAuthorizedCount);
+	sc->squidCountsReady = true;
+}
+
+static void
+SquidMeasureCurrentW(char *base, HnswSquidAdaptiveContext *adaptive, List *squidWItems, int *candidateCount, int *authorizedCount)
+{
 	ListCell   *lc;
 
 	*candidateCount = 0;
 	*authorizedCount = 0;
 
-	while (!pairingheap_is_empty(W))
-	{
-		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
-		HnswElement element = HnswPtrAccess(base, sc->element);
+	if (adaptive == NULL)
+		return;
 
-		SquidCountElementCandidates(adaptive, element, candidateCount, authorizedCount);
-		items = lappend(items, sc);
-	}
-
-	foreach(lc, items)
+	foreach(lc, squidWItems)
 	{
 		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc);
 
-		pairingheap_add(W, &sc->w_node);
+		if (!sc->squidInW)
+			continue;
+
+		SquidEnsureCandidateCounts(base, adaptive, sc);
+		*candidateCount += sc->squidCandidateCount;
+		*authorizedCount += sc->squidAuthorizedCount;
 	}
 }
 
@@ -900,7 +915,6 @@ SquidChooseAdaptiveEf(HnswSquidAdaptiveContext *adaptive, int candidateCount, in
 {
 	int			maxEf = adaptive->maxEf;
 	int			finalEf = adaptive->baseEf;
-	double		selectivity;
 
 	if (maxEf < adaptive->baseEf)
 		maxEf = adaptive->baseEf;
@@ -910,13 +924,17 @@ SquidChooseAdaptiveEf(HnswSquidAdaptiveContext *adaptive, int candidateCount, in
 		maxEf = HNSW_MIN_EF_SEARCH;
 
 	if (candidateCount > 0 && authorizedCount > 0)
-		finalEf = (int) ceil(((double) adaptive->baseEf * (double) candidateCount) / (double) authorizedCount);
-	else if (candidateCount > 0)
 	{
-		selectivity = adaptive->routeSelectivity;
+		double		expansion = (double) candidateCount / (double) authorizedCount;
+		double		selectivity = adaptive->routeSelectivity;
+
 		if (selectivity <= 0)
 			selectivity = 0.000001;
-		finalEf = (int) ceil((double) adaptive->baseEf / selectivity);
+		if (selectivity > 1)
+			selectivity = 1;
+
+		expansion = Min(expansion, 1.0 / selectivity);
+		finalEf = (int) ceil((double) adaptive->baseEf * expansion);
 	}
 
 	if (finalEf < adaptive->baseEf)
@@ -929,8 +947,68 @@ SquidChooseAdaptiveEf(HnswSquidAdaptiveContext *adaptive, int candidateCount, in
 	return finalEf;
 }
 
+static bool
+SquidAuthorizedTopKBoundReached(char *base, HnswSquidAdaptiveContext *adaptive, List *squidWItems, double frontierDistance)
+{
+	ListCell   *lc;
+	double	   *authorizedDistances;
+	int			authorizedCount = 0;
+	int			topK;
+	double		bound;
+
+	if (adaptive == NULL || adaptive->topK <= 0)
+		return false;
+
+	topK = adaptive->topK;
+	authorizedDistances = palloc(sizeof(double) * topK);
+
+	foreach(lc, squidWItems)
+	{
+		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc);
+
+		if (!sc->squidInW)
+			continue;
+
+		SquidEnsureCandidateCounts(base, adaptive, sc);
+		if (sc->squidAuthorizedCount <= 0)
+			continue;
+
+		if (authorizedCount < topK)
+			authorizedDistances[authorizedCount++] = sc->distance;
+		else
+		{
+			int			furthest = 0;
+
+			for (int i = 1; i < topK; i++)
+			{
+				if (authorizedDistances[i] > authorizedDistances[furthest])
+					furthest = i;
+			}
+
+			if (sc->distance < authorizedDistances[furthest])
+				authorizedDistances[furthest] = sc->distance;
+		}
+	}
+
+	if (authorizedCount < topK)
+	{
+		pfree(authorizedDistances);
+		return false;
+	}
+
+	bound = authorizedDistances[0];
+	for (int i = 1; i < topK; i++)
+	{
+		if (authorizedDistances[i] > bound)
+			bound = authorizedDistances[i];
+	}
+
+	pfree(authorizedDistances);
+	return frontierDistance >= bound;
+}
+
 static void
-SquidMaybeExpandEf(char *base, HnswSquidAdaptiveContext *adaptive, bool *expanded, int *ef, pairingheap *W)
+SquidMaybeExpandEf(char *base, HnswSquidAdaptiveContext *adaptive, bool *expanded, int *ef, List *squidWItems, double frontierDistance)
 {
 	int			candidateCount;
 	int			authorizedCount;
@@ -938,8 +1016,19 @@ SquidMaybeExpandEf(char *base, HnswSquidAdaptiveContext *adaptive, bool *expande
 	if (adaptive == NULL || *expanded)
 		return;
 
-	SquidMeasureCurrentW(base, adaptive, W, &candidateCount, &authorizedCount);
+	if (adaptive->globalBound >= 0 && frontierDistance >= adaptive->globalBound)
+	{
+		*expanded = true;
+		return;
+	}
 
+	if (SquidAuthorizedTopKBoundReached(base, adaptive, squidWItems, frontierDistance))
+	{
+		*expanded = true;
+		return;
+	}
+
+	SquidMeasureCurrentW(base, adaptive, squidWItems, &candidateCount, &authorizedCount);
 	*ef = SquidChooseAdaptiveEf(adaptive, candidateCount, authorizedCount);
 	*expanded = true;
 }
@@ -964,6 +1053,7 @@ HnswSearchLayerInternal(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 	bool		inMemory = index == NULL;
 	HnswSquidAdaptiveContext *activeAdaptive = adaptive != NULL && lc == 0 ? adaptive : NULL;
 	bool		adaptiveExpanded = activeAdaptive == NULL;
+	List	   *squidWItems = NIL;
 
 	if (v == NULL)
 	{
@@ -1003,6 +1093,11 @@ HnswSearchLayerInternal(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 
 		pairingheap_add(C, &sc->c_node);
 		pairingheap_add(W, &sc->w_node);
+		if (activeAdaptive != NULL)
+		{
+			sc->squidInW = true;
+			squidWItems = lappend(squidWItems, sc);
+		}
 
 		/*
 		 * Do not count elements being deleted towards ef when vacuuming. It
@@ -1023,7 +1118,7 @@ HnswSearchLayerInternal(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 		{
 			if (activeAdaptive != NULL && !adaptiveExpanded)
 			{
-				SquidMaybeExpandEf(base, activeAdaptive, &adaptiveExpanded, &ef, W);
+				SquidMaybeExpandEf(base, activeAdaptive, &adaptiveExpanded, &ef, squidWItems, c->distance);
 
 				if (ef > activeAdaptive->baseEf)
 				{
@@ -1094,6 +1189,11 @@ HnswSearchLayerInternal(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 			e = HnswInitSearchCandidate(base, eElement, eDistance);
 			pairingheap_add(C, &e->c_node);
 			pairingheap_add(W, &e->w_node);
+			if (activeAdaptive != NULL)
+			{
+				e->squidInW = true;
+				squidWItems = lappend(squidWItems, e);
+			}
 
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
@@ -1108,6 +1208,9 @@ HnswSearchLayerInternal(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 				if (wlen > ef)
 				{
 					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+					if (activeAdaptive != NULL)
+						d->squidInW = false;
 
 					if (discarded != NULL)
 						pairingheap_add(*discarded, &d->w_node);

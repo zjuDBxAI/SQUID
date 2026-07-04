@@ -107,7 +107,7 @@ def _log_sort_key(path: Path) -> tuple[int, float]:
 
 def load_points(log_dir: Path) -> dict[str, list[Point]]:
     latest_by_method_ef: dict[tuple[str, int], Point] = {}
-    for path in sorted(log_dir.glob("*.log")):
+    for path in sorted(log_dir.rglob("*.log")):
         point = _parse_log(path)
         if point is None:
             continue

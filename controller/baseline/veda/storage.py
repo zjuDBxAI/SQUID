@@ -737,22 +737,26 @@ def create_index_for_partition(
             if str(node_kind) != "index":
                 conn.commit()
                 return
-            if index_type.lower() == "hnsw":
+            normalized_index_type = index_type.lower()
+            if normalized_index_type in {"hnsw", "vedahnsw"}:
+                include_clause = sql.SQL(" INCLUDE (pattern_id)") if normalized_index_type == "vedahnsw" else sql.SQL("")
                 cur.execute(
                     sql.SQL(
                         """
                         CREATE INDEX IF NOT EXISTS {}
-                        ON {} USING hnsw (vector vector_l2_ops)
+                        ON {} USING {} (vector vector_l2_ops){}
                         WITH (m = {m}, ef_construction = {ef});
                         """
                     ).format(
                         sql.Identifier(_safe_index_name(table_name, "vector_idx")),
                         sql.Identifier(table_name),
+                        sql.SQL(normalized_index_type),
+                        include_clause,
                         m=sql.Literal(int(hnsw_m)),
                         ef=sql.Literal(int(hnsw_ef_construction)),
                     )
                 )
-            elif index_type.lower() == "ivfflat":
+            elif normalized_index_type == "ivfflat":
                 cur.execute(
                     sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING ivfflat (vector vector_l2_ops);").format(
                         sql.Identifier(_safe_index_name(table_name, "vector_idx")),

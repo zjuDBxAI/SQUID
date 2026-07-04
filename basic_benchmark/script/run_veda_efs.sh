@@ -8,13 +8,13 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 
 # Algorithm can be "veda" or "effveda".
-ALGORITHM="${ALGORITHM:-veda}"
+ALGORITHM="${ALGORITHM:-effveda}"
 
 # Space-separated ef_search values. Override with: EFS_VALUES="40 80 120" ./script/run_veda_efs.sh
-EFS_VALUES="${EFS_VALUES:-100}"
+EFS_VALUES="${EFS_VALUES:-25}"
 read -r -a EFS_LIST <<< "${EFS_VALUES}"
 
-PREPARE="${PREPARE:-true}"
+PREPARE="${PREPARE:-false}"
 # Veda planning uses ef_search in the cost model, so rebuilding per ef is the safer default.
 REBUILD_EACH_EF="${REBUILD_EACH_EF:-false}"
 
@@ -31,7 +31,7 @@ USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-true}"
 INDEXING_THRESHOLD="${INDEXING_THRESHOLD:-2900}"
 STORAGE_AMPLIFICATION="${STORAGE_AMPLIFICATION:-3.0}"
 SEARCH_MODE="${SEARCH_MODE:-coordinated}"
-SQL_TIMING_MODE="${SQL_TIMING_MODE:-legacy}"
+SQL_TIMING_MODE="${SQL_TIMING_MODE:-fair}"
 HNSW_ITERATIVE_SCAN="${HNSW_ITERATIVE_SCAN:-off}"
 HNSW_MAX_SCAN_TUPLES="${HNSW_MAX_SCAN_TUPLES:-}"
 GENERATOR_TYPE="${GENERATOR_TYPE:-tree-based}"
@@ -43,7 +43,8 @@ USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-true}"
 DOCUMENT_LIMIT="${DOCUMENT_LIMIT:-}"
 QUERY_DATASET_PATH="${QUERY_DATASET_PATH:-}"
 
-mkdir -p "${LOG_DIR}"
+METHOD_LOG_DIR="${LOG_DIR}/${ALGORITHM}"
+mkdir -p "${METHOD_LOG_DIR}"
 
 _bool_true() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -58,10 +59,10 @@ run_case() {
   local ts
   ts="$(date +%Y%m%d_%H%M%S)"
   local result_tag="${RESULT_TAG_PREFIX}_${ALGORITHM}_efs${efs}"
-  local log_file="${LOG_DIR}/${result_tag}_${ts}.log"
+  local log_file="${METHOD_LOG_DIR}/${result_tag}_${ts}.log"
 
   local cmd=(
-    "${PYTHON_BIN}" test_veda.py
+    python test_veda.py
     --prepare "${prepare}"
     --algorithm "${ALGORITHM}"
     --enable-index "${ENABLE_INDEX}"

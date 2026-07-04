@@ -28,6 +28,7 @@ def test_qd_tree_partition_search(
     record_recall: bool = True,
     warm_up: bool = True,
     partition_prefix: str = DEFAULT_QD_TREE_PARTITION_PREFIX,
+    query_num: int = 1000,
 ):
     """Run the QD-tree partition benchmark under the basic_benchmark harness."""
     sample_table = f"{partition_prefix}_0"
@@ -46,7 +47,7 @@ def test_qd_tree_partition_search(
     else:
         drop_indexes_for_qdtree_partitions(partition_prefix)
 
-    queries = prepare_query_dataset(regenerate=False, num_queries=1000)
+    queries = prepare_query_dataset(regenerate=False, num_queries=max(1, int(query_num)))
 
     run_test(
         queries,

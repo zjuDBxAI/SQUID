@@ -160,6 +160,7 @@ def test_veda_search(
     normalized_sql_timing_mode = _normalize_sql_timing_mode(sql_timing_mode)
     _sync_efconfig_value("veda_search_mode", normalized_search_mode)
     _sync_efconfig_value("veda_sql_timing_mode", normalized_sql_timing_mode)
+    _sync_efconfig_value("veda_index_type", str(index_type).strip().lower())
 
     effective_generator_type = _compose_generator_label(
         generator_type,
@@ -189,7 +190,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Veda/EffVeda benchmark.")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--enable-index", type=_str_to_bool, default=True)
-    parser.add_argument("--index-type", choices=["hnsw", "ivfflat"], default="hnsw")
+    parser.add_argument("--index-type", choices=["hnsw", "vedahnsw", "ivfflat"], default="hnsw")
     parser.add_argument("--statistics-type", choices=["sql", "system"], default="sql")
     parser.add_argument("--generator-type", default="tree-based")
     parser.add_argument("--record-recall", type=_str_to_bool, default=True)

@@ -55,6 +55,8 @@ def get_index_type(table_name):
             return 'ivfflat'
         elif 'squidhnsw' in index_definition:
             return 'squidhnsw'
+        elif 'vedahnsw' in index_definition:
+            return 'vedahnsw'
         elif 'hnsw' in index_definition:
             return 'hnsw'
 

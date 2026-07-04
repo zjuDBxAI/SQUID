@@ -73,6 +73,10 @@ def _base_ef_search() -> int:
     return _configured_int("veda_ef_search", _configured_int("ef_search", 100), minimum=1)
 
 
+def _index_type() -> str:
+    return str(_configured_value("veda_index_type", "hnsw") or "hnsw").strip().lower()
+
+
 def _search_mode() -> str:
     normalized = str(_configured_value("veda_search_mode", "coordinated")).strip().lower().replace("-", "_")
     if normalized in {"coordinated", "coord", "effveda", "default"}:
@@ -161,6 +165,45 @@ def _route_query(route: VedaRoute, *, query_vector, topk: int, limit: int):
     )
 
 
+def _unfiltered_route_query(route: VedaRoute, *, query_vector, topk: int):
+    return (
+        sql.SQL(
+            """
+            SELECT block_id, document_id, block_content, distance
+            FROM (
+                SELECT p.block_id, p.document_id, p.block_content,
+                       p.vector <-> %s::vector AS distance
+                FROM {} p
+                ORDER BY distance
+                LIMIT %s
+            ) routed
+            ORDER BY distance
+            LIMIT %s;
+            """
+        ).format(sql.Identifier(route.table_name)),
+        [query_vector, int(topk), int(topk)],
+    )
+
+
+def _route_selectivity(route: VedaRoute) -> float:
+    impurity = float(getattr(route, "impurity_factor", 1.0) or 1.0)
+    if impurity <= 0:
+        return 1.0
+    return min(1.0, max(0.000001, 1.0 / impurity))
+
+
+def _configure_vedahnsw_route(cur, route: VedaRoute, *, base_ef: int, max_ef: int, topk: int, global_bound: float) -> None:
+    bound_value = float(global_bound) if math.isfinite(float(global_bound)) else -1.0
+    cur.execute(f"SET vedahnsw.base_ef = {max(1, int(base_ef))};")
+    cur.execute(f"SET vedahnsw.max_ef = {max(1, int(max_ef))};")
+    cur.execute(f"SET vedahnsw.topk = {max(0, int(topk))};")
+    cur.execute(f"SET vedahnsw.global_bound = {bound_value:.17g};")
+    cur.execute(f"SET vedahnsw.route_selectivity = {_route_selectivity(route):.12f};")
+    cur.execute(sql.SQL("SET vedahnsw.allowed_patterns = {};").format(
+        sql.Literal(",".join(str(int(pattern_id)) for pattern_id in route.pattern_ids))
+    ))
+
+
 def _local_unfiltered_probe(cur, route: VedaRoute, *, query_vector, topk: int, collect_sql_time: bool):
     query = sql.SQL(
         """
@@ -207,29 +250,53 @@ def veda_search_statistics_system(user_id: int, query_vector, topk: int = 5):
 
 def _veda_search_impl(user_id: int, query_vector, topk: int, *, collect_sql_time: bool):
     started_at = time.time()
+    excluded_system_time = 0.0
     routes = [route for route in load_user_routes(int(user_id)) if route.pattern_ids]
     if not routes:
         return [], 0.0
 
+    total_query_time = 0.0
+
+    def _add_sql_python_time(started_at: float) -> None:
+        nonlocal total_query_time
+        if collect_sql_time:
+            total_query_time += time.perf_counter() - started_at
+
+    python_started_at = time.perf_counter()
     leftovers = [route for route in routes if str(route.route_kind) == "leftover"]
     pure_indices = [route for route in routes if str(route.route_kind) == "index"]
     impure_indices = [route for route in routes if str(route.route_kind) == "impure_index"]
     impure_indices.sort(key=lambda route: float(route.impurity_factor))
     search_mode = _search_mode()
     count_probe_sql_time = collect_sql_time and _sql_timing_mode() == "fair"
-
     base_ef = _base_ef_search()
-    total_query_time = 0.0
+    index_type = _index_type()
+    _add_sql_python_time(python_started_at)
+
     all_results = []
+    connect_started_at = time.perf_counter() if not collect_sql_time else None
     conn = get_db_connection()
+    if connect_started_at is not None:
+        excluded_system_time += time.perf_counter() - connect_started_at
     try:
         with conn.cursor() as cur:
             _configure_search_session(cur)
 
             def _search_route(route: VedaRoute, *, ef_search: int, limit: int) -> None:
                 nonlocal total_query_time
-                _try_set(cur, f"SET hnsw.ef_search = {int(ef_search)};")
-                query, params = _route_query(route, query_vector=query_vector, topk=topk, limit=limit)
+                if index_type == "vedahnsw" and str(route.route_kind) in {"index", "impure_index"}:
+                    _configure_vedahnsw_route(
+                        cur,
+                        route,
+                        base_ef=base_ef,
+                        max_ef=max(int(ef_search), int(base_ef)),
+                        topk=topk,
+                        global_bound=_global_bound(all_results, int(topk)),
+                    )
+                    query, params = _unfiltered_route_query(route, query_vector=query_vector, topk=topk)
+                else:
+                    _try_set(cur, f"SET hnsw.ef_search = {int(ef_search)};")
+                    query, params = _route_query(route, query_vector=query_vector, topk=topk, limit=limit)
                 if collect_sql_time:
                     total_query_time += _explain_analyze_time(cur, query, params)
                 cur.execute(query, params)
@@ -253,31 +320,58 @@ def _veda_search_impl(user_id: int, query_vector, topk: int, *, collect_sql_time
                         inflated_limit = max(int(topk), int(math.ceil(float(route.impurity_factor) * float(topk))))
                         _search_route(route, ef_search=inflated_ef, limit=inflated_limit)
                 else:
+                    python_started_at = time.perf_counter()
                     global_bound = _global_bound(all_results, int(topk))
-                    for route in impure_indices:
-                        _try_set(cur, f"SET hnsw.ef_search = {int(base_ef)};")
-                        local_unfiltered, probe_time = _local_unfiltered_probe(
-                            cur,
-                            route,
-                            query_vector=query_vector,
-                            topk=topk,
-                            collect_sql_time=count_probe_sql_time,
-                        )
-                        total_query_time += probe_time
-                        _release_statement_locks(conn)
-                        all_results.extend(_authorized_probe_results(local_unfiltered, route))
-                        local_bound = float(local_unfiltered[int(topk) - 1][4]) if len(local_unfiltered) >= int(topk) else float("inf")
-                        global_bound = _global_bound(all_results, int(topk))
+                    _add_sql_python_time(python_started_at)
+                    if index_type == "vedahnsw":
+                        for route in impure_indices:
+                            inflated_ef = max(int(base_ef), int(math.ceil(float(route.impurity_factor) * float(base_ef))))
+                            inflated_limit = max(int(topk), int(math.ceil(float(route.impurity_factor) * float(topk))))
+                            _search_route(route, ef_search=inflated_ef, limit=inflated_limit)
+                            python_started_at = time.perf_counter()
+                            global_bound = _global_bound(all_results, int(topk))
+                            _add_sql_python_time(python_started_at)
+                    else:
+                        for route in impure_indices:
+                            _try_set(cur, f"SET hnsw.ef_search = {int(base_ef)};")
+                            probe_started_at = time.perf_counter() if not collect_sql_time else None
+                            local_unfiltered, probe_time = _local_unfiltered_probe(
+                                cur,
+                                route,
+                                query_vector=query_vector,
+                                topk=topk,
+                                collect_sql_time=count_probe_sql_time,
+                            )
+                            if probe_started_at is not None:
+                                excluded_system_time += time.perf_counter() - probe_started_at
+                            total_query_time += probe_time
+                            _release_statement_locks(conn)
+                            filter_started_at = time.perf_counter()
+                            authorized_probe_results = _authorized_probe_results(local_unfiltered, route)
+                            filter_elapsed = time.perf_counter() - filter_started_at
+                            if collect_sql_time:
+                                total_query_time += filter_elapsed
+                            all_results.extend(authorized_probe_results)
+                            python_started_at = time.perf_counter()
+                            local_bound = float(local_unfiltered[int(topk) - 1][4]) if len(local_unfiltered) >= int(topk) else float("inf")
+                            global_bound = _global_bound(all_results, int(topk))
+                            skip_expanded_search = math.isfinite(global_bound) and local_bound >= global_bound
+                            _add_sql_python_time(python_started_at)
 
-                        if math.isfinite(global_bound) and local_bound >= global_bound:
-                            continue
+                            if skip_expanded_search:
+                                continue
 
-                        inflated_ef = max(int(base_ef), int(math.ceil(float(route.impurity_factor) * float(base_ef))))
-                        inflated_limit = max(int(topk), int(math.ceil(float(route.impurity_factor) * float(topk))))
-                        _search_route(route, ef_search=inflated_ef, limit=inflated_limit)
-                        global_bound = _global_bound(all_results, int(topk))
+                            inflated_ef = max(int(base_ef), int(math.ceil(float(route.impurity_factor) * float(base_ef))))
+                            inflated_limit = max(int(topk), int(math.ceil(float(route.impurity_factor) * float(topk))))
+                            _search_route(route, ef_search=inflated_ef, limit=inflated_limit)
+                            python_started_at = time.perf_counter()
+                            global_bound = _global_bound(all_results, int(topk))
+                            _add_sql_python_time(python_started_at)
     finally:
+        close_started_at = time.perf_counter() if not collect_sql_time else None
         conn.close()
+        if close_started_at is not None:
+            excluded_system_time += time.perf_counter() - close_started_at
 
-    elapsed = total_query_time if collect_sql_time else time.time() - started_at
+    elapsed = total_query_time if collect_sql_time else time.time() - started_at - excluded_system_time
     return _merge_results(all_results, int(topk)), float(elapsed)

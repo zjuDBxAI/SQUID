@@ -21,24 +21,25 @@ SHOW_PROGRESS="${SHOW_PROGRESS:-true}"
 USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-true}"
 RESULT_TAG="${RESULT_TAG:-OURS}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/efs_logs}"
-EFS_LIST="${EFS_LIST:-10 20 30 40 50}"
+EFS_LIST="${EFS_LIST:-25}"
 
 # This script only evaluates existing materialized kmeans partitions.
 # It intentionally passes --prepare false for every ef_search value.
 IFS=' ' read -r -a EFS_VALUES <<< "${EFS_LIST//,/ }"
 
-mkdir -p "${LOG_DIR}"
+METHOD_LOG_DIR="${LOG_DIR}/OURS"
+mkdir -p "${METHOD_LOG_DIR}"
 
 for EFS in "${EFS_VALUES[@]}"; do
   EFFECTIVE_RESULT_TAG="${RESULT_TAG}_ef${EFS}"
   TS="$(date +%Y%m%d_%H%M%S)"
-  LOG_FILE="${LOG_DIR}/${EFFECTIVE_RESULT_TAG}_${TS}.log"
+  LOG_FILE="${METHOD_LOG_DIR}/${EFFECTIVE_RESULT_TAG}_${TS}.log"
 
   echo "========================================"
   echo "[run_ours] testing ef_search=${EFS}, result_tag=${EFFECTIVE_RESULT_TAG}, prepare=false"
   echo "[log] ${LOG_FILE}"
 
-  "${PYTHON_BIN}" test_kmeans_partition.py \
+ python test_kmeans_partition.py \
     --prepare false \
     --private-replication-budget-ratio "${PRIVATE_REPLICATION_BUDGET_RATIO}" \
     --private-edge-top-d "${PRIVATE_EDGE_TOP_D}" \

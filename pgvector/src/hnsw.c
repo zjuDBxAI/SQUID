@@ -32,9 +32,16 @@ double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
 int			squidhnsw_base_ef;
 int			squidhnsw_max_ef;
-double		squidhnsw_route_selectivity;
+int			squidhnsw_topk;
 double		squidhnsw_global_bound;
+double		squidhnsw_route_selectivity;
 char	   *squidhnsw_allowed_patterns;
+int			vedahnsw_base_ef;
+int			vedahnsw_max_ef;
+int			vedahnsw_topk;
+double		vedahnsw_global_bound;
+double		vedahnsw_route_selectivity;
+char	   *vedahnsw_allowed_patterns;
 static relopt_kind hnsw_relopt_kind;
 
 /*
@@ -114,20 +121,51 @@ HnswInit(void)
 							"Valid range is 1..5000.", &squidhnsw_max_ef,
 							HNSW_MAX_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomIntVariable("squidhnsw.topk", "Sets the requested top-k for SQUIDHNSW adaptive early-stop decisions",
+							"Set to 0 to disable top-k bound early-stop.", &squidhnsw_topk,
+							0, 0, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("squidhnsw.global_bound", "Sets the current global top-k distance bound for SQUIDHNSW adaptive early-stop",
+							NULL, &squidhnsw_global_bound,
+							-1, -1, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomRealVariable("squidhnsw.route_selectivity", "Sets the metadata selectivity for the current SQUIDHNSW route",
 							NULL, &squidhnsw_route_selectivity,
 							1, 0.000001, 1, PGC_USERSET, 0, NULL, NULL, NULL);
 
-	DefineCustomRealVariable("squidhnsw.global_bound", "Sets the current global top-k distance bound for SQUIDHNSW pruning",
-							NULL, &squidhnsw_global_bound,
-							DBL_MAX, 0, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable("squidhnsw.allowed_patterns", "Sets comma-separated Access Atom ids visible to the current user",
 							NULL, &squidhnsw_allowed_patterns,
 							"", PGC_USERSET, 0, NULL, NULL, NULL);
 
+
+	DefineCustomIntVariable("vedahnsw.base_ef", "Sets the base search budget for VEDAHNSW probe search",
+								"Valid range is 1..5000.", &vedahnsw_base_ef,
+								HNSW_DEFAULT_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("vedahnsw.max_ef", "Sets the maximum search budget for VEDAHNSW expanded search",
+								"Valid range is 1..5000.", &vedahnsw_max_ef,
+								HNSW_MAX_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("vedahnsw.topk", "Sets the requested top-k for VEDAHNSW local-bound decisions",
+								"Set to 0 to disable local-bound skip.", &vedahnsw_topk,
+								0, 0, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("vedahnsw.global_bound", "Sets the current global top-k distance bound for VEDAHNSW",
+								NULL, &vedahnsw_global_bound,
+								-1, -1, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("vedahnsw.route_selectivity", "Sets the route selectivity for VEDAHNSW expanded search",
+								NULL, &vedahnsw_route_selectivity,
+								1, 0.000001, 1, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable("vedahnsw.allowed_patterns", "Sets comma-separated Access Atom ids visible to the current user",
+								NULL, &vedahnsw_allowed_patterns,
+								"", PGC_USERSET, 0, NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("hnsw");
 	MarkGUCPrefixReserved("squidhnsw");
+	MarkGUCPrefixReserved("vedahnsw");
 }
 
 /*
@@ -426,6 +464,87 @@ squidhnswhandler(PG_FUNCTION_ARGS)
 	amroutine->ambeginscan = hnswbeginscan;
 	amroutine->amrescan = hnswrescan;
 	amroutine->amgettuple = squidhnswgettuple;
+	amroutine->amgetbitmap = NULL;
+	amroutine->amendscan = hnswendscan;
+	amroutine->ammarkpos = NULL;
+	amroutine->amrestrpos = NULL;
+
+	amroutine->amestimateparallelscan = NULL;
+	amroutine->aminitparallelscan = NULL;
+	amroutine->amparallelrescan = NULL;
+
+#if PG_VERSION_NUM >= 180000
+	amroutine->amtranslatestrategy = NULL;
+	amroutine->amtranslatecmptype = NULL;
+#endif
+
+	PG_RETURN_POINTER(amroutine);
+}
+
+/*
+ * Define VEDAHNSW index handler
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(vedahnswhandler);
+Datum
+vedahnswhandler(PG_FUNCTION_ARGS)
+{
+	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+
+	amroutine->amstrategies = 0;
+	amroutine->amsupport = 3;
+	amroutine->amoptsprocnum = 0;
+	amroutine->amcanorder = false;
+	amroutine->amcanorderbyop = true;
+#if PG_VERSION_NUM >= 180000
+	amroutine->amcanhash = false;
+	amroutine->amconsistentequality = false;
+	amroutine->amconsistentordering = false;
+#endif
+	amroutine->amcanbackward = false;
+	amroutine->amcanunique = false;
+	amroutine->amcanmulticol = false;
+	amroutine->amoptionalkey = true;
+	amroutine->amsearcharray = false;
+	amroutine->amsearchnulls = false;
+	amroutine->amstorage = false;
+	amroutine->amclusterable = false;
+	amroutine->ampredlocks = false;
+	amroutine->amcanparallel = false;
+#if PG_VERSION_NUM >= 170000
+	amroutine->amcanbuildparallel = true;
+#endif
+	amroutine->amcaninclude = true;
+	amroutine->amusemaintenanceworkmem = false;
+#if PG_VERSION_NUM >= 160000
+	amroutine->amsummarizing = false;
+#endif
+	amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
+	amroutine->amkeytype = InvalidOid;
+
+	/* Reuse HNSW graph maintenance; use SQUID payload-aware build/insert/scan. */
+	amroutine->ambuild = squidhnswbuild;
+	amroutine->ambuildempty = hnswbuildempty;
+	amroutine->aminsert = squidhnswinsert;
+#if PG_VERSION_NUM >= 170000
+	amroutine->aminsertcleanup = NULL;
+#endif
+	amroutine->ambulkdelete = hnswbulkdelete;
+	amroutine->amvacuumcleanup = hnswvacuumcleanup;
+	amroutine->amcanreturn = NULL;
+	amroutine->amcostestimate = hnswcostestimate;
+#if PG_VERSION_NUM >= 180000
+	amroutine->amgettreeheight = NULL;
+#endif
+	amroutine->amoptions = hnswoptions;
+	amroutine->amproperty = NULL;
+	amroutine->ambuildphasename = hnswbuildphasename;
+	amroutine->amvalidate = hnswvalidate;
+#if PG_VERSION_NUM >= 140000
+	amroutine->amadjustmembers = NULL;
+#endif
+	amroutine->ambeginscan = hnswbeginscan;
+	amroutine->amrescan = hnswrescan;
+	amroutine->amgettuple = vedahnswgettuple;
 	amroutine->amgetbitmap = NULL;
 	amroutine->amendscan = hnswendscan;
 	amroutine->ammarkpos = NULL;

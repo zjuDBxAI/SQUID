@@ -201,10 +201,7 @@ class VedaPlanner:
 
         lattice, finalize_metadata = self._finalize_lattice(lattice)
         role_plans = self._build_role_query_plans(lattice, exact=True, final=True)
-        if self._storage_amplification(lattice) < self.storage_amplification:
-            lattice, role_plans, super_impure_metadata = self._handle_super_impure_nodes(lattice, role_plans)
-        else:
-            super_impure_metadata = {"enabled": False, "reason": "no_reclaimed_storage_budget"}
+        super_impure_metadata = {"enabled": False, "reason": "disabled_for_paper_semantics"}
 
         nodes = self._materializable_nodes(lattice)
         node_id_map = {
