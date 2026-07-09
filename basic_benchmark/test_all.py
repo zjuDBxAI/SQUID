@@ -56,7 +56,7 @@ if __name__ == '__main__':
     parser.add_argument('--statistics-type', choices=['sql', 'system'], default='sql', help='Latency source: EXPLAIN SQL time or wall-clock system time.')
     parser.add_argument('--generator-type', default='', help='Tag included in output filenames.')
     parser.add_argument('--iterations', type=int, default=1, help='Repeat each query this many times and average the result.')
-    parser.add_argument('--query-num', type=int, default=1000, help='Number of queries to run for QDTree.')
+    parser.add_argument('--query-num', type=int, default=1000, help='Number of queries to run.')
     parser.add_argument('--record-recall', type=_str_to_bool, default=True, help='Whether to compute recall against ground truth.')
     parser.add_argument('--warm-up', type=_str_to_bool, default=True, help='Whether to warm up each query before measuring.')
 
@@ -88,6 +88,7 @@ if __name__ == '__main__':
                 statistics_type=statistics_type,
                 index_type=index_type,
                 generator_type=generator_type,
+                query_num=query_num,
                 warm_up=warm_up,
             )
             rls_space_mb = calculate_rls('row_level_security', enable_index=enable_index)
@@ -104,6 +105,7 @@ if __name__ == '__main__':
                 statistics_type=statistics_type,
                 generator_type=generator_type,
                 record_recall=record_recall,
+                query_num=query_num,
                 warm_up=warm_up,
             )
             role_space_mb = calculate_prefilter('prefilter_partition_role', enable_index=enable_index)
@@ -120,6 +122,7 @@ if __name__ == '__main__':
                 statistics_type=statistics_type,
                 generator_type=generator_type,
                 record_recall=record_recall,
+                query_num=query_num,
                 warm_up=warm_up,
             )
             comb_space_mb = calculate_prefilter('prefilter_partition_combination', enable_index=enable_index)
@@ -136,6 +139,7 @@ if __name__ == '__main__':
                 index_type=index_type,
                 generator_type=generator_type,
                 record_recall=record_recall,
+                query_num=query_num,
                 warm_up=warm_up,
             )
             dynamic_space_mb = calculate_dynamic_partition('dynamic_partition', enable_index=enable_index)

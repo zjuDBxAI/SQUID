@@ -41,8 +41,17 @@ def _sanitize_identifier_part(value: object) -> str:
     return sanitized.strip("_") or "default"
 
 
-def get_node_table_name(node_id: str | int) -> str:
-    return f"{VEDA_NODE_TABLE_PREFIX}{_sanitize_identifier_part(node_id)}"
+def get_node_table_name(node_id: str | int, algorithm: str | None = None) -> str:
+    algorithm_part = ""
+    if algorithm:
+        algorithm_part = f"{_sanitize_identifier_part(normalize_algorithm(algorithm))}_"
+    return f"{VEDA_NODE_TABLE_PREFIX}{algorithm_part}{_sanitize_identifier_part(node_id)}"
+
+
+def get_node_table_prefix(algorithm: str | None = None) -> str:
+    if algorithm is None:
+        return VEDA_NODE_TABLE_PREFIX
+    return f"{VEDA_NODE_TABLE_PREFIX}{_sanitize_identifier_part(normalize_algorithm(algorithm))}_"
 
 
 def role_key(role_ids: Iterable[int]) -> str:

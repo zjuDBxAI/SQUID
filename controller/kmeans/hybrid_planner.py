@@ -629,6 +629,7 @@ class HybridACLKMeansPlanner:
             "reference_group_vector_mean": float(sum(reference_group_vectors) / len(reference_group_vectors)) if reference_group_vectors else 0.0,
             "reference_group_vector_max": int(max(reference_group_vectors)) if reference_group_vectors else 0,
             "cost_model": str(cost_model_metadata(DEFAULT_COST_MODEL)["cost_model"]),
+            "private_cost_aggregation": "average_over_served_tenants",
         }
         return shared, private, None
 
@@ -1211,7 +1212,7 @@ class HybridACLKMeansPlanner:
                 total += estimate_partition_query_cost(
                     partition_vectors=int(partition_vectors),
                     accessible_vectors=int(accessible_vectors),
-                    tenant_weight=float(tenant_weight),
+                    tenant_weight=1.0,
                     ef_search=int(ef_search),
                     topk=int(_COST_TOPK),
                     use_adaptive_ef=True,
@@ -1378,7 +1379,7 @@ class HybridACLKMeansPlanner:
             "move_right": 3,
             "full": 4,
         }
-        operations = ("full", "move_left", "move_right", "split_overlap", "merge_extract_overlap")
+        operations = ("full", "move_left", "move_right", "merge_extract_overlap", "split_overlap")
 
         def group_selectivity_profile(group_id: int, group: dict[str, object]) -> dict[str, object] | None:
             partition_vectors = int(group.get("vector_count", 0))
@@ -2222,6 +2223,22 @@ class HybridACLKMeansPlanner:
             edge_refcounts.clear()
             edge_signal_scores.clear()
 
+        # Second-stage tenant-similarity merge is intentionally disabled. The
+        # planner now relies only on the first-stage private core-star operations;
+        # this keeps the partition state directly attributable to the Cost Model.
+        tenant_similarity_initial_group_count = int(len(groups))
+        tenant_similarity_candidate_count = 0
+        tenant_similarity_merge_count = 0
+        tenant_similarity_stale_candidate_count = 0
+        tenant_similarity_heap_push_count = 0
+        tenant_similarity_edge_refresh_count = 0
+        tenant_similarity_total_gain = 0.0
+        tenant_similarity_last_gain = None
+        tenant_similarity_stop_reason = "disabled"
+        tenant_similarity_top_d = 0
+        tenant_similarity_min_partition_vectors = 0
+        tenant_similarity_final_group_count = int(len(groups))
+
         compact_ids = {group_id: index for index, group_id in enumerate(sorted(groups))}
         private_groups_for_partitions: list[dict[str, object]] = []
         tenant_to_cluster: dict[int, int] = {}
@@ -2301,6 +2318,18 @@ class HybridACLKMeansPlanner:
             "move_right_count": int(operation_counts.get("move_right", 0)),
             "split_overlap_count": int(operation_counts.get("split_overlap", 0)),
             "merge_extract_overlap_count": int(operation_counts.get("merge_extract_overlap", 0)),
+            "tenant_similarity_merge_count": int(tenant_similarity_merge_count),
+            "tenant_similarity_candidate_count": int(tenant_similarity_candidate_count),
+            "tenant_similarity_heap_push_count": int(tenant_similarity_heap_push_count),
+            "tenant_similarity_edge_refresh_count": int(tenant_similarity_edge_refresh_count),
+            "tenant_similarity_stale_candidate_count": int(tenant_similarity_stale_candidate_count),
+            "tenant_similarity_initial_group_count": int(tenant_similarity_initial_group_count),
+            "tenant_similarity_final_group_count": int(tenant_similarity_final_group_count),
+            "tenant_similarity_total_gain": float(tenant_similarity_total_gain),
+            "tenant_similarity_last_gain": None if tenant_similarity_last_gain is None else float(tenant_similarity_last_gain),
+            "tenant_similarity_stop_reason": str(tenant_similarity_stop_reason),
+            "tenant_similarity_top_d": int(tenant_similarity_top_d),
+            "tenant_similarity_min_partition_vectors": int(tenant_similarity_min_partition_vectors),
             "selectivity_extract_count": int(selectivity_refine_count),
             "selectivity_extract_cost_delta": float(selectivity_refine_cost_delta),
             "selectivity_extract_stop_reason": str(selectivity_refine_stop_reason),
@@ -2309,7 +2338,7 @@ class HybridACLKMeansPlanner:
             "selectivity_extract_last_avg_selectivity": None if selectivity_refine_last_avg_selectivity is None else float(selectivity_refine_last_avg_selectivity),
             "selectivity_extract_last_worst_selectivity": None if selectivity_refine_last_worst_selectivity is None else float(selectivity_refine_last_worst_selectivity),
             "total_storage_reduction": int(total_storage_reduction),
-            "total_latency_delta": float(total_latency_delta) + float(selectivity_refine_cost_delta),
+            "total_latency_delta": float(total_latency_delta) + float(selectivity_refine_cost_delta) - float(tenant_similarity_total_gain),
             "cost_initial": float(initial_cost),
             "cost_final": float(current_cost),
             "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; heap first takes delta_latency<=0 memory-saving candidates, then ranks positive-loss candidates by delta_latency/memory_saved",

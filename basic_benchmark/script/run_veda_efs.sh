@@ -11,16 +11,17 @@ PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 ALGORITHM="${ALGORITHM:-effveda}"
 
 # Space-separated ef_search values. Override with: EFS_VALUES="40 80 120" ./script/run_veda_efs.sh
-EFS_VALUES="${EFS_VALUES:-25}"
+EFS_VALUES="${EFS_VALUES:-100}"
+# 3 5 10 12 15 18 20 25 28 30 33 35 38 40 45 50 53 55 60 65 70 75 80 85
 read -r -a EFS_LIST <<< "${EFS_VALUES}"
 
-PREPARE="${PREPARE:-false}"
+PREPARE="${PREPARE:-true}"
 # Veda planning uses ef_search in the cost model, so rebuilding per ef is the safer default.
 REBUILD_EACH_EF="${REBUILD_EACH_EF:-false}"
 
 QUERY_NUM="${QUERY_NUM:-200}"
 ITERATIONS="${ITERATIONS:-1}"
-INDEX_TYPE="${INDEX_TYPE:-hnsw}"
+INDEX_TYPE="${INDEX_TYPE:-vedahnsw}"
 STATISTICS_TYPE="${STATISTICS_TYPE:-sql}"
 RECORD_RECALL="${RECORD_RECALL:-true}"
 WARM_UP="${WARM_UP:-true}"

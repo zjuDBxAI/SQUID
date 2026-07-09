@@ -16,7 +16,7 @@ from controller.baseline.veda import (
     drop_indexes_for_materialized_partitions,
     load_current_partitions,
 )
-from controller.baseline.veda.common import DEFAULT_QUERY_DATASET_PATH
+from controller.baseline.veda.common import DEFAULT_QUERY_DATASET_PATH, normalize_algorithm
 
 
 def _str_to_bool(value: str) -> bool:
@@ -81,7 +81,7 @@ def _compose_generator_label(
     return f"{label}_{safe_tag}" if label else safe_tag
 
 
-def _ensure_index_state(partitions, index_type: str) -> None:
+def _ensure_index_state(partitions, index_type: str, algorithm: str) -> None:
     missing = []
     wrong_type = []
     for partition in partitions:
@@ -93,8 +93,8 @@ def _ensure_index_state(partitions, index_type: str) -> None:
         elif actual_type != index_type:
             wrong_type.append(partition.table_name)
     if missing or wrong_type:
-        drop_indexes_for_materialized_partitions()
-        create_indexes_for_materialized_partitions(index_type=index_type)
+        drop_indexes_for_materialized_partitions(algorithm=algorithm)
+        create_indexes_for_materialized_partitions(index_type=index_type, algorithm=algorithm)
 
 
 def test_veda_search(
@@ -121,6 +121,9 @@ def test_veda_search(
     query_dataset_path=DEFAULT_QUERY_DATASET_PATH,
     show_progress=True,
 ):
+    algorithm = normalize_algorithm(algorithm)
+    _sync_efconfig_value("veda_algorithm", algorithm)
+
     effective_query_num = max(1, int(query_num))
     queries = prepare_query_dataset(
         regenerate=False,
@@ -140,14 +143,14 @@ def test_veda_search(
             show_progress=bool(show_progress),
         )
 
-    partitions = load_current_partitions(refresh=True)
+    partitions = load_current_partitions(algorithm=algorithm, refresh=True)
     if not partitions:
-        raise RuntimeError("No Veda nodes are materialized. Run with --prepare true first.")
+        raise RuntimeError(f"No {algorithm} nodes are materialized. Run with --prepare true first.")
 
     if enable_index:
-        _ensure_index_state(partitions, index_type)
+        _ensure_index_state(partitions, index_type, algorithm)
     else:
-        drop_indexes_for_materialized_partitions()
+        drop_indexes_for_materialized_partitions(algorithm=algorithm)
 
     _sync_efconfig_value("ef_search", int(ef_search))
     _sync_efconfig_value("veda_ef_search", int(ef_search))
@@ -164,7 +167,7 @@ def test_veda_search(
 
     effective_generator_type = _compose_generator_label(
         generator_type,
-        str(algorithm),
+        algorithm,
         result_tag,
         float(storage_amplification),
         int(indexing_threshold),
@@ -173,7 +176,7 @@ def test_veda_search(
     )
     run_test(
         queries,
-        "veda",
+        algorithm,
         iterations=iterations,
         enable_index=enable_index,
         statistics_type=statistics_type,

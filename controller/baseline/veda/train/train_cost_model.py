@@ -254,9 +254,23 @@ def run_calibration(args: argparse.Namespace) -> dict[str, object]:
         nonnegative=not args.allow_negative,
     )
 
+    model_rows = size_rows + efs_rows
+    y_joint = np.asarray([_target_latency(row, args.latency_stat) for row in model_rows], dtype=np.float64)
+    x_joint = np.asarray(
+        [[float(row["log2_1p_n"]), float(row["ef_search"]), 1.0] for row in model_rows],
+        dtype=np.float64,
+    )
+    joint_coef, joint_rmse, joint_mae, joint_r2 = _fit_line(
+        x_joint,
+        y_joint,
+        nonnegative=not args.allow_negative,
+    )
+    a = float(joint_coef[0])
+    b = float(joint_coef[1])
+    c = float(joint_coef[2])
+
     c_from_size = c1 - b * 1.0
     c_from_efs = c2 - a * math.log2(1.0 + float(fixed_size))
-    c = 0.5 * (c_from_size + c_from_efs)
 
     selected_efs_term = "linear_efs" if linear_r2 >= log_r2 else "efs_log_efs"
     payload: dict[str, object] = {
@@ -272,6 +286,13 @@ def run_calibration(args: argparse.Namespace) -> dict[str, object]:
         "c_from_size": c_from_size,
         "c_from_efs": c_from_efs,
         "selected_efs_term_by_r2": selected_efs_term,
+        "joint_fit": {
+            "formula": "T(N,efs)=a*log2(1+N)+b*efs+c",
+            "rmse_ms": joint_rmse,
+            "mae_ms": joint_mae,
+            "r2": joint_r2,
+            "nonnegative": not args.allow_negative,
+        },
         "size_sweep": {
             "formula": "T_size(N)=a*log2(1+N)+c1",
             "rmse_ms": size_rmse,
@@ -325,6 +346,7 @@ def run_calibration(args: argparse.Namespace) -> dict[str, object]:
                 f"b = {b:.10f}",
                 f"c = {c:.10f}",
                 "",
+                f"joint_fit_r2 = {joint_r2:.6f}",
                 f"size_sweep_r2 = {size_r2:.6f}",
                 f"efs_linear_r2 = {linear_r2:.6f}",
                 f"efs_log_r2 = {log_r2:.6f}",
@@ -369,6 +391,7 @@ def main() -> None:
     payload = run_calibration(args)
     print("[veda-cost-train] fitted model")
     print(f"  C(N,efs) = {payload['a']:.10f} * log2(1+N) + {payload['b']:.10f} * efs + {payload['c']:.10f}")
+    print(f"  joint_fit_r2 = {payload['joint_fit']['r2']:.6f}")
     print(f"  size_r2 = {payload['size_sweep']['r2']:.6f}")
     print(f"  efs_linear_r2 = {payload['efs_sweep_linear']['r2']:.6f}")
     print(f"  efs_log_r2 = {payload['efs_sweep_log']['r2']:.6f}")

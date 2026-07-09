@@ -13,6 +13,13 @@ from .common import VedaRoute
 from .storage import load_user_routes
 
 
+_VEDAHNSW_MAX_EF_GUC = 5000
+
+
+def _clamp_vedahnsw_ef(value: int) -> int:
+    return max(1, min(_VEDAHNSW_MAX_EF_GUC, int(value)))
+
+
 def _resolve_efconfig_module():
     for module_name in ("basic_benchmark.efconfig", "efconfig"):
         module = sys.modules.get(module_name)
@@ -194,8 +201,10 @@ def _route_selectivity(route: VedaRoute) -> float:
 
 def _configure_vedahnsw_route(cur, route: VedaRoute, *, base_ef: int, max_ef: int, topk: int, global_bound: float) -> None:
     bound_value = float(global_bound) if math.isfinite(float(global_bound)) else -1.0
-    cur.execute(f"SET vedahnsw.base_ef = {max(1, int(base_ef))};")
-    cur.execute(f"SET vedahnsw.max_ef = {max(1, int(max_ef))};")
+    base_ef_value = _clamp_vedahnsw_ef(base_ef)
+    max_ef_value = _clamp_vedahnsw_ef(max(int(max_ef), int(base_ef)))
+    cur.execute(f"SET vedahnsw.base_ef = {base_ef_value};")
+    cur.execute(f"SET vedahnsw.max_ef = {max_ef_value};")
     cur.execute(f"SET vedahnsw.topk = {max(0, int(topk))};")
     cur.execute(f"SET vedahnsw.global_bound = {bound_value:.17g};")
     cur.execute(f"SET vedahnsw.route_selectivity = {_route_selectivity(route):.12f};")

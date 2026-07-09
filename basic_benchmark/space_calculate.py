@@ -603,6 +603,14 @@ def calculate_veda(condition=None, *, enable_index=None):
         'veda_current_role_plans', 'veda_current_user_routes',
     ]
 
+    normalized = str(condition or "").strip().lower()
+    if normalized == "veda":
+        node_table_like = "veda_documentblocks_node_veda_%"
+    elif normalized == "effveda":
+        node_table_like = "veda_documentblocks_node_effveda_%"
+    else:
+        node_table_like = "veda_documentblocks_node_%"
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -612,11 +620,14 @@ def calculate_veda(condition=None, *, enable_index=None):
             if cur.fetchone()[0] is not None:
                 existing_tables.append(table_name)
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT tablename
             FROM pg_tables
-            WHERE tablename LIKE 'veda_documentblocks_node_%';
-        """)
+            WHERE tablename LIKE %s;
+            """,
+            [node_table_like],
+        )
         existing_tables.extend(row[0] for row in cur.fetchall())
     finally:
         cur.close()

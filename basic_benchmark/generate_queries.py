@@ -95,7 +95,7 @@ if __name__ == '__main__':
         generate_query_dataset(
             num_queries=args.num_queries,
             topk=args.topk,
-            output_file="query_dataset.json",
+            output_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), "query_dataset.json"),
             zipf_param=0,
             num_threads=args.num_threads
         )

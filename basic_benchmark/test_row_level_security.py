@@ -23,7 +23,7 @@ from controller.baseline.pg_row_security.row_level_security import disable_row_l
 
 
 def test_row_level_security(iterations=3, enable_index=False, index_type="ivfflat", statistics_type="sql",
-                            generator_type="tree-based", warm_up=True):
+                            generator_type="tree-based", query_num=1000, warm_up=True):
     current_index_type = get_index_type("documentblocks")
     if enable_index:
         if current_index_type is not None and current_index_type != index_type:
@@ -62,7 +62,7 @@ def test_row_level_security(iterations=3, enable_index=False, index_type="ivffla
 
     start_time = time.time()
     # Generate queries
-    queries = prepare_query_dataset(regenerate=False, num_queries=1000)
+    queries = prepare_query_dataset(regenerate=False, num_queries=max(1, int(query_num)))
     elapsed_time = time.time() - start_time
     logger.info("Time taken to generate query: %.2f seconds", elapsed_time)
 

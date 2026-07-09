@@ -23,7 +23,7 @@ from services.config import get_db_connection
 
 
 def test_dynamic_partition_search(iterations=1, enable_index=True, index_type="ivfflat", statistics_type="sql",
-                                  generator_type="tree-based", record_recall=True, warm_up=True):
+                                  generator_type="tree-based", record_recall=True, query_num=1000, warm_up=True):
     """
     Test search across partitions with optional index creation and verification.
     """
@@ -42,7 +42,7 @@ def test_dynamic_partition_search(iterations=1, enable_index=True, index_type="i
         drop_indexes_for_all_partitions()
 
     # Generate queries
-    queries = prepare_query_dataset(regenerate=False, num_queries=1000)
+    queries = prepare_query_dataset(regenerate=False, num_queries=max(1, int(query_num)))
 
     run_test(queries, f"dynamic_partition", iterations=iterations,
              enable_index=enable_index,

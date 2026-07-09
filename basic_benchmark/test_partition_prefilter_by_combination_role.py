@@ -56,7 +56,7 @@ def get_existing_combination_partition_name():
 
 def test_partition_prefilter_by_combination_role(iterations=3, enable_index=False, index_type="ivfflat",
                              statistics_type="sql",
-                             generator_type="tree-based", record_recall=True, warm_up=True):
+                             generator_type="tree-based", record_recall=True, query_num=1000, warm_up=True):
     combination_table = get_existing_combination_partition_name()
     current_index_type = get_index_type(combination_table)
 
@@ -84,7 +84,7 @@ def test_partition_prefilter_by_combination_role(iterations=3, enable_index=Fals
         drop_indexes_for_all_combination_tables()
 
     # Generate queries
-    queries = prepare_query_dataset(regenerate=False, num_queries=1000)
+    queries = prepare_query_dataset(regenerate=False, num_queries=max(1, int(query_num)))
 
     run_test(queries, f"prefilter_partition_combination", iterations=iterations,
              enable_index=enable_index,

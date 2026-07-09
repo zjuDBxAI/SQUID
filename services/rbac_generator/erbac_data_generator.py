@@ -92,7 +92,7 @@ class ERBACDataGenerator:
         # Step 3: Distribute uncovered documents while respecting m_perms
         if uncovered_documents:
             functional_roles_iter = iter(self.functional_roles)
-            for doc in uncovered_documents:
+            for doc in sorted(uncovered_documents):
                 while True:
                     try:
                         role = next(functional_roles_iter)

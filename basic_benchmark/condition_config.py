@@ -59,6 +59,11 @@ CONDITION_CONFIG = {
         "space_calc_func_path": "basic_benchmark.space_calculate.calculate_veda",
         "extra_params": {"queries_num": 1000}
     },
+    "effveda": {
+        "search_func_path": "controller.baseline.veda.veda_search",
+        "space_calc_func_path": "basic_benchmark.space_calculate.calculate_veda",
+        "extra_params": {"queries_num": 1000}
+    },
     "acl_partition": {
         "search_func_path": "controller.baseline.acl_partition.acl_partition_search",
         "space_calc_func_path": "basic_benchmark.space_calculate.calculate_acl_partition",

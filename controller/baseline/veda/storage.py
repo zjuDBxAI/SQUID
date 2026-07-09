@@ -19,6 +19,7 @@ from .common import (
     VEDA_NODE_TABLE_PREFIX,
     VEDA_PATTERN_TABLE,
     VEDA_PLAN_TABLE,
+    get_node_table_prefix,
     VEDA_ROLE_PLAN_TABLE,
     VEDA_ROUTE_TABLE,
     VedaNode,
@@ -37,19 +38,28 @@ _MATERIALIZE_BATCH_SIZE = 8192
 _MATERIALIZE_ADVISORY_LOCK_KEY = 2026053001
 _POSTGRES_IDENTIFIER_LIMIT = 63
 
-_CACHED_PLAN_SUMMARY: Optional[dict[str, object]] = None
-_CACHED_NODES: Optional[list[VedaNode]] = None
-_CACHED_ROUTES: dict[int, list[VedaRoute]] = {}
+_CACHED_PLAN_SUMMARY: dict[str, dict[str, object] | None] = {}
+_CACHED_NODES: dict[str, list[VedaNode]] = {}
+_CACHED_ROUTES: dict[tuple[str, int], list[VedaRoute]] = {}
 
 
 def _default_db_connection_factory():
     return get_db_connection()
 
 
+def _configured_algorithm(default: str = "effveda") -> str:
+    try:
+        from basic_benchmark import efconfig  # type: ignore
+    except Exception:
+        efconfig = None
+    value = getattr(efconfig, "veda_algorithm", default) if efconfig is not None else default
+    return normalize_algorithm(str(value or default))
+
+
 def invalidate_cache() -> None:
     global _CACHED_PLAN_SUMMARY, _CACHED_NODES, _CACHED_ROUTES
-    _CACHED_PLAN_SUMMARY = None
-    _CACHED_NODES = None
+    _CACHED_PLAN_SUMMARY = {}
+    _CACHED_NODES = {}
     _CACHED_ROUTES = {}
 
 
@@ -196,13 +206,19 @@ def initialize_schema(*, db_connection_factory=_default_db_connection_factory) -
         conn.close()
 
 
-def clear_current_plan(*, db_connection_factory=_default_db_connection_factory) -> None:
+def clear_current_plan(*, algorithm: str | None = None, db_connection_factory=_default_db_connection_factory) -> None:
     invalidate_cache()
     initialize_schema(db_connection_factory=db_connection_factory)
     conn = db_connection_factory()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql.SQL("DELETE FROM {};").format(sql.Identifier(VEDA_PLAN_TABLE)))
+            if algorithm is None:
+                cur.execute(sql.SQL("DELETE FROM {};").format(sql.Identifier(VEDA_PLAN_TABLE)))
+            else:
+                cur.execute(
+                    sql.SQL("DELETE FROM {} WHERE algorithm = %s;").format(sql.Identifier(VEDA_PLAN_TABLE)),
+                    [normalize_algorithm(algorithm)],
+                )
         conn.commit()
     finally:
         conn.close()
@@ -214,7 +230,10 @@ def save_plan(plan: VedaPlan, *, db_connection_factory=_default_db_connection_fa
     conn = db_connection_factory()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql.SQL("DELETE FROM {};").format(sql.Identifier(VEDA_PLAN_TABLE)))
+            cur.execute(
+                sql.SQL("DELETE FROM {} WHERE algorithm = %s;").format(sql.Identifier(VEDA_PLAN_TABLE)),
+                [normalize_algorithm(plan.algorithm)],
+            )
             metadata = dict(plan.metadata or {})
             cur.execute(
                 sql.SQL(
@@ -349,10 +368,11 @@ def save_plan(plan: VedaPlan, *, db_connection_factory=_default_db_connection_fa
         conn.close()
 
 
-def get_current_plan_summary(*, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> Optional[dict[str, object]]:
+def get_current_plan_summary(*, algorithm: str | None = None, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> Optional[dict[str, object]]:
+    active_algorithm = _configured_algorithm() if algorithm is None else normalize_algorithm(algorithm)
     global _CACHED_PLAN_SUMMARY
-    if not refresh and _CACHED_PLAN_SUMMARY is not None:
-        return _CACHED_PLAN_SUMMARY
+    if not refresh and active_algorithm in _CACHED_PLAN_SUMMARY:
+        return _CACHED_PLAN_SUMMARY[active_algorithm]
     initialize_schema(db_connection_factory=db_connection_factory)
     conn = db_connection_factory()
     try:
@@ -364,18 +384,20 @@ def get_current_plan_summary(*, refresh: bool = False, db_connection_factory=_de
                            index_node_count, leftover_node_count, document_count,
                            original_vector_count, materialized_vector_count, metadata
                     FROM {}
+                    WHERE algorithm = %s
                     ORDER BY plan_id DESC
                     LIMIT 1;
                     """
-                ).format(sql.Identifier(VEDA_PLAN_TABLE))
+                ).format(sql.Identifier(VEDA_PLAN_TABLE)),
+                [active_algorithm],
             )
             row = cur.fetchone()
     finally:
         conn.close()
     if row is None:
-        _CACHED_PLAN_SUMMARY = None
+        _CACHED_PLAN_SUMMARY[active_algorithm] = None
         return None
-    _CACHED_PLAN_SUMMARY = {
+    summary = {
         "plan_id": int(row[0]),
         "algorithm": str(row[1]),
         "role_count": int(row[2]),
@@ -388,16 +410,18 @@ def get_current_plan_summary(*, refresh: bool = False, db_connection_factory=_de
         "materialized_vector_count": int(row[9]),
         "metadata": dict(row[10] or {}),
     }
-    return _CACHED_PLAN_SUMMARY
+    _CACHED_PLAN_SUMMARY[active_algorithm] = summary
+    return summary
 
 
-def load_current_nodes(*, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> list[VedaNode]:
+def load_current_nodes(*, algorithm: str | None = None, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> list[VedaNode]:
+    active_algorithm = _configured_algorithm() if algorithm is None else normalize_algorithm(algorithm)
     global _CACHED_NODES
-    if not refresh and _CACHED_NODES is not None:
-        return _CACHED_NODES
-    summary = get_current_plan_summary(refresh=refresh, db_connection_factory=db_connection_factory)
+    if not refresh and active_algorithm in _CACHED_NODES:
+        return _CACHED_NODES[active_algorithm]
+    summary = get_current_plan_summary(algorithm=active_algorithm, refresh=refresh, db_connection_factory=db_connection_factory)
     if summary is None:
-        _CACHED_NODES = []
+        _CACHED_NODES[active_algorithm] = []
         return []
     conn = db_connection_factory()
     try:
@@ -418,7 +442,7 @@ def load_current_nodes(*, refresh: bool = False, db_connection_factory=_default_
             rows = cur.fetchall()
     finally:
         conn.close()
-    _CACHED_NODES = [
+    nodes = [
         VedaNode(
             node_id=str(row[0]),
             role_ids=normalize_int_tuple(row[1] or ()),
@@ -432,21 +456,24 @@ def load_current_nodes(*, refresh: bool = False, db_connection_factory=_default_
         )
         for row in rows
     ]
-    return _CACHED_NODES
+    _CACHED_NODES[active_algorithm] = nodes
+    return nodes
 
 
-def load_current_partitions(*, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> list[VedaNode]:
-    return load_current_nodes(refresh=refresh, db_connection_factory=db_connection_factory)
+def load_current_partitions(*, algorithm: str | None = None, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> list[VedaNode]:
+    return load_current_nodes(algorithm=algorithm, refresh=refresh, db_connection_factory=db_connection_factory)
 
 
-def load_user_routes(user_id: int, *, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> list[VedaRoute]:
+def load_user_routes(user_id: int, *, algorithm: str | None = None, refresh: bool = False, db_connection_factory=_default_db_connection_factory) -> list[VedaRoute]:
+    active_algorithm = _configured_algorithm() if algorithm is None else normalize_algorithm(algorithm)
     global _CACHED_ROUTES
     user_id = int(user_id)
-    if not refresh and user_id in _CACHED_ROUTES:
-        return _CACHED_ROUTES[user_id]
-    summary = get_current_plan_summary(refresh=refresh, db_connection_factory=db_connection_factory)
+    cache_key = (active_algorithm, user_id)
+    if not refresh and cache_key in _CACHED_ROUTES:
+        return _CACHED_ROUTES[cache_key]
+    summary = get_current_plan_summary(algorithm=active_algorithm, refresh=refresh, db_connection_factory=db_connection_factory)
     if summary is None:
-        _CACHED_ROUTES[user_id] = []
+        _CACHED_ROUTES[cache_key] = []
         return []
     conn = db_connection_factory()
     try:
@@ -480,11 +507,11 @@ def load_user_routes(user_id: int, *, refresh: bool = False, db_connection_facto
         )
         for row in rows
     ]
-    _CACHED_ROUTES[user_id] = routes
+    _CACHED_ROUTES[cache_key] = routes
     return routes
 
 
-def list_materialized_node_tables(*, db_connection_factory=_default_db_connection_factory) -> list[str]:
+def list_materialized_node_tables(*, algorithm: str | None = None, db_connection_factory=_default_db_connection_factory) -> list[str]:
     conn = db_connection_factory()
     try:
         with conn.cursor() as cur:
@@ -496,19 +523,20 @@ def list_materialized_node_tables(*, db_connection_factory=_default_db_connectio
                   AND tablename LIKE %s
                 ORDER BY tablename;
                 """,
-                [f"{VEDA_NODE_TABLE_PREFIX}%"],
+                [f"{get_node_table_prefix(algorithm)}%"],
             )
             return [str(row[0]) for row in cur.fetchall()]
     finally:
         conn.close()
 
 
-def list_materialized_partition_tables(*, db_connection_factory=_default_db_connection_factory) -> list[str]:
-    return list_materialized_node_tables(db_connection_factory=db_connection_factory)
+def list_materialized_partition_tables(*, algorithm: str | None = None, db_connection_factory=_default_db_connection_factory) -> list[str]:
+    return list_materialized_node_tables(algorithm=algorithm, db_connection_factory=db_connection_factory)
 
 
-def list_current_plan_partition_tables(*, db_connection_factory=_default_db_connection_factory) -> list[str]:
-    summary = get_current_plan_summary(db_connection_factory=db_connection_factory)
+def list_current_plan_partition_tables(*, algorithm: str | None = None, db_connection_factory=_default_db_connection_factory) -> list[str]:
+    active_algorithm = _configured_algorithm() if algorithm is None else normalize_algorithm(algorithm)
+    summary = get_current_plan_summary(algorithm=active_algorithm, db_connection_factory=db_connection_factory)
     if summary is None:
         return []
     conn = db_connection_factory()
@@ -602,8 +630,8 @@ def materialize_node(
         conn.close()
 
 
-def drop_stale_materialized_nodes(valid_table_names: set[str], *, db_connection_factory=_default_db_connection_factory) -> None:
-    existing = set(list_materialized_node_tables(db_connection_factory=db_connection_factory))
+def drop_stale_materialized_nodes(valid_table_names: set[str], *, algorithm: str | None = None, db_connection_factory=_default_db_connection_factory) -> None:
+    existing = set(list_materialized_node_tables(algorithm=algorithm, db_connection_factory=db_connection_factory))
     for table_name in sorted(existing - set(valid_table_names)):
         conn = db_connection_factory()
         try:
@@ -657,7 +685,7 @@ def materialize_plan(
         print(f"[veda][materialize] saving metadata for {len(plan.nodes)} nodes...", flush=True)
         save_plan(plan, db_connection_factory=db_connection_factory)
         valid_table_names = {str(node.table_name) for node in plan.nodes}
-        drop_stale_materialized_nodes(valid_table_names, db_connection_factory=db_connection_factory)
+        drop_stale_materialized_nodes(valid_table_names, algorithm=plan.algorithm, db_connection_factory=db_connection_factory)
         pattern_roles = _pattern_role_map(plan.patterns)
         iterator = tqdm(
             list(enumerate(plan.nodes, start=1)),
@@ -671,7 +699,7 @@ def materialize_plan(
             elapsed = time.time() - started_at
             print(f"[veda][materialize] [{index}/{len(plan.nodes)}] materialized {table_name} in {elapsed:.2f}s", flush=True)
         if create_indexes:
-            create_indexes_for_materialized_partitions(index_type=index_type, db_connection_factory=db_connection_factory)
+            create_indexes_for_materialized_partitions(index_type=index_type, algorithm=plan.algorithm, db_connection_factory=db_connection_factory)
         invalidate_cache()
         return plan
     finally:
@@ -779,12 +807,13 @@ def _create_index_for_node_timed(table_name: str, node_kind: str, index_type: st
 def create_indexes_for_materialized_partitions(
     index_type: str = "hnsw",
     *,
+    algorithm: str | None = None,
     parallel: bool = True,
     max_workers: Optional[int] = None,
     db_connection_factory=_default_db_connection_factory,
 ) -> None:
     maintenance_settings = get_maintenance_settings()
-    nodes = load_current_nodes(refresh=True, db_connection_factory=db_connection_factory)
+    nodes = load_current_nodes(algorithm=algorithm, refresh=True, db_connection_factory=db_connection_factory)
     if not nodes:
         print("Veda index build: no materialized nodes found. Skipping.", flush=True)
         return
@@ -814,13 +843,13 @@ def create_indexes_for_materialized_partitions(
         print(f"Veda index build: [{index}/{len(node_tasks)}] finished {table_name} in {elapsed:.2f}s", flush=True)
 
 
-def drop_indexes_for_materialized_partitions(*, db_connection_factory=_default_db_connection_factory) -> None:
+def drop_indexes_for_materialized_partitions(*, algorithm: str | None = None, db_connection_factory=_default_db_connection_factory) -> None:
     conn = db_connection_factory()
     try:
         with conn.cursor() as cur:
-            table_names = list_current_plan_partition_tables(db_connection_factory=db_connection_factory)
+            table_names = list_current_plan_partition_tables(algorithm=algorithm, db_connection_factory=db_connection_factory)
             if not table_names:
-                table_names = list_materialized_node_tables(db_connection_factory=db_connection_factory)
+                table_names = list_materialized_node_tables(algorithm=algorithm, db_connection_factory=db_connection_factory)
             for table_name in table_names:
                 cur.execute(
                     """

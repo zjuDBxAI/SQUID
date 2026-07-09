@@ -9,12 +9,15 @@ from psycopg2 import sql
 
 from services.config import get_db_connection
 
-from .common import TenantRoute
-from .storage import load_tenant_routes
+from .common import PATTERN_TABLE, TenantRoute
+from .cost_model import DEFAULT_COST_MODEL, required_base_ef_star
+from .storage import get_current_plan_summary, load_tenant_routes
 
 
-_HNSW_EF_SEARCH_MAX = 5000
-_SQUIDHNSW_LINEAR_SCAN_MAX_VECTORS = 3500
+_HNSW_EF_SEARCH_FALLBACK_MAX = int(DEFAULT_COST_MODEL.hnsw_max_ef_search)
+_FULL_TABLE_RECALL_EF_CAP: int | None = None
+_AVERAGE_GLOBAL_SELECTIVITY: float | None = None
+_SQUIDHNSW_LINEAR_SCAN_MAX_VECTORS = 0
 _SQUIDHNSW_INDEX_CACHE: dict[str, bool] = {}
 _SQUIDHNSW_GUC_SUPPORTED: bool | None = None
 
@@ -54,13 +57,85 @@ def _configured_index_type() -> str:
     return str(getattr(efconfig, "kmeans_index_type", "squidhnsw") or "squidhnsw").strip().lower()
 
 
+def _full_table_vector_count() -> int:
+    try:
+        plan_summary = get_current_plan_summary(refresh=False)
+        if plan_summary is not None:
+            metadata = dict(plan_summary.get("metadata", {}) or {})
+            return int(metadata.get("original_vector_count") or plan_summary.get("vector_count") or 0)
+    except Exception:
+        return 0
+    return 0
+
+
+def _full_table_recall_base_ef() -> int:
+    global _FULL_TABLE_RECALL_EF_CAP
+    if _FULL_TABLE_RECALL_EF_CAP is not None:
+        return int(_FULL_TABLE_RECALL_EF_CAP)
+    full_table_vectors = int(_full_table_vector_count())
+    if full_table_vectors > 0:
+        cap = int(math.ceil(required_base_ef_star(
+            partition_vectors=int(full_table_vectors),
+            topk=int(DEFAULT_COST_MODEL.topk),
+            model=DEFAULT_COST_MODEL,
+        )))
+    else:
+        cap = int(_HNSW_EF_SEARCH_FALLBACK_MAX)
+    _FULL_TABLE_RECALL_EF_CAP = max(1, int(cap))
+    return int(_FULL_TABLE_RECALL_EF_CAP)
+
+
+def _average_global_authorized_selectivity() -> float:
+    global _AVERAGE_GLOBAL_SELECTIVITY
+    if _AVERAGE_GLOBAL_SELECTIVITY is not None:
+        return float(_AVERAGE_GLOBAL_SELECTIVITY)
+    plan_summary = get_current_plan_summary(refresh=False)
+    full_table_vectors = int(_full_table_vector_count())
+    if plan_summary is None or full_table_vectors <= 0:
+        _AVERAGE_GLOBAL_SELECTIVITY = 1.0
+        return float(_AVERAGE_GLOBAL_SELECTIVITY)
+    tenant_count = max(1, int(plan_summary.get("tenant_count", 0) or 0))
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    """
+                    SELECT COALESCE(SUM(pattern_access.accessible_vectors), 0)::FLOAT8
+                    FROM (
+                        SELECT tenant_id, SUM(vector_count)::BIGINT AS accessible_vectors
+                        FROM (
+                            SELECT unnest(tenant_ids)::BIGINT AS tenant_id, vector_count
+                            FROM {}
+                            WHERE plan_id = %s
+                        ) expanded
+                        GROUP BY tenant_id
+                    ) pattern_access;
+                    """
+                ).format(sql.Identifier(PATTERN_TABLE)),
+                [int(plan_summary["plan_id"])],
+            )
+            total_accessible_vectors = float(cur.fetchone()[0] or 0.0)
+    finally:
+        conn.close()
+    average_accessible_vectors = float(total_accessible_vectors) / float(max(1, int(tenant_count)))
+    rho = float(average_accessible_vectors) / float(max(1, int(full_table_vectors)))
+    _AVERAGE_GLOBAL_SELECTIVITY = min(1.0, max(0.000001, float(rho)))
+    return float(_AVERAGE_GLOBAL_SELECTIVITY)
+
+
+def _full_table_recall_ef_cap() -> int:
+    rho = float(_average_global_authorized_selectivity())
+    return int(math.ceil(float(_full_table_recall_base_ef()) / float(rho)))
+
+
 def _clamp_ef(value: int, route: TenantRoute | None = None) -> int:
     ef = max(1, int(value))
     if route is not None:
         partition_vectors = int(getattr(route, "partition_vector_count", 0) or 0)
         if partition_vectors > 0:
             ef = min(ef, partition_vectors)
-    return min(ef, _HNSW_EF_SEARCH_MAX)
+    return int(ef)
 
 
 def _try_set(cur, statement: str) -> None:
@@ -141,7 +216,7 @@ def _global_bound(results, topk: int) -> float:
 
 
 def _base_ef(*, topk: int, ef_min: int) -> int:
-    return _clamp_ef(max(1, int(ef_min), int(topk)))
+    return _clamp_ef(max(1, int(ef_min)))
 
 
 def _allowed_pattern_ids(route: TenantRoute) -> set[int]:
@@ -506,15 +581,12 @@ def _search_squidhnsw_route(
         )
 
     base_ef = _base_ef(topk=int(topk), ef_min=int(ef_min))
-    max_ef = _clamp_ef(_HNSW_EF_SEARCH_MAX, route)
+    max_ef = _clamp_ef(_full_table_recall_ef_cap(), route)
     use_kernel_filter = _can_use_squidhnsw_filter(cur, route, base_ef=int(base_ef), max_ef=int(max_ef), topk=int(topk), global_bound=float(global_bound))
     if not use_kernel_filter:
-        return _search_linear_route(
-            cur,
-            route,
-            query_vector=query_vector,
-            topk=int(topk),
-            collect_sql_time=bool(collect_sql_time),
+        raise RuntimeError(
+            f"SQUIDHNSW search requires a valid squidhnsw index and GUC support for {route.table_name}; "
+            "linear fallback is disabled for KMeans SQUIDHNSW."
         )
 
     if collect_sql_time:

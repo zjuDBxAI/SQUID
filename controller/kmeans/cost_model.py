@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """KMeans/SQUID planner cost model.
 
-The planner uses the current SQUID latency formula with Veda paper coefficients. The ef term remains adaptive: first use the learned recall model to estimate the clean base ef required for target recall, then expand it by route selectivity as base_ef / rho.
+The planner uses the KMeans/SQUID latency formula with Veda paper coefficients. The ef term remains adaptive: first use the learned recall model to estimate the clean base ef required for target recall, then expand it by route selectivity as base_ef / rho.
 """
 
 from dataclasses import dataclass
@@ -286,14 +286,14 @@ def estimate_partition_query_cost(
 def cost_model_metadata(model: KMeansCostModel | None = None) -> dict[str, object]:
     active = model or DEFAULT_COST_MODEL
     return {
-        "cost_model": "current_formula_with_veda_coefficients: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
+        "cost_model": "kmeans_formula_with_veda_coefficients: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
         "adaptive_ef": True,
         "cost_unit": "milliseconds",
         "cost_a": float(active.cost_a),
         "cost_b_graph": float(active.cost_b_graph),
         "cost_d_filter": 0.0,
         "cost_c": float(active.cost_c),
-        "cost_compat_note": "estimate_partition_query_cost keeps the current SQUID formula but uses Veda Appendix B coefficients; pgvector_hnsw_cost_breakdown is kept only for debug compatibility",
+        "cost_compat_note": "estimate_partition_query_cost restores the KMeans/SQUID latency formula and uses Veda.pdf Appendix B coefficients",
         "hnsw_m": int(active.hnsw_m),
         "hnsw_scan_scaling_factor": float(active.hnsw_scan_scaling_factor),
         "pg_seq_page_cost": float(active.pg_seq_page_cost),

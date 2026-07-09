@@ -25,7 +25,7 @@ from controller.baseline.prefilter.initialize_partitions import initialize_user_
 
 def test_partition_prefilter_role(iterations=3, enable_index=False, index_type="ivfflat",
                              statistics_type="sql",
-                             generator_type="tree-based", record_recall=True, warm_up=True):
+                             generator_type="tree-based", record_recall=True, query_num=1000, warm_up=True):
     # drop_partition_tables()
 
     current_index_type = get_index_type("documentblocks_role_1")
@@ -59,7 +59,7 @@ def test_partition_prefilter_role(iterations=3, enable_index=False, index_type="
 
 
     # Generate queries
-    queries = prepare_query_dataset(regenerate=False, num_queries=1000)
+    queries = prepare_query_dataset(regenerate=False, num_queries=max(1, int(query_num)))
 
     run_test(queries, f"prefilter_partition_role", iterations=iterations,
              enable_index=enable_index,

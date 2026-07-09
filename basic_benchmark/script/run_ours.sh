@@ -7,21 +7,22 @@ cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 
-PRIVATE_REPLICATION_BUDGET_RATIO="${PRIVATE_REPLICATION_BUDGET_RATIO:-2.00}"
+PRIVATE_REPLICATION_BUDGET_RATIO="${PRIVATE_REPLICATION_BUDGET_RATIO:-2.0}"
 PRIVATE_EDGE_TOP_D="${PRIVATE_EDGE_TOP_D:-32}"
 ENABLE_SPLIT="${ENABLE_SPLIT:-false}"
 ENABLE_INDEX="${ENABLE_INDEX:-true}"
-INDEX_TYPE="${INDEX_TYPE:-hnsw}"
+INDEX_TYPE="${INDEX_TYPE:-squidhnsw}"
 STATISTICS_TYPE="${STATISTICS_TYPE:-sql}"
 QUERY_NUM="${QUERY_NUM:-200}"
 ITERATIONS="${ITERATIONS:-1}"
-RECORD_RECALL="${RECORD_RECALL:-true}"
+RECORD_RECALL="${RECORD_RECALL:-true}" 
 WARM_UP="${WARM_UP:-true}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-true}"
 USE_GROUND_TRUTH_CACHE="${USE_GROUND_TRUTH_CACHE:-true}"
 RESULT_TAG="${RESULT_TAG:-OURS}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/efs_logs}"
-EFS_LIST="${EFS_LIST:-25}"
+EFS_LIST="${EFS_LIST:-100}"
+# 3 5 10 12 15 18 20 25 28 30 33 35 38 40 45 50 53 55 60 65 70 75 80 85
 
 # This script only evaluates existing materialized kmeans partitions.
 # It intentionally passes --prepare false for every ef_search value.
@@ -40,7 +41,7 @@ for EFS in "${EFS_VALUES[@]}"; do
   echo "[log] ${LOG_FILE}"
 
  python test_kmeans_partition.py \
-    --prepare false \
+    --prepare true \
     --private-replication-budget-ratio "${PRIVATE_REPLICATION_BUDGET_RATIO}" \
     --private-edge-top-d "${PRIVATE_EDGE_TOP_D}" \
     --enable-split "${ENABLE_SPLIT}" \

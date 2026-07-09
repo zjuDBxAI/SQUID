@@ -102,6 +102,7 @@ class VedaPlanner:
         cost_b: float = DEFAULT_COST_B,
         cost_c: float = DEFAULT_COST_C,
         linear_scan_cost: float = 0.0005,
+        leftover_fixed_cost: float | None = None,
         max_veda_rounds: int = 8,
     ) -> None:
         self.indexing_threshold = max(1, int(indexing_threshold))
@@ -111,6 +112,7 @@ class VedaPlanner:
         self.cost_b = float(cost_b)
         self.cost_c = float(cost_c)
         self.linear_scan_cost = max(0.0, float(linear_scan_cost))
+        self.leftover_fixed_cost = max(0.0, float(self.cost_c if leftover_fixed_cost is None else leftover_fixed_cost))
         self.max_veda_rounds = max(1, int(max_veda_rounds))
 
         self.patterns: dict[int, VedaPattern] = {}
@@ -131,8 +133,10 @@ class VedaPlanner:
         self._role_bits: dict[int, int] = {}
         self._pattern_bits_size_cache: dict[int, int] = {}
         self._pattern_bits_roles_cache: dict[int, tuple[int, ...]] = {}
+        self._pattern_bits_role_bits_cache: dict[int, int] = {}
         self._milp_backend = None
         self._milp_backend_checked = False
+        self._active_algorithm = "effveda"
 
     def build_plan(
         self,
@@ -183,6 +187,7 @@ class VedaPlanner:
         self._node_cost_cache.clear()
         self._pattern_bits_size_cache.clear()
         self._pattern_bits_roles_cache.clear()
+        self._pattern_bits_role_bits_cache.clear()
         self._milp_backend = None
         self._milp_backend_checked = False
 
@@ -192,6 +197,7 @@ class VedaPlanner:
             for node_id, node in self.exclusive_lattice.items()
         }
         algorithm = normalize_algorithm(algorithm)
+        self._active_algorithm = str(algorithm)
         lattice = self._clone_lattice(self.exclusive_lattice)
 
         if algorithm == "veda":
@@ -201,7 +207,10 @@ class VedaPlanner:
 
         lattice, finalize_metadata = self._finalize_lattice(lattice)
         role_plans = self._build_role_query_plans(lattice, exact=True, final=True)
-        super_impure_metadata = {"enabled": False, "reason": "disabled_for_paper_semantics"}
+        if algorithm == "veda":
+            lattice, role_plans, super_impure_metadata = self._handle_super_impure_nodes(lattice, role_plans)
+        else:
+            super_impure_metadata = {"enabled": False, "reason": "effveda_planner_path"}
 
         nodes = self._materializable_nodes(lattice)
         node_id_map = {
@@ -223,6 +232,8 @@ class VedaPlanner:
             "cost_a": float(self.cost_a),
             "cost_b": float(self.cost_b),
             "cost_c": float(self.cost_c),
+            "linear_scan_cost": float(self.linear_scan_cost),
+            "leftover_fixed_cost": float(self.leftover_fixed_cost),
             "role_count": int(len(self.roles)),
             "pattern_count": int(len(patterns)),
             "node_count": int(len(nodes)),
@@ -326,6 +337,27 @@ class VedaPlanner:
         for role_id in role_ids:
             bits |= int(self._role_bits.get(int(role_id), 0))
         return int(bits)
+
+    def _role_bits_to_roles(self, bits: int) -> tuple[int, ...]:
+        bits = int(bits)
+        return tuple(role_id for role_id, role_bit in self._role_bits.items() if bits & int(role_bit))
+
+    def _roles_for_pattern_bits_bits(self, bits: int) -> int:
+        bits = int(bits)
+        cached = self._pattern_bits_role_bits_cache.get(bits)
+        if cached is not None:
+            return int(cached)
+        role_bits = 0
+        value = bits
+        while value:
+            low = value & -value
+            index = low.bit_length() - 1
+            pattern_id = self._bit_to_pattern.get(index)
+            if pattern_id is not None:
+                role_bits |= int(self._roles_to_bits(self._pattern_roles.get(int(pattern_id), frozenset())))
+            value ^= low
+        self._pattern_bits_role_bits_cache[bits] = int(role_bits)
+        return int(role_bits)
 
     def _node_role_bits(self, node: _LatticeNode) -> int:
         if int(node.role_bits) != 0 or not node.role_ids:
@@ -438,6 +470,11 @@ class VedaPlanner:
         self._authorized_size_cache[key] = int(total)
         return int(total)
 
+    def _leftover_cost_for_role(self, authorized_size: int, leftover_count: int = 1) -> float:
+        if int(authorized_size) <= 0:
+            return float("inf")
+        return float(max(1, int(leftover_count)) * self.leftover_fixed_cost + self.linear_scan_cost * int(authorized_size))
+
     def _node_cost_for_role(self, node: _LatticeNode, role_id: int, *, final: bool = False) -> float:
         role_id = int(role_id)
         key = (node.pattern_ids, role_id, bool(final))
@@ -448,8 +485,10 @@ class VedaPlanner:
         authorized_size = int(self._authorized_size(node, role_id))
         if authorized_size <= 0:
             return float("inf")
-        if final and node_size < self.indexing_threshold:
-            cost = float(self.linear_scan_cost * authorized_size)
+        if node_size < self.indexing_threshold:
+            authorized_bits = int(self._node_pattern_bits(node)) & int(self._role_authorized_bits.get(role_id, 0))
+            leftover_count = int(authorized_bits.bit_count()) if authorized_bits else 1
+            cost = self._leftover_cost_for_role(authorized_size, leftover_count)
             self._node_cost_cache[key] = cost
             return cost
         impurity = float(node_size) / float(max(1, authorized_size))
@@ -603,6 +642,7 @@ class VedaPlanner:
         seed: _RolePlanSeed,
         touched_patterns: Iterable[int],
         *,
+        owner_delta: Optional[dict[int, tuple[str | None, str | None]]] = None,
         exact: bool = False,
         final: bool = False,
         sort_output: bool = True,
@@ -624,7 +664,11 @@ class VedaPlanner:
             if bit == 0 or not (auth_bits & bit):
                 continue
 
-            base_single = self._single_owner_for_pattern(base_lattice, base_locations, pattern_id)
+            if owner_delta is not None and pattern_id in owner_delta:
+                base_single, candidate_single = owner_delta[pattern_id]
+            else:
+                base_single = self._single_owner_for_pattern(base_lattice, base_locations, pattern_id)
+                candidate_single = self._single_owner_for_pattern(candidate_lattice, locations, pattern_id)
             if base_single is None:
                 pending_bits &= ~bit
             else:
@@ -634,7 +678,6 @@ class VedaPlanner:
                 else:
                     selected_counts.pop(base_single, None)
 
-            candidate_single = self._single_owner_for_pattern(candidate_lattice, locations, pattern_id)
             if candidate_single is None:
                 pending_bits |= bit
             else:
@@ -798,6 +841,15 @@ class VedaPlanner:
             }
         else:
             affected = {int(role_id) for role_id in role_plan_index.get(str(ancestor_id), set())}
+
+        child = self.exclusive_lattice.get(str(child_id)) or lattice.get(str(child_id))
+        ancestor = lattice.get(str(ancestor_id))
+        if child is not None:
+            copied_bits = self._node_pattern_bits(child)
+            if ancestor is not None:
+                copied_bits &= ~self._node_pattern_bits(ancestor)
+            affected_bits = self._roles_to_bits(affected) | self._roles_for_pattern_bits_bits(copied_bits)
+            return self._role_bits_to_roles(affected_bits)
         return tuple(sorted(affected))
 
     def _merge_affected_roles(
@@ -818,7 +870,16 @@ class VedaPlanner:
             affected = set()
             affected.update(int(role_id) for role_id in role_plan_index.get(str(child_id), set()))
             affected.update(int(role_id) for role_id in role_plan_index.get(str(ancestor_id), set()))
-        return tuple(sorted(affected))
+
+        touched_bits = 0
+        child = lattice.get(str(child_id))
+        ancestor = lattice.get(str(ancestor_id))
+        if child is not None:
+            touched_bits |= self._node_pattern_bits(child)
+        if ancestor is not None:
+            touched_bits |= self._node_pattern_bits(ancestor)
+        affected_bits = self._roles_to_bits(affected) | self._roles_for_pattern_bits_bits(touched_bits)
+        return self._role_bits_to_roles(affected_bits)
 
     def _candidate_locations_overlay_for_patterns(
         self,
@@ -906,6 +967,8 @@ class VedaPlanner:
         touched_patterns: Optional[Iterable[int]] = None,
         collect_updates: bool = True,
         sort_plans: bool = True,
+        non_increasing: bool = False,
+        full_recompute: bool = False,
         timing: Optional[dict[str, dict[str, float | int]]] = None,
     ) -> tuple[float, dict[int, tuple[tuple[str, ...], float]]]:
         affected = tuple(dict.fromkeys(int(role_id) for role_id in affected_roles))
@@ -914,13 +977,30 @@ class VedaPlanner:
 
         updates: dict[int, tuple[tuple[str, ...], float]] = {}
         total_delta = 0.0
+        owner_delta = None
+        if (
+            not full_recompute
+            and role_plan_seed_cache is not None
+            and isinstance(locations, _LocationOverlay)
+        ):
+            owner_delta = {
+                int(pattern_id): (
+                    self._single_owner_for_pattern(lattice, locations.base, int(pattern_id)),
+                    self._single_owner_for_pattern(candidate_lattice, locations, int(pattern_id)),
+                )
+                for pattern_id in (locations.overrides.keys() if touched_patterns is None else touched_patterns)
+            }
         self._timing_count(timing, "role_delta_evaluations", len(affected))
         started = time.perf_counter()
         for role_id in affected:
             old_cost = role_costs.get(int(role_id))
             if old_cost is None:
                 old_cost = self._role_plan_cost(lattice, int(role_id), role_plans.get(int(role_id), tuple()))
-            if role_plan_seed_cache is not None and isinstance(locations, _LocationOverlay):
+            if (
+                not full_recompute
+                and role_plan_seed_cache is not None
+                and isinstance(locations, _LocationOverlay)
+            ):
                 seed = role_plan_seed_cache.get(int(role_id))
                 if seed is None:
                     seed = self._build_role_query_seed(lattice, int(role_id), locations.base)
@@ -931,12 +1011,17 @@ class VedaPlanner:
                     locations,
                     seed,
                     locations.overrides.keys() if touched_patterns is None else touched_patterns,
+                    owner_delta=owner_delta,
                     sort_output=sort_plans,
                 )
             else:
                 new_plan = self._build_role_query_plan(candidate_lattice, int(role_id), locations=locations, sort_output=sort_plans)
             new_cost = self._role_plan_cost(candidate_lattice, int(role_id), new_plan)
-            total_delta += float(old_cost) - float(new_cost)
+            if non_increasing and float(new_cost) > float(old_cost):
+                new_plan = tuple(role_plans.get(int(role_id), tuple()))
+                new_cost = float(old_cost)
+            scored_new_cost = float(new_cost)
+            total_delta += float(old_cost) - float(scored_new_cost)
             if collect_updates:
                 updates[int(role_id)] = (new_plan, float(new_cost))
         self._timing_add(timing, "candidate_plan_delta_seconds", time.perf_counter() - started)
@@ -1032,18 +1117,6 @@ class VedaPlanner:
         heapq.heapify(heap)
         return heap
 
-    def _rebuild_merge_heap(
-        self,
-        scores: dict[tuple[str, str], float],
-        versions: dict[tuple[str, str], int],
-    ) -> list[tuple[float, tuple[str, str], int]]:
-        heap = [
-            (-float(score), pair, int(versions.get(pair, 0)))
-            for pair, score in scores.items()
-        ]
-        heapq.heapify(heap)
-        return heap
-
     def _push_copy_score(
         self,
         heap: list[tuple[float, int, tuple[str, str], int]],
@@ -1056,18 +1129,6 @@ class VedaPlanner:
         versions[pair] = int(versions.get(pair, 0)) + 1
         scores[pair] = (float(score), int(delta))
         heapq.heappush(heap, (-float(score), int(delta), pair, versions[pair]))
-
-    def _push_merge_score(
-        self,
-        heap: list[tuple[float, tuple[str, str], int]],
-        scores: dict[tuple[str, str], float],
-        versions: dict[tuple[str, str], int],
-        pair: tuple[str, str],
-        score: float,
-    ) -> None:
-        versions[pair] = int(versions.get(pair, 0)) + 1
-        scores[pair] = float(score)
-        heapq.heappush(heap, (-float(score), pair, versions[pair]))
 
 
     def _score_veda_copy_pair(
@@ -1120,6 +1181,8 @@ class VedaPlanner:
             touched_patterns,
             collect_updates=collect_updates,
             sort_plans=collect_updates,
+            non_increasing=True,
+            full_recompute=True,
             timing=timing,
         )
         return float(avg_delta_cost / float(delta + 1)), int(delta), candidate_lattice, updates
@@ -1160,20 +1223,43 @@ class VedaPlanner:
             (child_id, ancestor_id),
             touched_patterns,
         )
-        avg_delta_cost, updates = self._candidate_plan_delta(
-            lattice,
-            candidate_lattice,
-            role_plans,
-            role_costs,
-            affected_roles,
-            candidate_locations,
-            role_plan_seed_cache,
-            touched_patterns,
-            collect_updates=collect_updates,
-            sort_plans=collect_updates,
-            timing=timing,
-        )
-        return float(avg_delta_cost), candidate_lattice, updates
+        # Algorithm 13 scores VEDA merge with the query-plan log benefit, not
+        # the final HNSW/leftover execution model. If both nodes are already in
+        # QP(r), the paper charges the direct replacement a+c; only the one-side
+        # case recomputes coverage.
+        affected = tuple(dict.fromkeys(int(role_id) for role_id in affected_roles))
+        updates: dict[int, tuple[tuple[str, ...], float]] = {}
+        total_delta = 0.0
+        self._timing_count(timing, "role_delta_evaluations", len(affected))
+        started = time.perf_counter()
+        for role_id in affected:
+            old_plan = tuple(role_plans.get(int(role_id), tuple()))
+            old_set = set(str(node_id) for node_id in old_plan)
+            has_ancestor = str(ancestor_id) in old_set
+            has_child = str(child_id) in old_set
+            if has_ancestor and has_child:
+                old_score = self._node_log_cost(lattice.get(str(ancestor_id))) + self._node_log_cost(lattice.get(str(child_id)))
+                new_score = self._node_log_cost(candidate_lattice.get(str(ancestor_id)))
+                new_plan = tuple(node_id for node_id in old_plan if str(node_id) != str(child_id))
+                self._timing_count(timing, "merge_both_in_qp_roles")
+            elif has_ancestor or has_child:
+                old_score = self._role_log_plan_cost(lattice, old_plan)
+                new_plan = self._build_role_query_plan(
+                    candidate_lattice,
+                    int(role_id),
+                    locations=candidate_locations,
+                    sort_output=collect_updates,
+                )
+                new_score = self._role_log_plan_cost(candidate_lattice, new_plan)
+                self._timing_count(timing, "merge_recomputed_qp_roles")
+            else:
+                continue
+            total_delta += float(old_score) - float(new_score)
+            if collect_updates:
+                new_cost = self._role_plan_cost(candidate_lattice, int(role_id), new_plan)
+                updates[int(role_id)] = (tuple(new_plan), float(new_cost))
+        self._timing_add(timing, "candidate_plan_delta_seconds", time.perf_counter() - started)
+        return float(total_delta / max(1, len(role_plans))), candidate_lattice, updates
 
     def _run_veda(self, lattice: dict[str, _LatticeNode], *, show_progress: bool) -> tuple[dict[str, _LatticeNode], dict[str, object]]:
         timing: dict[str, dict[str, float | int]] = {"seconds": {}, "counts": {}}
@@ -1263,17 +1349,17 @@ class VedaPlanner:
         locations = self._lattice_locations(lattice)
         role_plan_index = self._role_plan_node_index(role_plans)
         role_plan_seed_cache: dict[int, _RolePlanSeed] = {}
-        affected_roles_cache: dict[str, tuple[int, ...]] = {}
+        affected_roles_cache: dict[tuple[str, str], tuple[int, ...]] = {}
         dead_pairs: set[tuple[str, str]] = set()
         current_storage = int(sum(self._node_size(node) for node in lattice.values()))
 
-        def affected_roles_for_copy(ancestor_id: str) -> tuple[int, ...]:
-            ancestor_id = str(ancestor_id)
-            cached = affected_roles_cache.get(ancestor_id)
+        def affected_roles_for_copy(child_id: str, ancestor_id: str) -> tuple[int, ...]:
+            pair = (str(child_id), str(ancestor_id))
+            cached = affected_roles_cache.get(pair)
             if cached is not None:
                 return cached
-            result = self._copy_affected_roles(lattice, role_plans, ancestor_id, ancestor_id, role_plan_index)
-            affected_roles_cache[ancestor_id] = result
+            result = self._copy_affected_roles(lattice, role_plans, pair[0], pair[1], role_plan_index)
+            affected_roles_cache[pair] = result
             return result
 
         def refresh_scores(target_pairs: Iterable[tuple[str, str]] | None = None) -> None:
@@ -1317,7 +1403,7 @@ class VedaPlanner:
                         pair[1],
                         role_plan_index,
                         role_plan_seed_cache,
-                        affected_roles_for_copy(pair[1]),
+                        affected_roles_for_copy(pair[0], pair[1]),
                         collect_updates=False,
                         timing=timing,
                     )
@@ -1381,7 +1467,7 @@ class VedaPlanner:
             stop_refresh_done = False
             (child_id, ancestor_id), _score, _delta = selected
             pair = (str(child_id), str(ancestor_id))
-            rescored = self._score_veda_copy_pair(lattice, role_plans, role_costs, locations, child_id, ancestor_id, role_plan_index, role_plan_seed_cache, affected_roles_for_copy(ancestor_id), collect_updates=True, timing=timing)
+            rescored = self._score_veda_copy_pair(lattice, role_plans, role_costs, locations, child_id, ancestor_id, role_plan_index, role_plan_seed_cache, affected_roles_for_copy(child_id, ancestor_id), collect_updates=True, timing=timing)
             if rescored is None:
                 dead_pairs.add(pair)
                 scores.pop(pair, None)
@@ -1437,6 +1523,16 @@ class VedaPlanner:
             affected_roles_cache[pair] = result
             return result
 
+        def push_score(pair: tuple[str, str], score: float) -> None:
+            versions[pair] = int(versions.get(pair, 0)) + 1
+            scores[pair] = float(score)
+            heapq.heappush(heap, (-float(score), pair, versions[pair]))
+
+        def rebuild_heap() -> list[tuple[float, tuple[str, str], int]]:
+            rebuilt = [(-float(score), pair, int(versions.get(pair, 0))) for pair, score in scores.items()]
+            heapq.heapify(rebuilt)
+            return rebuilt
+
         def refresh_scores(target_pairs: Iterable[tuple[str, str]] | None = None) -> None:
             started = time.perf_counter()
             full_refresh = target_pairs is None
@@ -1473,7 +1569,11 @@ class VedaPlanner:
                         self._timing_count(timing, "merge_unscorable_pairs")
                         continue
                     score, _candidate_lattice, _updates = scored
-                    self._push_merge_score(heap, scores, versions, pair, float(score))
+                    push_score(pair, float(score))
+                    if float(score) > 0.0:
+                        self._timing_count(timing, "merge_positive_pairs")
+                    else:
+                        self._timing_count(timing, "merge_nonpositive_pairs")
                     self._timing_count(timing, "merge_scored_pairs")
             finally:
                 if progress is not None:
@@ -1498,7 +1598,7 @@ class VedaPlanner:
         while True:
             selected = None
             if len(heap) > max(4096, len(scores) * 4):
-                heap = self._rebuild_merge_heap(scores, versions)
+                heap = rebuild_heap()
             while heap:
                 neg_score, pair, version = heapq.heappop(heap)
                 current = scores.get(pair)
@@ -1526,16 +1626,30 @@ class VedaPlanner:
             stop_refresh_done = False
             (child_id, ancestor_id), _score = selected
             pair = (str(child_id), str(ancestor_id))
-            rescored = self._score_veda_merge_pair(lattice, role_plans, role_costs, locations, child_id, ancestor_id, role_plan_index, role_plan_seed_cache, affected_roles_for_merge(child_id, ancestor_id), collect_updates=True, timing=timing)
+            rescored = self._score_veda_merge_pair(
+                lattice,
+                role_plans,
+                role_costs,
+                locations,
+                child_id,
+                ancestor_id,
+                role_plan_index,
+                role_plan_seed_cache,
+                affected_roles_for_merge(child_id, ancestor_id),
+                collect_updates=True,
+                timing=timing,
+            )
             if rescored is None:
                 scores.pop(pair, None)
                 versions[pair] = int(versions.get(pair, 0)) + 1
                 continue
             current_score, candidate_lattice, updates = rescored
             if float(current_score) != float(_score):
-                self._push_merge_score(heap, scores, versions, pair, float(current_score))
+                push_score(pair, float(current_score))
                 continue
-            if current_score <= 0.0:
+            if float(current_score) <= 0.0:
+                scores.pop(pair, None)
+                versions[pair] = int(versions.get(pair, 0)) + 1
                 continue
 
             old_child = lattice.get(str(child_id))
@@ -1547,6 +1661,7 @@ class VedaPlanner:
             self._replace_locations_for_nodes(locations, (old_child, old_ancestor), (new_ancestor,))
             self._apply_role_plan_updates(role_plans, role_costs, updates, role_plan_index)
             applied += 1
+            self._timing_count(timing, "merge_applied")
             stop_refresh_done = False
             role_plan_seed_cache.clear()
             affected_roles_cache.clear()
@@ -1694,12 +1809,34 @@ class VedaPlanner:
         node_order = sorted(lattice, key=lambda node_id: self._node_size(lattice[node_id]), reverse=True)
         applied = 0
         index = 0
+        deferred_unindexable: set[str] = set()
         iterator_total = len(node_order)
         progress = tqdm(total=iterator_total, desc="EffVeda merge nodes", unit="node", disable=not show_progress)
+
+        def requeue_deferred(*, exclude: set[str] | None = None) -> None:
+            if not deferred_unindexable:
+                return
+            excluded = exclude or set()
+            requeued = 0
+            for deferred_id in sorted(deferred_unindexable):
+                if deferred_id in excluded:
+                    continue
+                if deferred_id in lattice and self._node_size(lattice[deferred_id]) < self.indexing_threshold:
+                    node_order.append(deferred_id)
+                    requeued += 1
+            deferred_unindexable.clear()
+            if requeued > 0:
+                try:
+                    progress.total = (progress.total or 0) + requeued
+                    progress.refresh()
+                except Exception:
+                    pass
+
         try:
             while index < len(node_order):
                 node_id = node_order[index]
                 if node_id not in lattice or self._node_size(lattice[node_id]) >= self.indexing_threshold:
+                    deferred_unindexable.discard(str(node_id))
                     index += 1
                     progress.update(1)
                     continue
@@ -1722,10 +1859,17 @@ class VedaPlanner:
                     del lattice[candidate_id]
                     applied += 1
                     merged_this_node = True
+                    deferred_unindexable.discard(str(node_id))
+                    deferred_unindexable.discard(str(candidate_id))
+                    requeue_deferred(exclude={str(node_id), str(candidate_id)})
                     if self._node_size(lattice[node_id]) >= self.indexing_threshold:
                         break
-                if node_id in lattice and self._node_size(lattice[node_id]) < self.indexing_threshold and merged_this_node:
-                    continue
+                if node_id in lattice and self._node_size(lattice[node_id]) < self.indexing_threshold:
+                    if merged_this_node:
+                        continue
+                    deferred_unindexable.add(str(node_id))
+                else:
+                    deferred_unindexable.discard(str(node_id))
                 index += 1
                 progress.update(1)
         finally:
@@ -1757,9 +1901,7 @@ class VedaPlanner:
             if candidate.node_id == node.node_id:
                 continue
             candidate_roles = set(candidate.role_ids)
-            if node_roles < candidate_roles or candidate_roles < node_roles:
-                candidates.append(candidate)
-            elif len(node_roles) == len(candidate_roles) and node_roles & candidate_roles:
+            if node_roles & candidate_roles:
                 candidates.append(candidate)
         candidates.sort(key=lambda item: (self._node_size(item), len(item.role_ids)), reverse=True)
         return candidates
@@ -1819,32 +1961,19 @@ class VedaPlanner:
 
     def _finalize_lattice(self, lattice: dict[str, _LatticeNode]) -> tuple[dict[str, _LatticeNode], dict[str, object]]:
         finalized: dict[str, _LatticeNode] = {}
-        leftover_by_pattern: dict[int, str] = {}
-        split_count = 0
-        deduplicated_leftovers = 0
+        indexable_count = 0
+        leftover_count = 0
         for node in lattice.values():
+            finalized[node.node_id] = node
             if self._node_size(node) >= self.indexing_threshold:
-                finalized[node.node_id] = node
-                continue
-            for pattern_id in sorted(node.pattern_ids):
-                pattern_id = int(pattern_id)
-                if pattern_id in leftover_by_pattern:
-                    deduplicated_leftovers += 1
-                    continue
-                pattern = self.patterns[pattern_id]
-                node_id = self._new_node_id("leftover", pattern.role_ids, suffix=str(pattern_id))
-                finalized[node_id] = self._make_lattice_node(
-                    node_id=node_id,
-                    role_ids=pattern.role_ids,
-                    pattern_ids=pattern_id,
-                    virtual_components=(role_key(pattern.role_ids),),
-                )
-                leftover_by_pattern[pattern_id] = node_id
-                split_count += 1
+                indexable_count += 1
+            else:
+                leftover_count += 1
         return finalized, {
-            "split_small_nodes_into_leftovers": True,
-            "small_group_split_count": int(split_count),
-            "deduplicated_leftover_count": int(deduplicated_leftovers),
+            "split_small_nodes_into_leftovers": False,
+            "small_nodes_kept_as_leftovers": int(leftover_count),
+            "indexable_nodes_kept": int(indexable_count),
+            "paper_semantics": "small lattice nodes are kept as leftover vectors without per-pattern splitting",
         }
 
     def _standalone_node_for_pattern(self, lattice: dict[str, _LatticeNode], pattern_id: int) -> str | None:
@@ -2045,7 +2174,12 @@ class VedaPlanner:
             shape=(len(pending_list), len(candidate_node_ids)),
         )
         costs = np.array(
-            [self._node_log_cost(lattice[node_id]) for node_id in candidate_node_ids],
+            [
+                self._node_cost_for_role(lattice[node_id], int(role_id), final=final)
+                if final
+                else self._node_log_cost(lattice[node_id])
+                for node_id in candidate_node_ids
+            ],
             dtype=float,
         )
         constraints = LinearConstraint(matrix.tocsr(), np.ones(len(pending_list)), np.full(len(pending_list), np.inf))
@@ -2079,6 +2213,7 @@ class VedaPlanner:
         final: bool = False,
     ) -> None:
         pending = int(pending_bits)
+        node_info_cache: dict[str, tuple[int, int, float, float]] = {}
         while pending:
             best_node_id = None
             best_rank = None
@@ -2094,17 +2229,26 @@ class VedaPlanner:
                         if node_id in seen_nodes:
                             continue
                         seen_nodes.add(node_id)
-                        node = lattice.get(node_id)
-                        if node is None:
-                            continue
-                        covered_bits = self._node_pattern_bits(node) & pending
+                        cached_info = node_info_cache.get(node_id)
+                        if cached_info is None:
+                            node = lattice.get(node_id)
+                            if node is None:
+                                continue
+                            node_bits = self._node_pattern_bits(node)
+                            node_size = self._node_size(node)
+                            node_log_cost = self._node_log_cost(node)
+                            node_final_cost = self._node_cost_for_role(node, int(role_id), final=final) if final else float(node_log_cost)
+                            cached_info = (int(node_bits), int(node_size), float(node_log_cost), float(node_final_cost))
+                            node_info_cache[node_id] = cached_info
+                        node_bits, node_size, node_log_cost, node_final_cost = cached_info
+                        covered_bits = int(node_bits) & pending
                         cover_count = int(covered_bits.bit_count())
                         if cover_count <= 0:
                             continue
                         rank = (
                             -cover_count,
-                            self._node_log_cost(node),
-                            self._node_size(node),
+                            float(node_final_cost),
+                            int(node_size),
                             node_id,
                         )
                         if best_rank is None or rank < best_rank:
@@ -2114,10 +2258,16 @@ class VedaPlanner:
             if best_node_id is None:
                 break
             selected.add(best_node_id)
-            node = lattice.get(best_node_id)
-            if node is None:
-                break
-            pending &= ~self._node_pattern_bits(node)
+            cached_info = node_info_cache.get(best_node_id)
+            if cached_info is None:
+                node = lattice.get(best_node_id)
+                if node is None:
+                    break
+                node_log_cost = self._node_log_cost(node)
+                node_final_cost = self._node_cost_for_role(node, int(role_id), final=final) if final else float(node_log_cost)
+                cached_info = (self._node_pattern_bits(node), self._node_size(node), float(node_log_cost), float(node_final_cost))
+                node_info_cache[best_node_id] = cached_info
+            pending &= ~int(cached_info[0])
 
     def _greedy_extend_coverage(
         self,
@@ -2202,7 +2352,7 @@ class VedaPlanner:
                     document_pattern_pairs=tuple(sorted(document_pattern_pairs)),
                     vector_count=int(vector_count),
                     node_kind=node_kind,
-                    table_name=get_node_table_name(stable_node_id),
+                    table_name=get_node_table_name(stable_node_id, algorithm=self._active_algorithm),
                     metadata={
                         "source_node_id": node.node_id,
                         "virtual_components": list(node.virtual_components),

@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 import os
+import random
 
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,6 +76,8 @@ def check_duplicate_roles(functional_roles_permissions):
 
 
 def main(num_documents):
+    random.seed(155)
+
     conn = get_db_connection()
     cur = conn.cursor()
 
