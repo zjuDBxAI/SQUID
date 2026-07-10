@@ -22,7 +22,7 @@ from basic_benchmark.common_function import get_index_type, prepare_query_datase
 from services.config import get_db_connection
 
 
-def test_dynamic_partition_search(iterations=1, enable_index=True, index_type="ivfflat", statistics_type="sql",
+def test_dynamic_partition_search(iterations=1, enable_index=True, index_type="hnsw", statistics_type="sql",
                                   generator_type="tree-based", record_recall=True, query_num=1000, warm_up=True):
     """
     Test search across partitions with optional index creation and verification.

@@ -449,6 +449,23 @@ SquidClampEf(int value)
 	return value;
 }
 
+static int
+VedaClampEf(int value)
+{
+	int			maxEf = vedahnsw_max_ef;
+
+	if (maxEf < HNSW_MIN_EF_SEARCH)
+		maxEf = HNSW_MAX_EF_SEARCH;
+	if (maxEf > HNSW_MAX_EF_SEARCH)
+		maxEf = HNSW_MAX_EF_SEARCH;
+
+	if (value < HNSW_MIN_EF_SEARCH)
+		value = HNSW_MIN_EF_SEARCH;
+	if (value > maxEf)
+		value = maxEf;
+	return value;
+}
+
 
 static double
 VedaLocalBound(List *w, int topK)
@@ -482,7 +499,7 @@ VedaExpandedEf(int baseEf)
 		selectivity = 1;
 
 	expandedEf = (int) ceil((double) baseEf / selectivity);
-	return SquidClampEf(Max(baseEf, expandedEf));
+	return VedaClampEf(Max(baseEf, expandedEf));
 }
 
 static List *
@@ -934,7 +951,7 @@ vedahnswgettuple(IndexScanDesc scan, ScanDirection dir)
 			elog(ERROR, "non-MVCC snapshots are not supported with vedahnsw");
 
 		value = GetScanValue(scan);
-		baseEf = SquidClampEf(Max(vedahnsw_base_ef, 1));
+		baseEf = VedaClampEf(Max(vedahnsw_base_ef, 1));
 
 		VedaInitFilter(scan);
 

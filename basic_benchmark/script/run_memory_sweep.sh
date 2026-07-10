@@ -25,7 +25,6 @@ VEDA_SEARCH_EF="${VEDA_SEARCH_EF:-${SEARCH_EF}}"
 EFFVEDA_SEARCH_EF="${EFFVEDA_SEARCH_EF:-${SEARCH_EF}}"
 HONEYBEE_SEARCH_EF="${HONEYBEE_SEARCH_EF:-${SEARCH_EF}}"
 OURS_SEARCH_EF="${OURS_SEARCH_EF:-${SEARCH_EF}}"
-OURS_PLAN_EF="${OURS_PLAN_EF:-20}"
 
 QUERY_NUM="${QUERY_NUM:-200}"
 ITERATIONS="${ITERATIONS:-1}"
@@ -43,6 +42,19 @@ PREPARE_PARTITIONS="${PREPARE_PARTITIONS:-true}"
 PREPARE_METHODS="${PREPARE_METHODS:-}"
 PREPARE_MEMORY_VALUES="${PREPARE_MEMORY_VALUES:-}"
 
+# ROLE and HQI are fixed-layout baselines. Build each once before the
+# memory-specific plans. ROLE must exist before AnonySys prepares its plan.
+PREPARE_FIXED_BASELINES="${PREPARE_FIXED_BASELINES:-${PREPARE_PARTITIONS}}"
+PREPARE_ROLE_TABLES="${PREPARE_ROLE_TABLES:-true}"
+PREPARE_HQI_TABLES="${PREPARE_HQI_TABLES:-true}"
+# Abort an individual layout build instead of continuing with incomplete tables.
+PLANNER_TIMEOUT="${PLANNER_TIMEOUT:-3h}"
+ROLE_INDEX_TYPE="${ROLE_INDEX_TYPE:-hnsw}"
+ROLE_MAX_WORKERS="${ROLE_MAX_WORKERS:-4}"
+HQI_INDEX_TYPE="${HQI_INDEX_TYPE:-hnsw}"
+HQI_MIN_SIZE="${HQI_MIN_SIZE:-10000}"
+HQI_WORKERS="${HQI_WORKERS:-8}"
+
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/efs_logs/memory_sweep}"
 BUILD_LOG_DIR="${BUILD_LOG_DIR:-${LOG_DIR}/_build_logs}"
 
@@ -55,6 +67,7 @@ VEDA_HNSW_ITERATIVE_SCAN="${VEDA_HNSW_ITERATIVE_SCAN:-off}"
 VEDA_HNSW_MAX_SCAN_TUPLES="${VEDA_HNSW_MAX_SCAN_TUPLES:-}"
 
 HONEYBEE_RECALL="${HONEYBEE_RECALL:-0.99}"
+OURS_RECALL="${OURS_RECALL:-0.99}"
 HONEYBEE_INDEX_TYPE="${HONEYBEE_INDEX_TYPE:-hnsw}"
 
 OURS_INDEX_TYPE="${OURS_INDEX_TYPE:-squidhnsw}"
@@ -161,6 +174,30 @@ run_logged() {
   echo "[DONE] ${label}"
 }
 
+run_planner_logged() {
+  local label="$1"
+  local log_file="$2"
+  shift 2
+  mkdir -p "$(dirname "${log_file}")"
+  echo "========================================"
+  echo "[PLAN] ${label}"
+  echo "[TIMEOUT] ${PLANNER_TIMEOUT}"
+  echo "[LOG] ${log_file}"
+  printf "[CMD]"
+  printf " %q" "$@"
+  printf "\n"
+  if timeout --foreground "${PLANNER_TIMEOUT}" "$@" > "${log_file}" 2>&1; then
+    echo "[DONE] ${label}"
+    return 0
+  else
+    local status=$?
+    if [[ ${status} -eq 124 ]]; then
+      echo "[TIMEOUT] ${label} exceeded ${PLANNER_TIMEOUT}; stopping sweep." >&2
+    fi
+    return "${status}"
+  fi
+}
+
 prepare_veda_like() {
   local algorithm="$1"
   local memory="$2"
@@ -193,7 +230,7 @@ prepare_veda_like() {
     cmd+=(--hnsw-max-scan-tuples "${VEDA_HNSW_MAX_SCAN_TUPLES}")
   fi
   append_optional_common_args cmd
-  run_logged "${algorithm} prepare memory=${memory} plan_ef=${VEDA_PLAN_EF}" "${log_file}" "${cmd[@]}"
+  run_planner_logged "${algorithm} prepare memory=${memory} plan_ef=${VEDA_PLAN_EF}" "${log_file}" "${cmd[@]}"
 }
 
 measure_veda_like() {
@@ -245,7 +282,33 @@ prepare_honeybee() {
     --storage "${memory}"
     --recall "${HONEYBEE_RECALL}"
   )
-  run_logged "AnonySys prepare memory=${memory} recall=${HONEYBEE_RECALL}" "${log_file}" "${cmd[@]}"
+  run_planner_logged "AnonySys prepare memory=${memory} recall=${HONEYBEE_RECALL}" "${log_file}" "${cmd[@]}"
+}
+
+prepare_role() {
+  local log_file="${BUILD_LOG_DIR}/ROLE_prepare_$(date +%Y%m%d_%H%M%S).txt"
+  local cmd=(
+    "${PYTHON_BIN}" initialize_role_partition_tables.py
+    --index_type "${ROLE_INDEX_TYPE}"
+    --max-workers "${ROLE_MAX_WORKERS}"
+  )
+  run_planner_logged "ROLE prepare index_type=${ROLE_INDEX_TYPE}" "${log_file}" "${cmd[@]}"
+}
+
+prepare_hqi() {
+  local build_log_file="${BUILD_LOG_DIR}/HQI_tree_prepare_$(date +%Y%m%d_%H%M%S).txt"
+  local persist_log_file="${BUILD_LOG_DIR}/HQI_partitions_prepare_$(date +%Y%m%d_%H%M%S).txt"
+  local build_cmd=(
+    "${PYTHON_BIN}" "${PROJECT_ROOT}/controller/baseline/HQI/build_tree.py"
+    --min-size "${HQI_MIN_SIZE}"
+  )
+  local persist_cmd=(
+    "${PYTHON_BIN}" "${PROJECT_ROOT}/controller/baseline/HQI/persist_tree.py"
+    --index-type "${HQI_INDEX_TYPE}"
+    --workers "${HQI_WORKERS}"
+  )
+  run_planner_logged "HQI build tree min_size=${HQI_MIN_SIZE}" "${build_log_file}" "${build_cmd[@]}"
+  run_planner_logged "HQI persist partitions index_type=${HQI_INDEX_TYPE}" "${persist_log_file}" "${persist_cmd[@]}"
 }
 
 measure_honeybee() {
@@ -277,6 +340,7 @@ prepare_ours() {
   local log_file="${BUILD_LOG_DIR}/OURS_mem${mem_label}_prepare_$(date +%Y%m%d_%H%M%S).txt"
   local result_tag="memory_OURS_mem${mem_label}_prepare"
   local cmd=(
+    env "KMEANS_TARGET_RECALL=${OURS_RECALL}"
     "${PYTHON_BIN}" test_kmeans_partition.py
     --prepare true
     --private-replication-budget-ratio "${ratio}"
@@ -289,13 +353,12 @@ prepare_ours() {
     --iterations "${ITERATIONS}"
     --record-recall "${RECORD_RECALL}"
     --warm-up "${WARM_UP}"
-    --ef-search "${OURS_PLAN_EF}"
     --show-progress "${SHOW_PROGRESS}"
     --use-ground-truth-cache "${USE_GROUND_TRUTH_CACHE}"
     --result-tag "${result_tag}"
   )
   append_optional_common_args cmd
-  run_logged "OURS prepare memory=${memory} ratio=${ratio} plan_ef=${OURS_PLAN_EF}" "${log_file}" "${cmd[@]}"
+  run_planner_logged "OURS prepare memory=${memory} ratio=${ratio} cost_ef=recall-model target_recall=${OURS_RECALL}" "${log_file}" "${cmd[@]}"
 }
 
 measure_ours() {
@@ -307,6 +370,7 @@ measure_ours() {
   local result_tag="memory_OURS_mem${mem_label}_ef${OURS_SEARCH_EF}"
   local log_file="${method_dir}/OURS_mem${mem_label}_ef${OURS_SEARCH_EF}_$(date +%Y%m%d_%H%M%S).log"
   local cmd=(
+    env "KMEANS_TARGET_RECALL=${OURS_RECALL}"
     "${PYTHON_BIN}" test_kmeans_partition.py
     --prepare false
     --private-replication-budget-ratio "${ratio}"
@@ -327,6 +391,23 @@ measure_ours() {
   append_optional_common_args cmd
   run_logged "OURS measure memory=${memory} ratio=${ratio} search_ef=${OURS_SEARCH_EF}" "${log_file}" "${cmd[@]}"
 }
+
+# Fixed baselines are deliberately materialized before the memory sweep. In
+# particular, AnonySys calls into the ROLE tables during its preparation.
+if bool_true "${PREPARE_FIXED_BASELINES}"; then
+  if bool_true "${PREPARE_ROLE_TABLES}"; then
+    prepare_role
+  else
+    echo "[SKIP] ROLE fixed-table preparation"
+  fi
+  if bool_true "${PREPARE_HQI_TABLES}"; then
+    prepare_hqi
+  else
+    echo "[SKIP] HQI fixed-table preparation"
+  fi
+else
+  echo "[SKIP] fixed baseline preparation"
+fi
 
 for memory in "${MEMORY_LIST[@]}"; do
   mem_label="$(memory_label "${memory}")"

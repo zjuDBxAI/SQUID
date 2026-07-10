@@ -28,4 +28,4 @@ run_step "Generate benchmark queries"   "${PYTHON_BIN}" basic_benchmark/generate
 
 run_step "Compute ground truth"   "${PYTHON_BIN}" basic_benchmark/compute_ground_truth.py
 
-run_step "Build AnonySys dynamic partition"   "${PYTHON_BIN}" controller/dynamic_partition/hnsw/AnonySys_dynamic_partition.py --storage 2.0 --recall 0.99
+run_step "Build AnonySys dynamic partition"   "${PYTHON_BIN}" controller/dynamic_partition/hnsw/AnonySys_dynamic_partition.py --storage 1.0 --recall 0.99

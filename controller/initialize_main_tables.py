@@ -1,3 +1,5 @@
+import argparse
+
 import psycopg2
 from psycopg2 import sql
 import sys
@@ -79,7 +81,7 @@ def initialize_database_deduplication(enable_index=False, vector_dimension=300):
         create_indexes()
 
 
-def create_indexes(index_type="ivfflat", hnsw_m=16, hnsw_ef_construction=64,
+def create_indexes(index_type="hnsw", hnsw_m=16, hnsw_ef_construction=64,
                    hnsw_threads=None, disable_sync_commit=True):
     maintenance_settings = get_maintenance_settings()
     maintenance_work_mem_gb = maintenance_settings["maintenance_work_mem_gb"]
@@ -208,5 +210,18 @@ def drop_indexes():
 
 
 if __name__ == '__main__':
-    #drop_indexes()
-    create_indexes()
+    parser = argparse.ArgumentParser(description="Create main indexes and initialize RLS by default.")
+    parser.add_argument("--index-type", choices=["hnsw", "ivfflat"], default="hnsw")
+    parser.add_argument("--no-rls", action="store_true", help="Create indexes without user roles or RLS policy.")
+    args = parser.parse_args()
+
+    create_indexes(index_type=args.index_type)
+    if not args.no_rls:
+        from controller.baseline.pg_row_security.row_level_security import (
+            create_database_users,
+            enable_row_level_security,
+        )
+
+        user_count = create_database_users()
+        enable_row_level_security()
+        print(f"RLS initialized for {user_count} database users.")

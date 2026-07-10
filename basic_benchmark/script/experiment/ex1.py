@@ -232,7 +232,13 @@ def _sample_at_anchors(points: list[Point], anchors: tuple[float, ...]) -> list[
     return sorted(selected, key=lambda item: (item.recall, item.query_time_ms, item.ef_search))
 
 
-def load_points(log_dir: Path, *, min_recall: float, anchors: tuple[float, ...]) -> dict[str, list[CurvePoint]]:
+def load_points(
+    log_dir: Path,
+    *,
+    min_recall: float,
+    anchors: tuple[float, ...],
+    keep_raw_points: bool = False,
+) -> dict[str, list[CurvePoint]]:
     latest_by_method_ef: dict[tuple[str, int], Point] = {}
     for path in sorted(log_dir.rglob("*.log")):
         point = _parse_log(path)
@@ -249,6 +255,14 @@ def load_points(log_dir: Path, *, min_recall: float, anchors: tuple[float, ...])
 
     sampled: dict[str, list[CurvePoint]] = {}
     for method, points in raw_grouped.items():
+        if keep_raw_points:
+            sampled[method] = [
+                _as_curve_point(point)
+                for point in _dedupe_and_sort(
+                    [point for point in points if point.recall >= min_recall]
+                )
+            ]
+            continue
         frontier = _monotone_frontier(points, min_recall=min_recall)
         sampled[method] = _sample_at_anchors(frontier, anchors)
     return {method: sampled.get(method, []) for method in _method_order(set(sampled))}
@@ -371,13 +385,19 @@ def main() -> None:
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Output image path.")
     parser.add_argument("--min-recall", type=float, default=DEFAULT_MIN_RECALL, help="Drop points below this recall.")
     parser.add_argument("--anchors", type=_parse_anchors, default=DEFAULT_RECALL_ANCHORS, help="Comma-separated recall anchors for aligned interpolation.")
+    parser.add_argument("--keep-raw-points", action="store_true", help="Plot every valid raw EF point instead of the sampled Pareto frontier.")
     parser.add_argument("--annotate-ef", action="store_true", help="Annotate each point with its ef_search value or interpolation bracket.")
     args = parser.parse_args()
 
     log_dir = Path(args.log_dir).resolve()
     output = Path(args.output).resolve()
     anchors = tuple(anchor for anchor in tuple(args.anchors) if anchor >= float(args.min_recall))
-    points_by_method = load_points(log_dir, min_recall=float(args.min_recall), anchors=anchors)
+    points_by_method = load_points(
+        log_dir,
+        min_recall=float(args.min_recall),
+        anchors=anchors,
+        keep_raw_points=bool(args.keep_raw_points),
+    )
     plot(points_by_method, output, annotate_ef=bool(args.annotate_ef), min_recall=float(args.min_recall), anchors=anchors)
     csv_path = write_csv(points_by_method, output)
 

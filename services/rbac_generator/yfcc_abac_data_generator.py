@@ -19,6 +19,22 @@ DEFAULT_YFCC_METADATA_PATH = (
     "yfcc_subsampled_nvec_1000000_nlabel_1000_mds.pkl"
 )
 
+# Xu-Stoller-style synthetic ABAC workload defaults used by the YFCC
+# materialization script. The mapping is:
+# |U| -> num_users, Nrule -> num_rules, c -> conjunct_count,
+# sbar -> target_avg_sharing_degree, p_o -> overlap_probability,
+# N_urp -> min_user_resource_pairs, N_cand -> candidate_pool_size.
+XU_STOLLER_STYLE_DEFAULTS = {
+    "num_users": 1000,
+    "num_rules": 50,
+    "rules_per_user": 2,
+    "conjunct_count": 2,
+    "target_avg_sharing_degree": 13.37,
+    "overlap_probability": 0.5,
+    "min_user_resource_pairs": 16,
+    "candidate_pool_size": 256,
+}
+
 
 @dataclass(slots=True)
 class Role:
@@ -99,14 +115,14 @@ class YFCCABACDataGenerator:
         *,
         document_ids: Iterable[int],
         document_labels: Iterable[Iterable[int]],
-        num_users: int = 1000,
-        num_rules: int = 80,
-        rules_per_user: int = 2,
-        conjunct_count: int = 2,
-        target_avg_sharing_degree: float = 25.0,
-        overlap_probability: float = 0.35,
-        min_user_resource_pairs: int = 64,
-        candidate_pool_size: int = 512,
+        num_users: int = XU_STOLLER_STYLE_DEFAULTS["num_users"],
+        num_rules: int = XU_STOLLER_STYLE_DEFAULTS["num_rules"],
+        rules_per_user: int = XU_STOLLER_STYLE_DEFAULTS["rules_per_user"],
+        conjunct_count: int = XU_STOLLER_STYLE_DEFAULTS["conjunct_count"],
+        target_avg_sharing_degree: float = XU_STOLLER_STYLE_DEFAULTS["target_avg_sharing_degree"],
+        overlap_probability: float = XU_STOLLER_STYLE_DEFAULTS["overlap_probability"],
+        min_user_resource_pairs: int = XU_STOLLER_STYLE_DEFAULTS["min_user_resource_pairs"],
+        candidate_pool_size: int = XU_STOLLER_STYLE_DEFAULTS["candidate_pool_size"],
         seed: int = 42,
     ) -> None:
         self.document_ids = [int(document_id) for document_id in document_ids]

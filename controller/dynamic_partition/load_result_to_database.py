@@ -350,7 +350,7 @@ def initialize_partitions_and_role_mappings(partition_assignment, comb_role_trac
 
 def create_index_for_partition(
     table_name,
-    index_type="ivfflat",
+    index_type="hnsw",
     *,
     hnsw_m: int = 16,
     hnsw_ef_construction: int = 64,
@@ -403,7 +403,7 @@ def create_index_for_partition(
 
 
 def create_indexes_for_all_partitions(
-    index_type="ivfflat",
+    index_type="hnsw",
     *,
     parallel: bool = True,
     max_workers: Optional[int] = None,

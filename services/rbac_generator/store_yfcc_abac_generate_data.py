@@ -12,6 +12,7 @@ sys.path.append(project_root)
 from services.config import get_db_connection
 from services.rbac_generator.yfcc_abac_data_generator import (
     DEFAULT_YFCC_METADATA_PATH,
+    XU_STOLLER_STYLE_DEFAULTS,
     YFCCABACDataGenerator,
     load_yfcc_metadata_rows,
 )
@@ -115,24 +116,24 @@ def main():
     )
     parser.add_argument("--metadata-path", default=DEFAULT_YFCC_METADATA_PATH)
     parser.add_argument("--max-documents", type=int)
-    parser.add_argument("--num-users", type=int, default=1000)
-    parser.add_argument("--num-rules", type=int, default=80)
-    parser.add_argument("--rules-per-user", type=int, default=2)
+    parser.add_argument("--num-users", type=int, default=XU_STOLLER_STYLE_DEFAULTS["num_users"], help="|U|: number of users")
+    parser.add_argument("--num-rules", type=int, default=XU_STOLLER_STYLE_DEFAULTS["num_rules"], help="Nrule: number of ABAC policy rules")
+    parser.add_argument("--rules-per-user", type=int, default=XU_STOLLER_STYLE_DEFAULTS["rules_per_user"], help="Number of ABAC rules assigned to each user")
     parser.add_argument(
         "--conjunct-count",
         type=int,
-        default=2,
-        help="Number of metadata labels required by each ABAC rule; must be >= 2.",
+        default=XU_STOLLER_STYLE_DEFAULTS["conjunct_count"],
+        help="c: number of metadata labels required by each ABAC rule; must be >= 2.",
     )
     parser.add_argument(
         "--target-avg-sharing-degree",
         type=float,
-        default=25.0,
-        help="Target average number of users that can access each document.",
+        default=XU_STOLLER_STYLE_DEFAULTS["target_avg_sharing_degree"],
+        help="sbar: target average number of users that can access each document.",
     )
-    parser.add_argument("--overlap-probability", type=float, default=0.35)
-    parser.add_argument("--min-user-resource-pairs", type=int, default=64)
-    parser.add_argument("--candidate-pool-size", type=int, default=512)
+    parser.add_argument("--overlap-probability", type=float, default=XU_STOLLER_STYLE_DEFAULTS["overlap_probability"], help="p_o: probability of sampling a rule overlapping an existing rule")
+    parser.add_argument("--min-user-resource-pairs", type=int, default=XU_STOLLER_STYLE_DEFAULTS["min_user_resource_pairs"], help="N_urp: minimum user-resource pairs / rule support accepted")
+    parser.add_argument("--candidate-pool-size", type=int, default=XU_STOLLER_STYLE_DEFAULTS["candidate_pool_size"], help="N_cand: number of candidate clauses sampled per rule")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=10000)
     parser.add_argument(

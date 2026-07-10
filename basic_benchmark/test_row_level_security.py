@@ -22,7 +22,7 @@ from controller.baseline.pg_row_security.row_level_security import disable_row_l
     create_database_users, enable_row_level_security, search_documents_rls
 
 
-def test_row_level_security(iterations=3, enable_index=False, index_type="ivfflat", statistics_type="sql",
+def test_row_level_security(iterations=3, enable_index=False, index_type="hnsw", statistics_type="sql",
                             generator_type="tree-based", query_num=1000, warm_up=True):
     current_index_type = get_index_type("documentblocks")
     if enable_index:

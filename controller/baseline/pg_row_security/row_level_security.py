@@ -5,20 +5,34 @@ from services.config import get_db_connection, config
 
 
 def create_database_users():
+    """Ensure every benchmark user has an idempotent PostgreSQL login role."""
     conn = get_db_connection()
-    cur = conn.cursor()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM Users ORDER BY user_id;")
+            user_ids = [int(row[0]) for row in cur.fetchall()]
+            cur.execute("SELECT rolname FROM pg_roles;")
+            existing_roles = {str(row[0]) for row in cur.fetchall()}
 
-    # Retrieve all user_ids from the Users table
-    cur.execute("SELECT user_id FROM Users;")
-    user_ids = cur.fetchall()
-
-    # Create a database role for each user_id
-    for user_id in user_ids:
-        cur.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD '123';").format(sql.Identifier(str(user_id[0]))))
-
-    conn.commit()
-    cur.close()
-    conn.close()
+            for user_id in user_ids:
+                role_name = str(user_id)
+                if role_name not in existing_roles:
+                    cur.execute(
+                        sql.SQL("CREATE ROLE {} LOGIN PASSWORD %s;").format(sql.Identifier(role_name)),
+                        [config["password"]],
+                    )
+                else:
+                    cur.execute(
+                        sql.SQL("ALTER ROLE {} LOGIN PASSWORD %s;").format(sql.Identifier(role_name)),
+                        [config["password"]],
+                    )
+        conn.commit()
+        return len(user_ids)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def drop_database_users():
@@ -39,34 +53,34 @@ def drop_database_users():
 
 
 def enable_row_level_security():
+    """Idempotently grant access and install the document-block RLS policy."""
     conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("GRANT SELECT ON PermissionAssignment TO PUBLIC;")
-    cur.execute("GRANT SELECT ON UserRoles TO PUBLIC;")
-    cur.execute("GRANT SELECT ON DocumentBlocks TO PUBLIC;")
-
-    # Enable row-level security on the DocumentBlocks table
-    cur.execute("ALTER TABLE DocumentBlocks ENABLE ROW LEVEL SECURITY;")
-    cur.execute("ALTER TABLE DocumentBlocks FORCE ROW LEVEL SECURITY;")
-
-    # Create a row-level security policy that restricts access based on user roles
-    cur.execute("""
-        CREATE POLICY block_access_policy ON DocumentBlocks FOR SELECT
-        USING (
-            EXISTS (
-                SELECT 1
-                FROM PermissionAssignment pa
-                JOIN UserRoles ur ON pa.role_id = ur.role_id
-                WHERE pa.document_id = DocumentBlocks.document_id
-                  AND ur.user_id = current_user::int
-            )
-        );
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("GRANT SELECT ON PermissionAssignment TO PUBLIC;")
+            cur.execute("GRANT SELECT ON UserRoles TO PUBLIC;")
+            cur.execute("GRANT SELECT ON DocumentBlocks TO PUBLIC;")
+            cur.execute("ALTER TABLE DocumentBlocks ENABLE ROW LEVEL SECURITY;")
+            cur.execute("ALTER TABLE DocumentBlocks FORCE ROW LEVEL SECURITY;")
+            cur.execute("DROP POLICY IF EXISTS block_access_policy ON DocumentBlocks;")
+            cur.execute("""
+                CREATE POLICY block_access_policy ON DocumentBlocks FOR SELECT
+                USING (
+                    EXISTS (
+                        SELECT 1
+                        FROM PermissionAssignment pa
+                        JOIN UserRoles ur ON pa.role_id = ur.role_id
+                        WHERE pa.document_id = DocumentBlocks.document_id
+                          AND ur.user_id = current_user::int
+                    )
+                );
+            """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def disable_row_level_security():

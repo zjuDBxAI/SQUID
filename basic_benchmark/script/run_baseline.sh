@@ -10,12 +10,12 @@ PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 # Space-separated algorithms supported by test_all.py:
 #   RLS ROLE USER AnonySys QDTree
 # Override example: ALGORITHMS="AnonySys RLS" ./script/run_baseline.sh
-ALGORITHMS="${ALGORITHMS:-AnonySys}"
+ALGORITHMS="${ALGORITHMS:-RLS}"
 read -r -a ALGORITHM_LIST <<< "${ALGORITHMS}"
 
 # Space-separated or comma-separated ef_search values.
 # Override example: EFS_VALUES="40 60 80 100" ./script/run_baseline.sh
-EFS_VALUES="${EFS_VALUES:-10 15 20 25 35}"
+EFS_VALUES="${EFS_VALUES:-750 800 850 900 925 950 975 1000 1050 1100 1150 1200 1250 1300}"
 EFS_VALUES="${EFS_VALUES//,/ }"
 read -r -a EFS_LIST <<< "${EFS_VALUES}"
 

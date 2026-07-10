@@ -133,7 +133,7 @@ def load_latency_cost_model(
         efs_h=float(efs_payload.get("h", _FALLBACK_EFS_H)),
         efs_lambda0=float(efs_payload.get("lambda0", _FALLBACK_EFS_LAMBDA0)),
         efs_lambda1=float(efs_payload.get("lambda1", _FALLBACK_EFS_LAMBDA1)),
-        target_recall=float(efs_payload.get("target_recall", settings.get("target_recall", _FALLBACK_TARGET_RECALL))),
+        target_recall=float(os.environ.get("KMEANS_TARGET_RECALL", efs_payload.get("target_recall", settings.get("target_recall", _FALLBACK_TARGET_RECALL)))),
         topk=max(1, int(settings.get("topk", _FALLBACK_TOPK))),
         source="Veda.pdf Appendix B coefficients: a=0.0821,b=0.1159,c=2.3110",
         efs_source=str(efs_candidate),
