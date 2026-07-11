@@ -93,6 +93,8 @@ def test_kmeans_partition_search(
     query_dataset_path=DEFAULT_QUERY_DATASET_PATH,
     enable_split=True,
     private_edge_top_d=32,
+    table_prefix=None,
+    versioned_plan=False,
 ):
     effective_query_num = max(1, int(query_num))
     queries = prepare_query_dataset(
@@ -108,12 +110,17 @@ def test_kmeans_partition_search(
             embedding_dim=embedding_dim,
             document_limit=document_limit,
             query_dataset_path=query_dataset_path or DEFAULT_QUERY_DATASET_PATH,
-            create_indexes=False,
+            create_indexes=bool(enable_index) if bool(versioned_plan) else False,
             index_type=index_type,
             show_progress=bool(show_progress),
             enable_split=bool(enable_split),
             private_edge_top_d=int(private_edge_top_d),
+            table_prefix=table_prefix,
+            replace_current=not bool(versioned_plan),
+            drop_stale=not bool(versioned_plan),
         )
+        if versioned_plan:
+            return
 
     partitions = load_current_partitions(refresh=True)
     if not partitions:
@@ -178,6 +185,8 @@ if __name__ == "__main__":
     parser.add_argument("--query-dataset-path", default=DEFAULT_QUERY_DATASET_PATH)
     parser.add_argument("--enable-split", type=_str_to_bool, default=True)
     parser.add_argument("--private-edge-top-d", type=int, default=32)
+    parser.add_argument("--table-prefix", default=None)
+    parser.add_argument("--versioned-plan", type=_str_to_bool, default=False)
     args = parser.parse_args()
 
     test_kmeans_partition_search(
@@ -200,4 +209,6 @@ if __name__ == "__main__":
         query_dataset_path=args.query_dataset_path,
         enable_split=args.enable_split,
         private_edge_top_d=args.private_edge_top_d,
+        table_prefix=args.table_prefix,
+        versioned_plan=args.versioned_plan,
     )

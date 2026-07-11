@@ -55,10 +55,49 @@ venv/bin/python basic_benchmark/script/squid/versioned_plan_registry.py resolve 
   --method ours --memory-ratio 2.0
 ```
 
-`plan-id` is the method-local metadata plan id after the corresponding builder
-has been updated to preserve versions. The next implementation step is to make
-each builder generate table names from the registry id and avoid current-plan
-deletes/stale-table cleanup for versioned builds.
+`plan-id` is the method-local metadata plan id. Versioned builders preserve the
+physical partition tables, copy route metadata into namespaced metadata tables,
+and register all query-visible relations in `benchmark_plan_relations`.
+
+## Versioned Build and QPS
+
+Build one namespaced plan and register it:
+
+```bash
+venv/bin/python basic_benchmark/script/squid/build_versioned_plan.py \
+  --method ours \
+  --memory-ratio 2.0 \
+  --version yfcc_2p0
+```
+
+Run direct PostgreSQL QPS against that exact materialization:
+
+```bash
+venv/bin/python basic_benchmark/direct_pg_qps.py \
+  --methods ours \
+  --memory-ratio 2.0 \
+  --ef-search 30 \
+  --concurrency 16
+```
+
+`direct_pg_qps.py` resolves `(method, memory_ratio)` and preloads route
+metadata before the timed QPS barrier. Timed QPS only includes worker SELECTs,
+candidate fetching, and the common top-k merge.
+
+Batch build and QPS for selected methods/ratios:
+
+```bash
+METHODS="ours honeybee veda effveda" \
+MEMORY_VALUES="1.0 2.0 3.0" \
+EF_VALUES="20 30 40" \
+basic_benchmark/script/squid/run_versioned_qps.sh
+```
+
+Default QPS outputs are structured as:
+
+```text
+basic_benchmark/result/direct_pg_qps/<method>/memory_<ratio>/ef_<ef>/<timestamp>.json
+```
 
 ## Query Contract
 
@@ -81,8 +120,9 @@ venv/bin/python basic_benchmark/script/squid/versioned_plan_registry.py manifest
   --method ours --memory-ratio 2.0 --version 101
 ```
 
-After a builder has created a version, record every partition table, index, and
-namespaced route/pattern metadata relation with `register-relations`.
+After a builder has created a version, record every partition table and
+namespaced plan/partition/route/pattern metadata relation with
+`register-relations`.
 
 ## Sweep Manifest
 
@@ -97,6 +137,6 @@ venv/bin/python basic_benchmark/script/squid/create_sweep_manifest.py \
 ```
 
 This only records the naming/build contract. It does not build partitions or
-access PostgreSQL. A later version-aware builder consumes one manifest entry at
-a time, registers it as `building`, materializes only its namespaced relations,
-measures space, and finally marks it `ready`.
+access PostgreSQL. `build_versioned_plan.py` consumes one manifest-equivalent
+entry at a time, materializes only its namespaced relations, and marks it
+`ready`.

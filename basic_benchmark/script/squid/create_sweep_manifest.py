@@ -32,6 +32,7 @@ def main() -> None:
             manifest["build_contract"] = {
                 "metadata_relations": [
                     manifest["plan_relation"],
+                    manifest["partition_relation"],
                     manifest["route_relation"],
                     manifest["pattern_relation"],
                 ],

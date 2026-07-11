@@ -18,9 +18,46 @@ CREATE TABLE IF NOT EXISTS benchmark_plan_registry (
 CREATE TABLE IF NOT EXISTS benchmark_plan_relations (
     registry_id BIGINT NOT NULL REFERENCES benchmark_plan_registry(registry_id) ON DELETE CASCADE,
     relation_name TEXT NOT NULL,
-    relation_kind TEXT NOT NULL CHECK (relation_kind IN ('partition', 'index', 'route_metadata', 'pattern_metadata')),
+    relation_kind TEXT NOT NULL CHECK (
+        relation_kind IN (
+            'partition',
+            'index',
+            'plan_metadata',
+            'partition_metadata',
+            'route_metadata',
+            'pattern_metadata',
+            'mapping_metadata'
+        )
+    ),
     PRIMARY KEY (registry_id, relation_name)
 );
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'benchmark_plan_relations_relation_kind_check'
+          AND conrelid = 'benchmark_plan_relations'::regclass
+    ) THEN
+        ALTER TABLE benchmark_plan_relations
+            DROP CONSTRAINT benchmark_plan_relations_relation_kind_check;
+    END IF;
+END $$;
+
+ALTER TABLE benchmark_plan_relations
+    ADD CONSTRAINT benchmark_plan_relations_relation_kind_check
+    CHECK (
+        relation_kind IN (
+            'partition',
+            'index',
+            'plan_metadata',
+            'partition_metadata',
+            'route_metadata',
+            'pattern_metadata',
+            'mapping_metadata'
+        )
+    );
 
 CREATE INDEX IF NOT EXISTS benchmark_plan_registry_lookup_idx
     ON benchmark_plan_registry (method, memory_ratio)

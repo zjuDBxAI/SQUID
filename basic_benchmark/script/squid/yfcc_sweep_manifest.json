@@ -1,0 +1,530 @@
+[
+  {
+    "method": "ours",
+    "memory_ratio": 1.0,
+    "version": "yfcc_sweep_1p0",
+    "table_prefix": "ours_m1p0_vyfcc_sweep_1p0",
+    "route_relation": "ours_m1p0_vyfcc_sweep_1p0_routes",
+    "pattern_relation": "ours_m1p0_vyfcc_sweep_1p0_patterns",
+    "plan_relation": "ours_m1p0_vyfcc_sweep_1p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "ours_m1p0_vyfcc_sweep_1p0_plan",
+        "ours_m1p0_vyfcc_sweep_1p0_routes",
+        "ours_m1p0_vyfcc_sweep_1p0_patterns"
+      ],
+      "partition_prefix": "ours_m1p0_vyfcc_sweep_1p0",
+      "query_selector": {
+        "method": "ours",
+        "memory_ratio": 1.0
+      }
+    }
+  },
+  {
+    "method": "ours",
+    "memory_ratio": 2.0,
+    "version": "yfcc_sweep_2p0",
+    "table_prefix": "ours_m2p0_vyfcc_sweep_2p0",
+    "route_relation": "ours_m2p0_vyfcc_sweep_2p0_routes",
+    "pattern_relation": "ours_m2p0_vyfcc_sweep_2p0_patterns",
+    "plan_relation": "ours_m2p0_vyfcc_sweep_2p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "ours_m2p0_vyfcc_sweep_2p0_plan",
+        "ours_m2p0_vyfcc_sweep_2p0_routes",
+        "ours_m2p0_vyfcc_sweep_2p0_patterns"
+      ],
+      "partition_prefix": "ours_m2p0_vyfcc_sweep_2p0",
+      "query_selector": {
+        "method": "ours",
+        "memory_ratio": 2.0
+      }
+    }
+  },
+  {
+    "method": "ours",
+    "memory_ratio": 3.0,
+    "version": "yfcc_sweep_3p0",
+    "table_prefix": "ours_m3p0_vyfcc_sweep_3p0",
+    "route_relation": "ours_m3p0_vyfcc_sweep_3p0_routes",
+    "pattern_relation": "ours_m3p0_vyfcc_sweep_3p0_patterns",
+    "plan_relation": "ours_m3p0_vyfcc_sweep_3p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "ours_m3p0_vyfcc_sweep_3p0_plan",
+        "ours_m3p0_vyfcc_sweep_3p0_routes",
+        "ours_m3p0_vyfcc_sweep_3p0_patterns"
+      ],
+      "partition_prefix": "ours_m3p0_vyfcc_sweep_3p0",
+      "query_selector": {
+        "method": "ours",
+        "memory_ratio": 3.0
+      }
+    }
+  },
+  {
+    "method": "ours",
+    "memory_ratio": 4.0,
+    "version": "yfcc_sweep_4p0",
+    "table_prefix": "ours_m4p0_vyfcc_sweep_4p0",
+    "route_relation": "ours_m4p0_vyfcc_sweep_4p0_routes",
+    "pattern_relation": "ours_m4p0_vyfcc_sweep_4p0_patterns",
+    "plan_relation": "ours_m4p0_vyfcc_sweep_4p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "ours_m4p0_vyfcc_sweep_4p0_plan",
+        "ours_m4p0_vyfcc_sweep_4p0_routes",
+        "ours_m4p0_vyfcc_sweep_4p0_patterns"
+      ],
+      "partition_prefix": "ours_m4p0_vyfcc_sweep_4p0",
+      "query_selector": {
+        "method": "ours",
+        "memory_ratio": 4.0
+      }
+    }
+  },
+  {
+    "method": "ours",
+    "memory_ratio": 5.0,
+    "version": "yfcc_sweep_5p0",
+    "table_prefix": "ours_m5p0_vyfcc_sweep_5p0",
+    "route_relation": "ours_m5p0_vyfcc_sweep_5p0_routes",
+    "pattern_relation": "ours_m5p0_vyfcc_sweep_5p0_patterns",
+    "plan_relation": "ours_m5p0_vyfcc_sweep_5p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "ours_m5p0_vyfcc_sweep_5p0_plan",
+        "ours_m5p0_vyfcc_sweep_5p0_routes",
+        "ours_m5p0_vyfcc_sweep_5p0_patterns"
+      ],
+      "partition_prefix": "ours_m5p0_vyfcc_sweep_5p0",
+      "query_selector": {
+        "method": "ours",
+        "memory_ratio": 5.0
+      }
+    }
+  },
+  {
+    "method": "ours",
+    "memory_ratio": 6.0,
+    "version": "yfcc_sweep_6p0",
+    "table_prefix": "ours_m6p0_vyfcc_sweep_6p0",
+    "route_relation": "ours_m6p0_vyfcc_sweep_6p0_routes",
+    "pattern_relation": "ours_m6p0_vyfcc_sweep_6p0_patterns",
+    "plan_relation": "ours_m6p0_vyfcc_sweep_6p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "ours_m6p0_vyfcc_sweep_6p0_plan",
+        "ours_m6p0_vyfcc_sweep_6p0_routes",
+        "ours_m6p0_vyfcc_sweep_6p0_patterns"
+      ],
+      "partition_prefix": "ours_m6p0_vyfcc_sweep_6p0",
+      "query_selector": {
+        "method": "ours",
+        "memory_ratio": 6.0
+      }
+    }
+  },
+  {
+    "method": "honeybee",
+    "memory_ratio": 1.0,
+    "version": "yfcc_sweep_1p0",
+    "table_prefix": "honeybee_m1p0_vyfcc_sweep_1p0",
+    "route_relation": "honeybee_m1p0_vyfcc_sweep_1p0_routes",
+    "pattern_relation": "honeybee_m1p0_vyfcc_sweep_1p0_patterns",
+    "plan_relation": "honeybee_m1p0_vyfcc_sweep_1p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "honeybee_m1p0_vyfcc_sweep_1p0_plan",
+        "honeybee_m1p0_vyfcc_sweep_1p0_routes",
+        "honeybee_m1p0_vyfcc_sweep_1p0_patterns"
+      ],
+      "partition_prefix": "honeybee_m1p0_vyfcc_sweep_1p0",
+      "query_selector": {
+        "method": "honeybee",
+        "memory_ratio": 1.0
+      }
+    }
+  },
+  {
+    "method": "honeybee",
+    "memory_ratio": 2.0,
+    "version": "yfcc_sweep_2p0",
+    "table_prefix": "honeybee_m2p0_vyfcc_sweep_2p0",
+    "route_relation": "honeybee_m2p0_vyfcc_sweep_2p0_routes",
+    "pattern_relation": "honeybee_m2p0_vyfcc_sweep_2p0_patterns",
+    "plan_relation": "honeybee_m2p0_vyfcc_sweep_2p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "honeybee_m2p0_vyfcc_sweep_2p0_plan",
+        "honeybee_m2p0_vyfcc_sweep_2p0_routes",
+        "honeybee_m2p0_vyfcc_sweep_2p0_patterns"
+      ],
+      "partition_prefix": "honeybee_m2p0_vyfcc_sweep_2p0",
+      "query_selector": {
+        "method": "honeybee",
+        "memory_ratio": 2.0
+      }
+    }
+  },
+  {
+    "method": "honeybee",
+    "memory_ratio": 3.0,
+    "version": "yfcc_sweep_3p0",
+    "table_prefix": "honeybee_m3p0_vyfcc_sweep_3p0",
+    "route_relation": "honeybee_m3p0_vyfcc_sweep_3p0_routes",
+    "pattern_relation": "honeybee_m3p0_vyfcc_sweep_3p0_patterns",
+    "plan_relation": "honeybee_m3p0_vyfcc_sweep_3p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "honeybee_m3p0_vyfcc_sweep_3p0_plan",
+        "honeybee_m3p0_vyfcc_sweep_3p0_routes",
+        "honeybee_m3p0_vyfcc_sweep_3p0_patterns"
+      ],
+      "partition_prefix": "honeybee_m3p0_vyfcc_sweep_3p0",
+      "query_selector": {
+        "method": "honeybee",
+        "memory_ratio": 3.0
+      }
+    }
+  },
+  {
+    "method": "honeybee",
+    "memory_ratio": 4.0,
+    "version": "yfcc_sweep_4p0",
+    "table_prefix": "honeybee_m4p0_vyfcc_sweep_4p0",
+    "route_relation": "honeybee_m4p0_vyfcc_sweep_4p0_routes",
+    "pattern_relation": "honeybee_m4p0_vyfcc_sweep_4p0_patterns",
+    "plan_relation": "honeybee_m4p0_vyfcc_sweep_4p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "honeybee_m4p0_vyfcc_sweep_4p0_plan",
+        "honeybee_m4p0_vyfcc_sweep_4p0_routes",
+        "honeybee_m4p0_vyfcc_sweep_4p0_patterns"
+      ],
+      "partition_prefix": "honeybee_m4p0_vyfcc_sweep_4p0",
+      "query_selector": {
+        "method": "honeybee",
+        "memory_ratio": 4.0
+      }
+    }
+  },
+  {
+    "method": "honeybee",
+    "memory_ratio": 5.0,
+    "version": "yfcc_sweep_5p0",
+    "table_prefix": "honeybee_m5p0_vyfcc_sweep_5p0",
+    "route_relation": "honeybee_m5p0_vyfcc_sweep_5p0_routes",
+    "pattern_relation": "honeybee_m5p0_vyfcc_sweep_5p0_patterns",
+    "plan_relation": "honeybee_m5p0_vyfcc_sweep_5p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "honeybee_m5p0_vyfcc_sweep_5p0_plan",
+        "honeybee_m5p0_vyfcc_sweep_5p0_routes",
+        "honeybee_m5p0_vyfcc_sweep_5p0_patterns"
+      ],
+      "partition_prefix": "honeybee_m5p0_vyfcc_sweep_5p0",
+      "query_selector": {
+        "method": "honeybee",
+        "memory_ratio": 5.0
+      }
+    }
+  },
+  {
+    "method": "honeybee",
+    "memory_ratio": 6.0,
+    "version": "yfcc_sweep_6p0",
+    "table_prefix": "honeybee_m6p0_vyfcc_sweep_6p0",
+    "route_relation": "honeybee_m6p0_vyfcc_sweep_6p0_routes",
+    "pattern_relation": "honeybee_m6p0_vyfcc_sweep_6p0_patterns",
+    "plan_relation": "honeybee_m6p0_vyfcc_sweep_6p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "honeybee_m6p0_vyfcc_sweep_6p0_plan",
+        "honeybee_m6p0_vyfcc_sweep_6p0_routes",
+        "honeybee_m6p0_vyfcc_sweep_6p0_patterns"
+      ],
+      "partition_prefix": "honeybee_m6p0_vyfcc_sweep_6p0",
+      "query_selector": {
+        "method": "honeybee",
+        "memory_ratio": 6.0
+      }
+    }
+  },
+  {
+    "method": "veda",
+    "memory_ratio": 1.0,
+    "version": "yfcc_sweep_1p0",
+    "table_prefix": "veda_m1p0_vyfcc_sweep_1p0",
+    "route_relation": "veda_m1p0_vyfcc_sweep_1p0_routes",
+    "pattern_relation": "veda_m1p0_vyfcc_sweep_1p0_patterns",
+    "plan_relation": "veda_m1p0_vyfcc_sweep_1p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "veda_m1p0_vyfcc_sweep_1p0_plan",
+        "veda_m1p0_vyfcc_sweep_1p0_routes",
+        "veda_m1p0_vyfcc_sweep_1p0_patterns"
+      ],
+      "partition_prefix": "veda_m1p0_vyfcc_sweep_1p0",
+      "query_selector": {
+        "method": "veda",
+        "memory_ratio": 1.0
+      }
+    }
+  },
+  {
+    "method": "veda",
+    "memory_ratio": 2.0,
+    "version": "yfcc_sweep_2p0",
+    "table_prefix": "veda_m2p0_vyfcc_sweep_2p0",
+    "route_relation": "veda_m2p0_vyfcc_sweep_2p0_routes",
+    "pattern_relation": "veda_m2p0_vyfcc_sweep_2p0_patterns",
+    "plan_relation": "veda_m2p0_vyfcc_sweep_2p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "veda_m2p0_vyfcc_sweep_2p0_plan",
+        "veda_m2p0_vyfcc_sweep_2p0_routes",
+        "veda_m2p0_vyfcc_sweep_2p0_patterns"
+      ],
+      "partition_prefix": "veda_m2p0_vyfcc_sweep_2p0",
+      "query_selector": {
+        "method": "veda",
+        "memory_ratio": 2.0
+      }
+    }
+  },
+  {
+    "method": "veda",
+    "memory_ratio": 3.0,
+    "version": "yfcc_sweep_3p0",
+    "table_prefix": "veda_m3p0_vyfcc_sweep_3p0",
+    "route_relation": "veda_m3p0_vyfcc_sweep_3p0_routes",
+    "pattern_relation": "veda_m3p0_vyfcc_sweep_3p0_patterns",
+    "plan_relation": "veda_m3p0_vyfcc_sweep_3p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "veda_m3p0_vyfcc_sweep_3p0_plan",
+        "veda_m3p0_vyfcc_sweep_3p0_routes",
+        "veda_m3p0_vyfcc_sweep_3p0_patterns"
+      ],
+      "partition_prefix": "veda_m3p0_vyfcc_sweep_3p0",
+      "query_selector": {
+        "method": "veda",
+        "memory_ratio": 3.0
+      }
+    }
+  },
+  {
+    "method": "veda",
+    "memory_ratio": 4.0,
+    "version": "yfcc_sweep_4p0",
+    "table_prefix": "veda_m4p0_vyfcc_sweep_4p0",
+    "route_relation": "veda_m4p0_vyfcc_sweep_4p0_routes",
+    "pattern_relation": "veda_m4p0_vyfcc_sweep_4p0_patterns",
+    "plan_relation": "veda_m4p0_vyfcc_sweep_4p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "veda_m4p0_vyfcc_sweep_4p0_plan",
+        "veda_m4p0_vyfcc_sweep_4p0_routes",
+        "veda_m4p0_vyfcc_sweep_4p0_patterns"
+      ],
+      "partition_prefix": "veda_m4p0_vyfcc_sweep_4p0",
+      "query_selector": {
+        "method": "veda",
+        "memory_ratio": 4.0
+      }
+    }
+  },
+  {
+    "method": "veda",
+    "memory_ratio": 5.0,
+    "version": "yfcc_sweep_5p0",
+    "table_prefix": "veda_m5p0_vyfcc_sweep_5p0",
+    "route_relation": "veda_m5p0_vyfcc_sweep_5p0_routes",
+    "pattern_relation": "veda_m5p0_vyfcc_sweep_5p0_patterns",
+    "plan_relation": "veda_m5p0_vyfcc_sweep_5p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "veda_m5p0_vyfcc_sweep_5p0_plan",
+        "veda_m5p0_vyfcc_sweep_5p0_routes",
+        "veda_m5p0_vyfcc_sweep_5p0_patterns"
+      ],
+      "partition_prefix": "veda_m5p0_vyfcc_sweep_5p0",
+      "query_selector": {
+        "method": "veda",
+        "memory_ratio": 5.0
+      }
+    }
+  },
+  {
+    "method": "veda",
+    "memory_ratio": 6.0,
+    "version": "yfcc_sweep_6p0",
+    "table_prefix": "veda_m6p0_vyfcc_sweep_6p0",
+    "route_relation": "veda_m6p0_vyfcc_sweep_6p0_routes",
+    "pattern_relation": "veda_m6p0_vyfcc_sweep_6p0_patterns",
+    "plan_relation": "veda_m6p0_vyfcc_sweep_6p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "veda_m6p0_vyfcc_sweep_6p0_plan",
+        "veda_m6p0_vyfcc_sweep_6p0_routes",
+        "veda_m6p0_vyfcc_sweep_6p0_patterns"
+      ],
+      "partition_prefix": "veda_m6p0_vyfcc_sweep_6p0",
+      "query_selector": {
+        "method": "veda",
+        "memory_ratio": 6.0
+      }
+    }
+  },
+  {
+    "method": "effveda",
+    "memory_ratio": 1.0,
+    "version": "yfcc_sweep_1p0",
+    "table_prefix": "effveda_m1p0_vyfcc_sweep_1p0",
+    "route_relation": "effveda_m1p0_vyfcc_sweep_1p0_routes",
+    "pattern_relation": "effveda_m1p0_vyfcc_sweep_1p0_patterns",
+    "plan_relation": "effveda_m1p0_vyfcc_sweep_1p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "effveda_m1p0_vyfcc_sweep_1p0_plan",
+        "effveda_m1p0_vyfcc_sweep_1p0_routes",
+        "effveda_m1p0_vyfcc_sweep_1p0_patterns"
+      ],
+      "partition_prefix": "effveda_m1p0_vyfcc_sweep_1p0",
+      "query_selector": {
+        "method": "effveda",
+        "memory_ratio": 1.0
+      }
+    }
+  },
+  {
+    "method": "effveda",
+    "memory_ratio": 2.0,
+    "version": "yfcc_sweep_2p0",
+    "table_prefix": "effveda_m2p0_vyfcc_sweep_2p0",
+    "route_relation": "effveda_m2p0_vyfcc_sweep_2p0_routes",
+    "pattern_relation": "effveda_m2p0_vyfcc_sweep_2p0_patterns",
+    "plan_relation": "effveda_m2p0_vyfcc_sweep_2p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "effveda_m2p0_vyfcc_sweep_2p0_plan",
+        "effveda_m2p0_vyfcc_sweep_2p0_routes",
+        "effveda_m2p0_vyfcc_sweep_2p0_patterns"
+      ],
+      "partition_prefix": "effveda_m2p0_vyfcc_sweep_2p0",
+      "query_selector": {
+        "method": "effveda",
+        "memory_ratio": 2.0
+      }
+    }
+  },
+  {
+    "method": "effveda",
+    "memory_ratio": 3.0,
+    "version": "yfcc_sweep_3p0",
+    "table_prefix": "effveda_m3p0_vyfcc_sweep_3p0",
+    "route_relation": "effveda_m3p0_vyfcc_sweep_3p0_routes",
+    "pattern_relation": "effveda_m3p0_vyfcc_sweep_3p0_patterns",
+    "plan_relation": "effveda_m3p0_vyfcc_sweep_3p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "effveda_m3p0_vyfcc_sweep_3p0_plan",
+        "effveda_m3p0_vyfcc_sweep_3p0_routes",
+        "effveda_m3p0_vyfcc_sweep_3p0_patterns"
+      ],
+      "partition_prefix": "effveda_m3p0_vyfcc_sweep_3p0",
+      "query_selector": {
+        "method": "effveda",
+        "memory_ratio": 3.0
+      }
+    }
+  },
+  {
+    "method": "effveda",
+    "memory_ratio": 4.0,
+    "version": "yfcc_sweep_4p0",
+    "table_prefix": "effveda_m4p0_vyfcc_sweep_4p0",
+    "route_relation": "effveda_m4p0_vyfcc_sweep_4p0_routes",
+    "pattern_relation": "effveda_m4p0_vyfcc_sweep_4p0_patterns",
+    "plan_relation": "effveda_m4p0_vyfcc_sweep_4p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "effveda_m4p0_vyfcc_sweep_4p0_plan",
+        "effveda_m4p0_vyfcc_sweep_4p0_routes",
+        "effveda_m4p0_vyfcc_sweep_4p0_patterns"
+      ],
+      "partition_prefix": "effveda_m4p0_vyfcc_sweep_4p0",
+      "query_selector": {
+        "method": "effveda",
+        "memory_ratio": 4.0
+      }
+    }
+  },
+  {
+    "method": "effveda",
+    "memory_ratio": 5.0,
+    "version": "yfcc_sweep_5p0",
+    "table_prefix": "effveda_m5p0_vyfcc_sweep_5p0",
+    "route_relation": "effveda_m5p0_vyfcc_sweep_5p0_routes",
+    "pattern_relation": "effveda_m5p0_vyfcc_sweep_5p0_patterns",
+    "plan_relation": "effveda_m5p0_vyfcc_sweep_5p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "effveda_m5p0_vyfcc_sweep_5p0_plan",
+        "effveda_m5p0_vyfcc_sweep_5p0_routes",
+        "effveda_m5p0_vyfcc_sweep_5p0_patterns"
+      ],
+      "partition_prefix": "effveda_m5p0_vyfcc_sweep_5p0",
+      "query_selector": {
+        "method": "effveda",
+        "memory_ratio": 5.0
+      }
+    }
+  },
+  {
+    "method": "effveda",
+    "memory_ratio": 6.0,
+    "version": "yfcc_sweep_6p0",
+    "table_prefix": "effveda_m6p0_vyfcc_sweep_6p0",
+    "route_relation": "effveda_m6p0_vyfcc_sweep_6p0_routes",
+    "pattern_relation": "effveda_m6p0_vyfcc_sweep_6p0_patterns",
+    "plan_relation": "effveda_m6p0_vyfcc_sweep_6p0_plan",
+    "state": "planned",
+    "build_contract": {
+      "metadata_relations": [
+        "effveda_m6p0_vyfcc_sweep_6p0_plan",
+        "effveda_m6p0_vyfcc_sweep_6p0_routes",
+        "effveda_m6p0_vyfcc_sweep_6p0_patterns"
+      ],
+      "partition_prefix": "effveda_m6p0_vyfcc_sweep_6p0",
+      "query_selector": {
+        "method": "effveda",
+        "memory_ratio": 6.0
+      }
+    }
+  }
+]

@@ -41,7 +41,7 @@ for EFS in "${EFS_VALUES[@]}"; do
   echo "[log] ${LOG_FILE}"
 
  python test_kmeans_partition.py \
-    --prepare true \
+    --prepare false \
     --private-replication-budget-ratio "${PRIVATE_REPLICATION_BUDGET_RATIO}" \
     --private-edge-top-d "${PRIVATE_EDGE_TOP_D}" \
     --enable-split "${ENABLE_SPLIT}" \

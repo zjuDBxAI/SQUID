@@ -120,6 +120,8 @@ def test_veda_search(
     use_ground_truth_cache=False,
     query_dataset_path=DEFAULT_QUERY_DATASET_PATH,
     show_progress=True,
+    table_prefix=None,
+    versioned_plan=False,
 ):
     algorithm = normalize_algorithm(algorithm)
     _sync_efconfig_value("veda_algorithm", algorithm)
@@ -138,10 +140,15 @@ def test_veda_search(
             storage_amplification=float(storage_amplification),
             ef_search=int(ef_search),
             document_limit=document_limit,
-            create_indexes=False,
+            create_indexes=bool(enable_index) if bool(versioned_plan) else False,
             index_type=index_type,
             show_progress=bool(show_progress),
+            table_prefix=table_prefix,
+            replace_current=not bool(versioned_plan),
+            drop_stale=not bool(versioned_plan),
         )
+        if versioned_plan:
+            return
 
     partitions = load_current_partitions(algorithm=algorithm, refresh=True)
     if not partitions:
@@ -213,6 +220,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-ground-truth-cache", type=_str_to_bool, default=False)
     parser.add_argument("--query-dataset-path", default=DEFAULT_QUERY_DATASET_PATH)
     parser.add_argument("--show-progress", type=_str_to_bool, default=True)
+    parser.add_argument("--table-prefix", default=None)
+    parser.add_argument("--versioned-plan", type=_str_to_bool, default=False)
     args = parser.parse_args()
 
     test_veda_search(
@@ -238,4 +247,6 @@ if __name__ == "__main__":
         use_ground_truth_cache=args.use_ground_truth_cache,
         query_dataset_path=args.query_dataset_path,
         show_progress=args.show_progress,
+        table_prefix=args.table_prefix,
+        versioned_plan=args.versioned_plan,
     )

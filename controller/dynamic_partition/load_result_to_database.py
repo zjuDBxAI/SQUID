@@ -6,6 +6,7 @@ from psycopg2 import sql
 
 import os
 import sys
+import hashlib
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
@@ -13,6 +14,30 @@ sys.path.append(project_root)
 from controller.dynamic_partition.hnsw.helper import fetch_initial_data, prepare_background_data
 
 from services.config import get_db_connection, get_maintenance_settings, get_document_vector_dimension
+
+_POSTGRES_IDENTIFIER_LIMIT = 63
+
+
+def _safe_identifier(value: str) -> str:
+    candidate = "".join(char if char.isalnum() or char == "_" else "_" for char in str(value).lower()).strip("_")
+    if not candidate:
+        candidate = "partition"
+    if len(candidate) <= _POSTGRES_IDENTIFIER_LIMIT:
+        return candidate
+    digest = hashlib.blake2b(candidate.encode("utf-8"), digest_size=6).hexdigest()
+    return f"{candidate[:_POSTGRES_IDENTIFIER_LIMIT - len(digest) - 1]}_{digest}"
+
+
+def partition_table_name(partition_id, table_prefix: str | None = None) -> str:
+    if table_prefix:
+        return _safe_identifier(f"{table_prefix}_partition_{partition_id}")
+    return f"documentblocks_partition_{partition_id}"
+
+
+def comb_role_mapping_table_name(table_prefix: str | None = None) -> str:
+    if table_prefix:
+        return _safe_identifier(f"{table_prefix}_comb_role_partitions")
+    return "CombRolePartitions"
 
 
 def _configure_index_session(cur, disable_sync_commit: bool = True, hnsw_threads: Optional[int] = None) -> None:
@@ -55,7 +80,7 @@ def validate_partition_coverage(cur, accessible_partitions, document_to_index):
     print("All documents are correctly assigned across partitions.")
 
 
-def delete_partitions_and_role_mappings(comb_role_tracker=None, increment_update=False):
+def delete_partitions_and_role_mappings(comb_role_tracker=None, increment_update=False, table_prefix: str | None = None):
     """
     Deletes all partition tables and clears the RolePartitions mapping table.
 
@@ -68,17 +93,18 @@ def delete_partitions_and_role_mappings(comb_role_tracker=None, increment_update
 
     try:
         # Step 1: Retrieve all existing partition tables
+        like_pattern = f"{_safe_identifier(table_prefix)}_partition_%" if table_prefix else "documentblocks_partition_%"
         cur.execute("""
             SELECT table_name 
             FROM information_schema.tables 
-            WHERE table_name LIKE 'documentblocks_partition_%';
-        """)
+            WHERE table_name LIKE %s;
+        """, [like_pattern])
         partition_tables = {row[0] for row in cur.fetchall()}
 
         # Step 2: Identify valid partitions based on comb_role_tracker
         if increment_update and comb_role_tracker:
             valid_partitions = {
-                f"documentblocks_partition_{partition_id}"
+                partition_table_name(partition_id, table_prefix)
                 for partitions in comb_role_tracker.values()
                 for partition_id in partitions
             }
@@ -99,7 +125,9 @@ def delete_partitions_and_role_mappings(comb_role_tracker=None, increment_update
                 conn.rollback()  # Rollback only the current delete
 
         # Step 5: Clear the RolePartitions table
-        cur.execute("DELETE FROM CombRolePartitions;")
+        mapping_table = comb_role_mapping_table_name(table_prefix)
+        cur.execute(sql.SQL("CREATE TABLE IF NOT EXISTS {} (comb_role INT[] NOT NULL, partition_id INT NOT NULL, PRIMARY KEY (comb_role, partition_id));").format(sql.Identifier(mapping_table)))
+        cur.execute(sql.SQL("DELETE FROM {};").format(sql.Identifier(mapping_table)))
         conn.commit()
         print("RolePartitions table cleared.")
 
@@ -111,10 +139,10 @@ def delete_partitions_and_role_mappings(comb_role_tracker=None, increment_update
         conn.close()
 
 
-def create_and_populate_partition_table_increment(partition_id, partition_assignment, document_to_index):
+def create_and_populate_partition_table_increment(partition_id, partition_assignment, document_to_index, table_prefix: str | None = None):
     conn = get_db_connection()
     cur = conn.cursor()
-    partition_table_name = f"documentblocks_partition_{partition_id}"
+    partition_table = partition_table_name(partition_id, table_prefix)
     vector_dimension = get_document_vector_dimension()
 
     try:
@@ -125,13 +153,13 @@ def create_and_populate_partition_table_increment(partition_id, partition_assign
                 FROM information_schema.tables
                 WHERE table_name = %s
             );
-        """, (partition_table_name,))
+            """, (partition_table,))
         table_exists = cur.fetchone()[0]
 
         # Step 2: Collect current data if table exists
         current_docs = set()
         if table_exists:
-            cur.execute(sql.SQL("SELECT document_id FROM {};").format(sql.Identifier(partition_table_name)))
+            cur.execute(sql.SQL("SELECT document_id FROM {};").format(sql.Identifier(partition_table)))
             current_docs = {row[0] for row in cur.fetchall()}
 
         # Step 3: Get new documents to be inserted
@@ -141,12 +169,12 @@ def create_and_populate_partition_table_increment(partition_id, partition_assign
 
         # Step 4: Compare current and new data
         if table_exists and current_docs == new_docs:
-            print(f"Partition table {partition_table_name} is up-to-date. Skipping.")
+            print(f"Partition table {partition_table} is up-to-date. Skipping.")
             return partition_id
 
         # If not up-to-date, recreate the table
-        print(f"Updating partition table {partition_table_name}...")
-        cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE;").format(sql.Identifier(partition_table_name)))
+        print(f"Updating partition table {partition_table}...")
+        cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE;").format(sql.Identifier(partition_table)))
 
         # Create the partition table
         cur.execute(
@@ -159,7 +187,7 @@ def create_and_populate_partition_table_increment(partition_id, partition_assign
                     PRIMARY KEY (block_id, document_id)
                 );
             """).format(
-                table=sql.Identifier(partition_table_name),
+                table=sql.Identifier(partition_table),
                 dimension=sql.SQL(str(vector_dimension))
             )
         )
@@ -173,16 +201,16 @@ def create_and_populate_partition_table_increment(partition_id, partition_assign
                     SELECT block_id, document_id, block_content, vector
                     FROM documentblocks
                     WHERE document_id = %s;
-                """).format(sql.Identifier(partition_table_name)),
+                """).format(sql.Identifier(partition_table)),
                 [document_id]
             )
 
         conn.commit()
-        print(f"Partition table {partition_table_name} updated with new data.")
+        print(f"Partition table {partition_table} updated with new data.")
         return partition_id
 
     except psycopg2.Error as e:
-        print(f"Database error while updating {partition_table_name}: {e}")
+        print(f"Database error while updating {partition_table}: {e}")
         conn.rollback()
         raise
     finally:
@@ -190,7 +218,7 @@ def create_and_populate_partition_table_increment(partition_id, partition_assign
         conn.close()
 
 
-def create_and_populate_partition_table(partition_id, partition_assignment, document_to_index):
+def create_and_populate_partition_table(partition_id, partition_assignment, document_to_index, table_prefix: str | None = None):
     """
     Create or update a partition table based on `partition_assignment`.
 
@@ -201,7 +229,7 @@ def create_and_populate_partition_table(partition_id, partition_assignment, docu
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    partition_table_name = f"documentblocks_partition_{partition_id}"
+    partition_table = partition_table_name(partition_id, table_prefix)
     vector_dimension = get_document_vector_dimension()
 
     try:
@@ -216,12 +244,12 @@ def create_and_populate_partition_table(partition_id, partition_assignment, docu
                     PRIMARY KEY (block_id, document_id)
                 );
             """).format(
-                table=sql.Identifier(partition_table_name),
+                table=sql.Identifier(partition_table),
                 dimension=sql.SQL(str(vector_dimension))
             )
         )
         conn.commit()
-        print(f"Partition table {partition_table_name} created.")
+        print(f"Partition table {partition_table} created.")
 
         # Step 2: Populate the partition table based on `partition_assignment`
         # Use `partition_assignment` to get the document indices, then map to document IDs
@@ -237,16 +265,16 @@ def create_and_populate_partition_table(partition_id, partition_assignment, docu
                     SELECT block_id, document_id, block_content, vector
                     FROM documentblocks
                     WHERE document_id = %s;
-                """).format(sql.Identifier(partition_table_name)),
+                """).format(sql.Identifier(partition_table)),
                 [document_id]
             )
 
         conn.commit()
-        print(f"Partition table {partition_table_name} populated with document blocks.")
+        print(f"Partition table {partition_table} populated with document blocks.")
         return partition_id
 
     except psycopg2.Error as e:
-        print(f"Database error while creating or populating {partition_table_name}: {e}")
+        print(f"Database error while creating or populating {partition_table}: {e}")
         conn.rollback()
         raise
     finally:
@@ -254,7 +282,7 @@ def create_and_populate_partition_table(partition_id, partition_assignment, docu
         conn.close()
 
 
-def insert_comb_role_partition_mapping(role_comb, partition_ids):
+def insert_comb_role_partition_mapping(role_comb, partition_ids, mapping_table: str | None = None):
     """
     Insert role combination to partition mappings into the CombRolePartitions table.
 
@@ -264,17 +292,23 @@ def insert_comb_role_partition_mapping(role_comb, partition_ids):
     """
     conn = get_db_connection()
     cur = conn.cursor()
+    target_mapping_table = mapping_table or comb_role_mapping_table_name()
 
     try:
         # Convert role_comb into a sorted list for consistent storage
         comb_roles_array = list(sorted(role_comb))
 
         for partition_id in partition_ids:
-            cur.execute("""
-                INSERT INTO CombRolePartitions (comb_role, partition_id)
-                VALUES (%s, %s)
-                ON CONFLICT (comb_role, partition_id) DO NOTHING;
-            """, (comb_roles_array, partition_id))
+            cur.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (comb_role, partition_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (comb_role, partition_id) DO NOTHING;
+                    """
+                ).format(sql.Identifier(target_mapping_table)),
+                (comb_roles_array, partition_id),
+            )
 
         conn.commit()
         print(f"Role combination {comb_roles_array} mapped to partitions {partition_ids}.")
@@ -287,23 +321,34 @@ def insert_comb_role_partition_mapping(role_comb, partition_ids):
         conn.close()
 
 
-def initialize_partitions_and_role_mappings(partition_assignment, comb_role_tracker, document_to_index,
-                                            num_threads=os.cpu_count(), increment_update=False):
+def initialize_partitions_and_role_mappings(
+    partition_assignment,
+    comb_role_tracker,
+    document_to_index,
+    num_threads=os.cpu_count(),
+    increment_update=False,
+    table_prefix: str | None = None,
+):
     num_threads=min(4, os.cpu_count())
     conn = get_db_connection()
     cur = conn.cursor()
 
     try:
         # Step 1: Create CombRolePartitions Mapping table once
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS CombRolePartitions (
-                comb_role INT[] NOT NULL,  -- Array of role IDs representing the combination
-                partition_id INT NOT NULL,
-                PRIMARY KEY (comb_role, partition_id)
-            );
-        """)
+        mapping_table = comb_role_mapping_table_name(table_prefix)
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} (
+                    comb_role INT[] NOT NULL,
+                    partition_id INT NOT NULL,
+                    PRIMARY KEY (comb_role, partition_id)
+                );
+                """
+            ).format(sql.Identifier(mapping_table))
+        )
         conn.commit()
-        print("CombRolePartitions table created successfully.")
+        print(f"{mapping_table} table created successfully.")
     except psycopg2.Error as e:
         print(f"Error creating CombRolePartitions table: {e}")
         conn.rollback()
@@ -318,13 +363,13 @@ def initialize_partitions_and_role_mappings(partition_assignment, comb_role_trac
         if increment_update:
             partition_futures = [
                 executor.submit(create_and_populate_partition_table_increment, partition_id, partition_assignment,
-                                document_to_index)
+                                document_to_index, table_prefix)
                 for partition_id in partition_ids
             ]
         else:
             partition_futures = [
                 executor.submit(create_and_populate_partition_table, partition_id, partition_assignment,
-                                document_to_index)
+                                document_to_index, table_prefix)
                 for partition_id in partition_ids
             ]
 
@@ -339,7 +384,7 @@ def initialize_partitions_and_role_mappings(partition_assignment, comb_role_trac
     # Step 3: Only insert combination mappings after all referenced partition tables exist.
     with ProcessPoolExecutor(max_workers=num_threads) as executor:
         comb_role_futures = [
-            executor.submit(insert_comb_role_partition_mapping, comb_role, partitions)
+            executor.submit(insert_comb_role_partition_mapping, comb_role, partitions, mapping_table)
             for comb_role, partitions in comb_role_tracker.items()
         ]
         for future in comb_role_futures:
@@ -405,6 +450,7 @@ def create_index_for_partition(
 def create_indexes_for_all_partitions(
     index_type="hnsw",
     *,
+    table_prefix: str | None = None,
     parallel: bool = True,
     max_workers: Optional[int] = None,
     hnsw_m: int = 16,
@@ -432,11 +478,12 @@ def create_indexes_for_all_partitions(
     )
     try:
         # Retrieve all partition tables
+        like_pattern = f"{_safe_identifier(table_prefix)}_partition_%" if table_prefix else "documentblocks_partition_%"
         cur.execute("""
             SELECT table_name 
             FROM information_schema.tables 
-            WHERE table_name LIKE 'documentblocks_partition_%';
-        """)
+            WHERE table_name LIKE %s;
+        """, [like_pattern])
         partition_tables = [row[0] for row in cur.fetchall()]
     except psycopg2.Error as e:
         print(f"Error retrieving partition tables: {e}")
@@ -688,14 +735,18 @@ def disable_rls_for_partitions():
         conn.close()
 
 
-def load_result_to_database(partition_assignment=None, comb_role_tracker=None, increment_update=False):
-    delete_partitions_and_role_mappings(comb_role_tracker=comb_role_tracker, increment_update=increment_update)
+def load_result_to_database(partition_assignment=None, comb_role_tracker=None, increment_update=False, table_prefix: str | None = None):
+    delete_partitions_and_role_mappings(
+        comb_role_tracker=comb_role_tracker,
+        increment_update=increment_update,
+        table_prefix=table_prefix,
+    )
     # Step 2: Fetch roles and document-to-index mapping from the database
     roles, documents, permissions, _, _ = fetch_initial_data()
     role_to_documents, document_to_index = prepare_background_data(roles, documents, permissions)
 
     # Step 3: Initialize partitions and role mappings based on the x values
     initialize_partitions_and_role_mappings(partition_assignment, comb_role_tracker, document_to_index,
-                                            increment_update=increment_update)
+                                            increment_update=increment_update, table_prefix=table_prefix)
 
     print("Partition and role mappings initialization completed.")

@@ -51,6 +51,71 @@ def _safe_index_name(table_name: str, suffix: str) -> str:
     return f"idx_{digest}_{compact_suffix}"[:_POSTGRES_IDENTIFIER_LIMIT]
 
 
+def _safe_identifier(value: str, *, prefix: str = "") -> str:
+    candidate = f"{prefix}{value}"
+    candidate = "".join(char if char.isalnum() or char == "_" else "_" for char in candidate.lower()).strip("_")
+    if not candidate:
+        candidate = "partition"
+    if len(candidate) <= _POSTGRES_IDENTIFIER_LIMIT:
+        return candidate
+    digest = hashlib.blake2b(candidate.encode("utf-8"), digest_size=6).hexdigest()
+    return f"{candidate[:_POSTGRES_IDENTIFIER_LIMIT - len(digest) - 1]}_{digest}"
+
+
+def _versioned_partition_name(table_prefix: str, partition_id: str) -> str:
+    return _safe_identifier(f"{table_prefix}_{partition_id}")
+
+
+def _rename_plan_tables(plan: KMeansPlan, table_prefix: str | None) -> KMeansPlan:
+    if not table_prefix:
+        return plan
+    prefix = _safe_identifier(str(table_prefix))
+    table_by_partition = {
+        str(partition.partition_id): _versioned_partition_name(prefix, str(partition.partition_id))
+        for partition in plan.partitions
+    }
+    id_by_partition = {
+        str(partition.partition_id): _safe_identifier(f"{prefix}_{partition.partition_id}")
+        for partition in plan.partitions
+    }
+    renamed_partitions = [
+        KMeansPartition(
+            partition_id=id_by_partition[str(partition.partition_id)],
+            cluster_id=partition.cluster_id,
+            partition_kind=partition.partition_kind,
+            table_name=table_by_partition[str(partition.partition_id)],
+            tenant_ids=partition.tenant_ids,
+            pattern_ids=partition.pattern_ids,
+            document_ids=partition.document_ids,
+            document_pattern_pairs=partition.document_pattern_pairs,
+            vector_count=partition.vector_count,
+            metadata={**dict(partition.metadata or {}), "versioned_table_prefix": prefix},
+        )
+        for partition in plan.partitions
+    ]
+    renamed_routes = [
+        TenantRoute(
+            tenant_id=route.tenant_id,
+            partition_id=id_by_partition.get(str(route.partition_id), route.partition_id),
+            table_name=table_by_partition.get(str(route.partition_id), route.table_name),
+            route_kind=route.route_kind,
+            cluster_id=route.cluster_id,
+            pattern_ids=route.pattern_ids,
+            partition_vector_count=route.partition_vector_count,
+            accessible_vector_count=route.accessible_vector_count,
+        )
+        for route in plan.tenant_routes
+    ]
+    metadata = {**dict(plan.metadata or {}), "versioned_table_prefix": prefix}
+    return KMeansPlan(
+        partitions=renamed_partitions,
+        tenant_routes=renamed_routes,
+        tenant_to_cluster=plan.tenant_to_cluster,
+        patterns=plan.patterns,
+        metadata=metadata,
+    )
+
+
 def _json_safe(value):
     if isinstance(value, float):
         return value if math.isfinite(value) else None
@@ -229,13 +294,19 @@ def clear_current_plan(*, db_connection_factory=_default_db_connection_factory) 
         conn.close()
 
 
-def save_plan(plan: KMeansPlan, *, db_connection_factory=_default_db_connection_factory) -> int:
+def save_plan(
+    plan: KMeansPlan,
+    *,
+    replace_current: bool = True,
+    db_connection_factory=_default_db_connection_factory,
+) -> int:
     invalidate_cache()
     initialize_schema(db_connection_factory=db_connection_factory)
     conn = db_connection_factory()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql.SQL("DELETE FROM {};").format(sql.Identifier(PLAN_TABLE)))
+            if replace_current:
+                cur.execute(sql.SQL("DELETE FROM {};").format(sql.Identifier(PLAN_TABLE)))
             cur.execute(
                 sql.SQL(
                     """
@@ -631,6 +702,8 @@ def materialize_plan(
     create_indexes: bool = False,
     index_type: str = "squidhnsw",
     show_progress: bool = True,
+    replace_current: bool = True,
+    drop_stale: bool = True,
     db_connection_factory=_default_db_connection_factory,
 ) -> KMeansPlan:
     print("[kmeans][materialize] waiting for global materialization lock...", flush=True)
@@ -638,9 +711,10 @@ def materialize_plan(
     print("[kmeans][materialize] acquired global materialization lock", flush=True)
     try:
         print(f"[kmeans][materialize] saving metadata for {len(plan.partitions)} partitions...", flush=True)
-        save_plan(plan, db_connection_factory=db_connection_factory)
+        save_plan(plan, replace_current=replace_current, db_connection_factory=db_connection_factory)
         valid_table_names = {str(partition.table_name) for partition in plan.partitions}
-        drop_stale_materialized_partitions(valid_table_names, db_connection_factory=db_connection_factory)
+        if drop_stale:
+            drop_stale_materialized_partitions(valid_table_names, db_connection_factory=db_connection_factory)
         iterator = tqdm(
             list(enumerate(plan.partitions, start=1)),
             desc="KMeans materialize partitions",
@@ -656,7 +730,11 @@ def materialize_plan(
                 flush=True,
             )
         if create_indexes:
-            create_indexes_for_materialized_partitions(index_type=index_type, db_connection_factory=db_connection_factory)
+            if replace_current:
+                create_indexes_for_materialized_partitions(index_type=index_type, db_connection_factory=db_connection_factory)
+            else:
+                for table_name in sorted(valid_table_names):
+                    create_index_for_partition(table_name, index_type=index_type, db_connection_factory=db_connection_factory)
         invalidate_cache()
         return plan
     finally:
@@ -813,6 +891,9 @@ def build_and_materialize_kmeans_plan(
     show_progress: bool = True,
     enable_split: bool = True,
     private_edge_top_d: int = 32,
+    table_prefix: str | None = None,
+    replace_current: bool = True,
+    drop_stale: bool = True,
     db_connection_factory=_default_db_connection_factory,
 ) -> KMeansPlan:
     print("[kmeans][planner] loading ACL rows...", flush=True)
@@ -847,6 +928,7 @@ def build_and_materialize_kmeans_plan(
         enable_split=bool(enable_split),
         private_edge_top_d=int(private_edge_top_d),
     )
+    plan = _rename_plan_tables(plan, table_prefix)
     print(
         f"[kmeans][planner] built {len(plan.partitions)} partitions; "
         f"memory_replication_factor={float(plan.metadata.get('memory_replication_factor', 0.0)):.4f}",
@@ -857,5 +939,7 @@ def build_and_materialize_kmeans_plan(
         create_indexes=create_indexes,
         index_type=index_type,
         show_progress=show_progress,
+        replace_current=replace_current,
+        drop_stale=drop_stale,
         db_connection_factory=db_connection_factory,
     )

@@ -603,7 +603,17 @@ GetScanItemsAdaptive(IndexScanDesc scan, Datum value, int baseEf)
 	}
 
 	if (!so->squidFilterEnabled)
-		return HnswSearchLayer(base, q, ep, baseEf, 0, index, support, m, false, NULL, &so->v, NULL, true, &so->tuples);
+	{
+		List	   *result = HnswSearchLayer(base, q, ep, baseEf, 0, index, support, m, false, NULL, &so->v, NULL, true, &so->tuples);
+
+		squidhnsw_last_base_ef = baseEf;
+		squidhnsw_last_final_ef = baseEf;
+		squidhnsw_last_tuples = (int) Min(so->tuples, INT_MAX);
+		squidhnsw_last_candidate_count = 0;
+		squidhnsw_last_authorized_count = 0;
+		squidhnsw_last_decision = SQUID_DECISION_PURE;
+		return result;
+	}
 
 	adaptive.baseEf = baseEf;
 	adaptive.maxEf = SquidClampEf(squidhnsw_max_ef);
@@ -612,8 +622,19 @@ GetScanItemsAdaptive(IndexScanDesc scan, Datum value, int baseEf)
 	adaptive.routeSelectivity = squidhnsw_route_selectivity;
 	adaptive.patternAllowed = SquidPatternAllowedCallback;
 	adaptive.patternAllowedArg = so;
+	adaptive.finalEf = baseEf;
+	adaptive.candidateCount = 0;
+	adaptive.authorizedCount = 0;
+	adaptive.decision = SQUID_DECISION_NONE;
 
-	return HnswSearchLayerAdaptive(base, q, ep, baseEf, 0, index, support, m, false, NULL, &so->v, true, &so->tuples, &adaptive);
+	w = HnswSearchLayerAdaptive(base, q, ep, baseEf, 0, index, support, m, false, NULL, &so->v, true, &so->tuples, &adaptive);
+	squidhnsw_last_base_ef = baseEf;
+	squidhnsw_last_final_ef = adaptive.finalEf;
+	squidhnsw_last_tuples = (int) Min(so->tuples, INT_MAX);
+	squidhnsw_last_candidate_count = adaptive.candidateCount;
+	squidhnsw_last_authorized_count = adaptive.authorizedCount;
+	squidhnsw_last_decision = adaptive.decision;
+	return w;
 }
 
 /*

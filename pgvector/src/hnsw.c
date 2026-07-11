@@ -36,6 +36,12 @@ int			squidhnsw_topk;
 double		squidhnsw_global_bound;
 double		squidhnsw_route_selectivity;
 char	   *squidhnsw_allowed_patterns;
+int			squidhnsw_last_base_ef;
+int			squidhnsw_last_final_ef;
+int			squidhnsw_last_tuples;
+int			squidhnsw_last_candidate_count;
+int			squidhnsw_last_authorized_count;
+int			squidhnsw_last_decision;
 int			vedahnsw_base_ef;
 int			vedahnsw_max_ef;
 int			vedahnsw_topk;
@@ -137,6 +143,26 @@ HnswInit(void)
 	DefineCustomStringVariable("squidhnsw.allowed_patterns", "Sets comma-separated Access Atom ids visible to the current user",
 							NULL, &squidhnsw_allowed_patterns,
 							"", PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/* These session-local values expose the last scan for diagnostics only. */
+	DefineCustomIntVariable("squidhnsw.last_base_ef", "Base ef used by the last SQUIDHNSW scan",
+							NULL, &squidhnsw_last_base_ef,
+							0, 0, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("squidhnsw.last_final_ef", "Final ef used by the last SQUIDHNSW scan",
+							NULL, &squidhnsw_last_final_ef,
+							0, 0, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("squidhnsw.last_tuples", "Graph tuples visited by the last SQUIDHNSW scan",
+							NULL, &squidhnsw_last_tuples,
+							0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("squidhnsw.last_candidate_count", "W candidate tuples measured before SQUID expansion",
+							NULL, &squidhnsw_last_candidate_count,
+							0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("squidhnsw.last_authorized_count", "Authorized W tuples measured before SQUID expansion",
+							NULL, &squidhnsw_last_authorized_count,
+							0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("squidhnsw.last_decision", "Last SQUIDHNSW decision: 0 none, 1 pure, 2 global, 3 authorized, 4 expanded",
+							NULL, &squidhnsw_last_decision,
+							0, 0, 4, PGC_USERSET, 0, NULL, NULL, NULL);
 
 
 	DefineCustomIntVariable("vedahnsw.base_ef", "Sets the base search budget for VEDAHNSW probe search",

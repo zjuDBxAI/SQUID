@@ -72,6 +72,67 @@ def _safe_index_name(table_name: str, suffix: str) -> str:
     return f"idx_{digest}_{compact_suffix}"[:_POSTGRES_IDENTIFIER_LIMIT]
 
 
+def _safe_identifier(value: str, *, prefix: str = "") -> str:
+    candidate = f"{prefix}{value}"
+    candidate = "".join(char if char.isalnum() or char == "_" else "_" for char in candidate.lower()).strip("_")
+    if not candidate:
+        candidate = "node"
+    if len(candidate) <= _POSTGRES_IDENTIFIER_LIMIT:
+        return candidate
+    digest = hashlib.blake2b(candidate.encode("utf-8"), digest_size=6).hexdigest()
+    return f"{candidate[:_POSTGRES_IDENTIFIER_LIMIT - len(digest) - 1]}_{digest}"
+
+
+def _versioned_node_table_name(table_prefix: str, node_id: str) -> str:
+    return _safe_identifier(f"{table_prefix}_{node_id}")
+
+
+def _rename_plan_tables(plan: VedaPlan, table_prefix: str | None) -> VedaPlan:
+    if not table_prefix:
+        return plan
+    prefix = _safe_identifier(str(table_prefix))
+    table_by_node = {
+        str(node.node_id): _versioned_node_table_name(prefix, str(node.node_id))
+        for node in plan.nodes
+    }
+    renamed_nodes = [
+        VedaNode(
+            node_id=node.node_id,
+            role_ids=node.role_ids,
+            pattern_ids=node.pattern_ids,
+            document_ids=node.document_ids,
+            document_pattern_pairs=node.document_pattern_pairs,
+            vector_count=node.vector_count,
+            node_kind=node.node_kind,
+            table_name=table_by_node[str(node.node_id)],
+            metadata={**dict(node.metadata or {}), "versioned_table_prefix": prefix},
+        )
+        for node in plan.nodes
+    ]
+    renamed_routes = [
+        VedaRoute(
+            user_id=route.user_id,
+            node_id=route.node_id,
+            table_name=table_by_node.get(str(route.node_id), route.table_name),
+            route_kind=route.route_kind,
+            pattern_ids=route.pattern_ids,
+            node_vector_count=route.node_vector_count,
+            accessible_vector_count=route.accessible_vector_count,
+            impurity_factor=route.impurity_factor,
+        )
+        for route in plan.user_routes
+    ]
+    metadata = {**dict(plan.metadata or {}), "versioned_table_prefix": prefix}
+    return VedaPlan(
+        algorithm=plan.algorithm,
+        patterns=plan.patterns,
+        nodes=renamed_nodes,
+        role_plans=plan.role_plans,
+        user_routes=renamed_routes,
+        metadata=metadata,
+    )
+
+
 def _recommended_worker_count(task_count: int, *, max_workers: Optional[int] = None) -> int:
     if task_count <= 1:
         return 1
@@ -224,16 +285,22 @@ def clear_current_plan(*, algorithm: str | None = None, db_connection_factory=_d
         conn.close()
 
 
-def save_plan(plan: VedaPlan, *, db_connection_factory=_default_db_connection_factory) -> int:
+def save_plan(
+    plan: VedaPlan,
+    *,
+    replace_current: bool = True,
+    db_connection_factory=_default_db_connection_factory,
+) -> int:
     invalidate_cache()
     initialize_schema(db_connection_factory=db_connection_factory)
     conn = db_connection_factory()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                sql.SQL("DELETE FROM {} WHERE algorithm = %s;").format(sql.Identifier(VEDA_PLAN_TABLE)),
-                [normalize_algorithm(plan.algorithm)],
-            )
+            if replace_current:
+                cur.execute(
+                    sql.SQL("DELETE FROM {} WHERE algorithm = %s;").format(sql.Identifier(VEDA_PLAN_TABLE)),
+                    [normalize_algorithm(plan.algorithm)],
+                )
             metadata = dict(plan.metadata or {})
             cur.execute(
                 sql.SQL(
@@ -676,6 +743,8 @@ def materialize_plan(
     create_indexes: bool = False,
     index_type: str = "hnsw",
     show_progress: bool = True,
+    replace_current: bool = True,
+    drop_stale: bool = True,
     db_connection_factory=_default_db_connection_factory,
 ) -> VedaPlan:
     print("[veda][materialize] waiting for global materialization lock...", flush=True)
@@ -683,9 +752,10 @@ def materialize_plan(
     print("[veda][materialize] acquired global materialization lock", flush=True)
     try:
         print(f"[veda][materialize] saving metadata for {len(plan.nodes)} nodes...", flush=True)
-        save_plan(plan, db_connection_factory=db_connection_factory)
+        save_plan(plan, replace_current=replace_current, db_connection_factory=db_connection_factory)
         valid_table_names = {str(node.table_name) for node in plan.nodes}
-        drop_stale_materialized_nodes(valid_table_names, algorithm=plan.algorithm, db_connection_factory=db_connection_factory)
+        if drop_stale:
+            drop_stale_materialized_nodes(valid_table_names, algorithm=plan.algorithm, db_connection_factory=db_connection_factory)
         pattern_roles = _pattern_role_map(plan.patterns)
         iterator = tqdm(
             list(enumerate(plan.nodes, start=1)),
@@ -699,7 +769,16 @@ def materialize_plan(
             elapsed = time.time() - started_at
             print(f"[veda][materialize] [{index}/{len(plan.nodes)}] materialized {table_name} in {elapsed:.2f}s", flush=True)
         if create_indexes:
-            create_indexes_for_materialized_partitions(index_type=index_type, algorithm=plan.algorithm, db_connection_factory=db_connection_factory)
+            if replace_current:
+                create_indexes_for_materialized_partitions(index_type=index_type, algorithm=plan.algorithm, db_connection_factory=db_connection_factory)
+            else:
+                for node in sorted(plan.nodes, key=lambda item: item.table_name):
+                    create_index_for_partition(
+                        node.table_name,
+                        node_kind=node.node_kind,
+                        index_type=index_type,
+                        db_connection_factory=db_connection_factory,
+                    )
         invalidate_cache()
         return plan
     finally:
@@ -716,6 +795,9 @@ def build_and_materialize_veda_plan(
     create_indexes: bool = False,
     index_type: str = "hnsw",
     show_progress: bool = True,
+    table_prefix: str | None = None,
+    replace_current: bool = True,
+    drop_stale: bool = True,
     db_connection_factory=_default_db_connection_factory,
 ) -> VedaPlan:
     plan = build_veda_plan(
@@ -727,11 +809,14 @@ def build_and_materialize_veda_plan(
         show_progress=show_progress,
         db_connection_factory=db_connection_factory,
     )
+    plan = _rename_plan_tables(plan, table_prefix)
     return materialize_plan(
         plan,
         create_indexes=create_indexes,
         index_type=index_type,
         show_progress=show_progress,
+        replace_current=replace_current,
+        drop_stale=drop_stale,
         db_connection_factory=db_connection_factory,
     )
 

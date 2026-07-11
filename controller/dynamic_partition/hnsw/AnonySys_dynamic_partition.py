@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.append(project_root)
-from controller.dynamic_partition.load_result_to_database import load_result_to_database
+from controller.dynamic_partition.load_result_to_database import create_indexes_for_all_partitions, load_result_to_database
 from basic_benchmark.initialize_dynamic_partition_tables import initialize_dynamic_partition_tables_in_comb
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -736,6 +736,8 @@ if __name__ == '__main__':
                         help="Storage parameter (alpha). Higher values increase storage. Default is 1.5")
     parser.add_argument('--recall', type=float, default=None,
                         help="Recall parameter. Default is None (will use parameters from file)")
+    parser.add_argument('--table-prefix', default=None,
+                        help="Optional versioned table prefix. When set, HONEYBEE materializes into namespaced tables.")
 
     # Parse arguments
     args = parser.parse_args()
@@ -913,7 +915,15 @@ if __name__ == '__main__':
         len(roles_in_partition_0),
     )
 
-    load_result_to_database(partition_assignment, converted_comb_role_trackers, increment_update=False)
-    initialize_dynamic_partition_tables_in_comb(index_type=None)
-    initialize_dynamic_partition_tables_in_comb(index_type="hnsw")
+    load_result_to_database(
+        partition_assignment,
+        converted_comb_role_trackers,
+        increment_update=False,
+        table_prefix=args.table_prefix,
+    )
+    if args.table_prefix:
+        create_indexes_for_all_partitions(index_type="hnsw", table_prefix=args.table_prefix)
+    else:
+        initialize_dynamic_partition_tables_in_comb(index_type=None)
+        initialize_dynamic_partition_tables_in_comb(index_type="hnsw")
     logger.info("done")

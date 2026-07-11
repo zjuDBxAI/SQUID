@@ -121,6 +121,13 @@ extern int	squidhnsw_topk;
 extern double squidhnsw_global_bound;
 extern double squidhnsw_route_selectivity;
 extern char *squidhnsw_allowed_patterns;
+/* Per-backend telemetry for the most recently completed SQUIDHNSW scan. */
+extern int	squidhnsw_last_base_ef;
+extern int	squidhnsw_last_final_ef;
+extern int	squidhnsw_last_tuples;
+extern int	squidhnsw_last_candidate_count;
+extern int	squidhnsw_last_authorized_count;
+extern int	squidhnsw_last_decision;
 extern int	vedahnsw_base_ef;
 extern int	vedahnsw_max_ef;
 extern int	vedahnsw_topk;
@@ -285,6 +292,12 @@ typedef struct HnswQuery
 
 typedef bool (*HnswPatternAllowedCallback) (void *arg, int64 pattern);
 
+#define SQUID_DECISION_NONE 0
+#define SQUID_DECISION_PURE 1
+#define SQUID_DECISION_GLOBAL_BOUND 2
+#define SQUID_DECISION_AUTHORIZED_TOPK 3
+#define SQUID_DECISION_EXPANDED 4
+
 typedef struct HnswSquidAdaptiveContext
 {
 	int			baseEf;
@@ -294,6 +307,10 @@ typedef struct HnswSquidAdaptiveContext
 	double		routeSelectivity;
 	HnswPatternAllowedCallback patternAllowed;
 	void	   *patternAllowedArg;
+	int			finalEf;
+	int			candidateCount;
+	int			authorizedCount;
+	int			decision;
 }			HnswSquidAdaptiveContext;
 
 typedef struct HnswBuildState

@@ -41,6 +41,7 @@ class PlanManifest:
     table_prefix: str
     route_relation: str
     pattern_relation: str
+    partition_relation: str
     plan_relation: str
 
     def as_dict(self) -> dict[str, object]:
@@ -64,5 +65,6 @@ def create_manifest(method: str, memory_ratio: float, version: str | int) -> Pla
         table_prefix=table_prefix,
         route_relation=_truncate(f"{table_prefix}_routes"),
         pattern_relation=_truncate(f"{table_prefix}_patterns"),
+        partition_relation=_truncate(f"{table_prefix}_partitions"),
         plan_relation=_truncate(f"{table_prefix}_plan"),
     )

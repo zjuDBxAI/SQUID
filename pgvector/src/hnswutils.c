@@ -1018,18 +1018,24 @@ SquidMaybeExpandEf(char *base, HnswSquidAdaptiveContext *adaptive, bool *expande
 
 	if (adaptive->globalBound >= 0 && frontierDistance >= adaptive->globalBound)
 	{
+		adaptive->decision = SQUID_DECISION_GLOBAL_BOUND;
 		*expanded = true;
 		return;
 	}
 
 	if (SquidAuthorizedTopKBoundReached(base, adaptive, squidWItems, frontierDistance))
 	{
+		adaptive->decision = SQUID_DECISION_AUTHORIZED_TOPK;
 		*expanded = true;
 		return;
 	}
 
 	SquidMeasureCurrentW(base, adaptive, squidWItems, &candidateCount, &authorizedCount);
+	adaptive->candidateCount = candidateCount;
+	adaptive->authorizedCount = authorizedCount;
 	*ef = SquidChooseAdaptiveEf(adaptive, candidateCount, authorizedCount);
+	adaptive->finalEf = *ef;
+	adaptive->decision = SQUID_DECISION_EXPANDED;
 	*expanded = true;
 }
 
