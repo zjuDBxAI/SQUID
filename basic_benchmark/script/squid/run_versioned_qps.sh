@@ -6,20 +6,23 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${PROJECT_ROOT}/venv/bin/python}"
 
 # ours honeybee veda effveda
-METHODS="${METHODS:-ours effveda}"
-MEMORY_VALUES="${MEMORY_VALUES:-1.0 2.0}"
+METHODS="${METHODS:-ours effveda honeybee veda}"
+MEMORY_VALUES="${MEMORY_VALUES:-1.0 2.0 3.0 4.0 5.0 6.0}"
 #1.0 2.0 3.0 4.0 5.0 6.0
 BUILD="${BUILD:-true}"
 QPS="${QPS:-false}"
 
-QUERY_COUNT="${QUERY_COUNT:-200}"
+QUERY_COUNT="${QUERY_COUNT:-10}"
 QUERY_REPETITIONS="${QUERY_REPETITIONS:-5}"
 CONCURRENCY="${CONCURRENCY:-64}"
 WARMUP_ROUNDS="${WARMUP_ROUNDS:-1}"
 EF_VALUES="${EF_VALUES:-100}"
 INDEX_MODE="${INDEX_MODE:-hnsw}"
-JIT="${JIT:-off}"
-PARALLEL_WORKERS="${PARALLEL_WORKERS:-0}"
+OURS_INDEX_TYPE="${OURS_INDEX_TYPE:-hnsw}"
+VEDA_INDEX_TYPE="${VEDA_INDEX_TYPE:-hnsw}"
+JIT="${JIT:-on}"
+PARALLEL_WORKERS="${PARALLEL_WORKERS:-2}"
+AUTH_FILTER="${AUTH_FILTER:-rls}"
 
 VERSION_PREFIX="${VERSION_PREFIX:-sweep}"
 PLANNER_TIMEOUT="${PLANNER_TIMEOUT:-3h}"
@@ -43,7 +46,9 @@ for memory in "${MEMORY_LIST[@]}"; do
         "${PYTHON_BIN}" "${SCRIPT_DIR}/build_versioned_plan.py" \
           --method "${method}" \
           --memory-ratio "${memory}" \
-          --version "${version}"
+          --version "${version}" \
+          --ours-index-type "${OURS_INDEX_TYPE}" \
+          --veda-index-type "${VEDA_INDEX_TYPE}"
     fi
     if bool_true "${QPS}"; then
       for ef in "${EF_LIST[@]}"; do
@@ -57,7 +62,8 @@ for memory in "${MEMORY_LIST[@]}"; do
           --ef-search "${ef}" \
           --index-mode "${INDEX_MODE}" \
           --jit "${JIT}" \
-          --parallel-workers "${PARALLEL_WORKERS}"
+          --parallel-workers "${PARALLEL_WORKERS}" \
+          --auth-filter "${AUTH_FILTER}"
       done
     fi
   done

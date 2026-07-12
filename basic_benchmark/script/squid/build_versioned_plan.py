@@ -46,6 +46,133 @@ def _registry_init() -> None:
         conn.close()
 
 
+def _drop_relation(cur, relation_name: str) -> None:
+    cur.execute("SELECT to_regclass(%s)", [f"public.{relation_name}"])
+    if cur.fetchone()[0] is None:
+        return
+    cur.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(relation_name)))
+
+
+def _delete_if_table_exists(cur, table_name: str, where_sql: str, params: list[object]) -> None:
+    cur.execute("SELECT to_regclass(%s)", [f"public.{table_name}"])
+    if cur.fetchone()[0] is None:
+        return
+    cur.execute(sql.SQL("DELETE FROM {} ").format(sql.Identifier(table_name)) + sql.SQL(where_sql), params)
+
+
+def _relations_with_prefix(cur, table_prefix: str) -> list[str]:
+    cur.execute(
+        """
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = current_schema()
+          AND (tablename = %s OR tablename LIKE %s)
+        ORDER BY tablename
+        """,
+        [str(table_prefix), f"{table_prefix}_%"],
+    )
+    return [str(row[0]) for row in cur.fetchall()]
+
+
+def _cleanup_kmeans_current_metadata(cur, table_prefix: str) -> None:
+    cur.execute("SELECT to_regclass('public.kmeans_current_partitions')")
+    if cur.fetchone()[0] is None:
+        return
+    cur.execute(
+        """
+        SELECT DISTINCT plan_id
+        FROM kmeans_current_partitions
+        WHERE partition_id LIKE %s
+           OR table_name LIKE %s
+        """,
+        [f"{table_prefix}_%", f"{table_prefix}_%"],
+    )
+    plan_ids = [int(row[0]) for row in cur.fetchall()]
+    if not plan_ids:
+        return
+    cur.execute("DELETE FROM kmeans_current_routes WHERE plan_id = ANY(%s)", [plan_ids])
+    cur.execute("DELETE FROM kmeans_current_partitions WHERE plan_id = ANY(%s)", [plan_ids])
+    cur.execute("DELETE FROM kmeans_current_patterns WHERE plan_id = ANY(%s)", [plan_ids])
+    cur.execute("DELETE FROM kmeans_current_plan WHERE plan_id = ANY(%s)", [plan_ids])
+
+
+def _cleanup_veda_current_metadata(cur, method: str, table_prefix: str) -> None:
+    cur.execute("SELECT to_regclass('public.veda_current_nodes')")
+    if cur.fetchone()[0] is None:
+        return
+    cur.execute(
+        """
+        SELECT DISTINCT plan_id
+        FROM veda_current_nodes
+        WHERE table_name LIKE %s
+        """,
+        [f"{table_prefix}_%"],
+    )
+    node_plan_ids = {int(row[0]) for row in cur.fetchall()}
+    cur.execute(
+        """
+        SELECT plan_id
+        FROM veda_current_plan
+        WHERE algorithm = %s
+          AND metadata->>'versioned_table_prefix' = %s
+        """,
+        [str(method), str(table_prefix)],
+    )
+    plan_ids = sorted(node_plan_ids | {int(row[0]) for row in cur.fetchall()})
+    if not plan_ids:
+        return
+    _delete_if_table_exists(cur, "veda_current_user_routes", "WHERE plan_id = ANY(%s)", [plan_ids])
+    _delete_if_table_exists(cur, "veda_current_role_plan", "WHERE plan_id = ANY(%s)", [plan_ids])
+    _delete_if_table_exists(cur, "veda_current_nodes", "WHERE plan_id = ANY(%s)", [plan_ids])
+    _delete_if_table_exists(cur, "veda_current_patterns", "WHERE plan_id = ANY(%s)", [plan_ids])
+    _delete_if_table_exists(cur, "veda_current_plan", "WHERE plan_id = ANY(%s)", [plan_ids])
+
+
+def _cleanup_existing_version(manifest: dict) -> None:
+    method = str(manifest["method"])
+    table_prefix = str(manifest["table_prefix"])
+    metadata_relations = {
+        str(manifest["plan_relation"]),
+        str(manifest["partition_relation"]),
+        str(manifest["pattern_relation"]),
+        str(manifest["route_relation"]),
+    }
+    if method == "honeybee":
+        metadata_relations.add(comb_role_mapping_table_name(table_prefix))
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT registry_id
+                FROM benchmark_plan_registry
+                WHERE (method = %s AND memory_ratio = %s)
+                   OR table_prefix = %s
+                """,
+                [method, float(manifest["memory_ratio"]), table_prefix],
+            )
+            registry_ids = [int(row[0]) for row in cur.fetchall()]
+            if registry_ids:
+                cur.execute(
+                    "SELECT relation_name FROM benchmark_plan_relations WHERE registry_id = ANY(%s)",
+                    [registry_ids],
+                )
+                metadata_relations.update(str(row[0]) for row in cur.fetchall())
+                cur.execute("DELETE FROM benchmark_plan_registry WHERE registry_id = ANY(%s)", [registry_ids])
+
+            if method == "ours":
+                _cleanup_kmeans_current_metadata(cur, table_prefix)
+            elif method in {"veda", "effveda"}:
+                _cleanup_veda_current_metadata(cur, method, table_prefix)
+
+            for relation_name in sorted(set(_relations_with_prefix(cur, table_prefix)) | metadata_relations):
+                _drop_relation(cur, relation_name)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _register_plan(manifest: dict, plan_id: int, metadata: dict) -> int:
     conn = get_db_connection()
     try:
@@ -249,6 +376,22 @@ def _honeybee_relations(table_prefix: str) -> dict[str, list[str]]:
     }
 
 
+
+
+def _grant_select_public(relations: dict[str, list[str]]) -> None:
+    table_names = sorted({name for names in relations.values() for name in names})
+    if not table_names:
+        return
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            for table_name in table_names:
+                cur.execute(sql.SQL("GRANT SELECT ON {} TO PUBLIC").format(sql.Identifier(table_name)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _build_ours(args: argparse.Namespace, manifest: dict) -> tuple[int, dict[str, list[str]], dict]:
     table_prefix = str(manifest["table_prefix"])
     budget_ratio = max(0.0, float(args.memory_ratio) - 1.0)
@@ -325,7 +468,8 @@ def _build_honeybee(args: argparse.Namespace, table_prefix: str) -> tuple[int, d
         "--table-prefix", table_prefix,
     ]
     _run(cmd, cwd=PROJECT_ROOT)
-    return 0, _honeybee_relations(table_prefix), {
+    relations = _honeybee_relations(table_prefix)
+    return 0, relations, {
         "mapping_table": comb_role_mapping_table_name(table_prefix),
         "honeybee_recall": float(args.honeybee_recall),
     }
@@ -354,6 +498,7 @@ def main() -> None:
     table_prefix = str(manifest["table_prefix"])
 
     _registry_init()
+    _cleanup_existing_version(manifest)
     if args.method == "ours":
         plan_id, relations, metadata = _build_ours(args, manifest)
     elif args.method in {"veda", "effveda"}:
@@ -363,6 +508,7 @@ def main() -> None:
     else:
         raise SystemExit(f"Unsupported method: {args.method}")
 
+    _grant_select_public(relations)
     metadata = {
         **metadata,
         "version": manifest["version"],

@@ -12,13 +12,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import queue
 import statistics
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
 
@@ -29,6 +30,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.config import get_db_connection  # noqa: E402
+from controller.baseline.HQI.qd_tree import (  # noqa: E402
+    DEFAULT_QD_TREE_PARTITION_PREFIX as HQI_DEFAULT_PARTITION_PREFIX,
+    _collect_partition_document_ids_for_user as hqi_collect_partition_document_ids_for_user,
+    _collect_relevant_partitions as hqi_collect_relevant_partitions,
+    _prepare_query_vector as hqi_prepare_query_vector,
+    gather_role_accessible_partitions as hqi_gather_role_accessible_partitions,
+    get_qd_tree_root,
+    partition_has_accessible_documents as hqi_partition_has_accessible_documents,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,7 @@ class Route:
     accessible_vectors: int = 0
     cluster_id: int = 0
     partition_id: str = ""
+    doc_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,6 +71,13 @@ class PlanSelection:
     plan_id: int | None = None
     table_prefix: str | None = None
     metadata: dict | None = None
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    values: list[tuple[float, list[tuple], int, Query]]
+    timed_elapsed: float
+    query_count: int
 
 
 class PreparedRouteCache:
@@ -142,18 +160,26 @@ def table_exists(cur, table_name: str) -> bool:
     return bool(cur.fetchone()[0])
 
 
+def method_sql_batching(method: str, args: argparse.Namespace) -> bool:
+    if args.sql_batching is not None:
+        return bool(args.sql_batching)
+    return _normalize_method_name(method) != "hqi"
+
+
 def _normalize_method_name(method: str) -> str:
     normalized = str(method).strip().lower()
     if normalized in {"squid", "ours"}:
         return "ours"
     if normalized in {"honeybee", "anonysys", "dynamic_partition"}:
         return "honeybee"
+    if normalized in {"hqi", "qdtree", "qd_tree", "qdtree_partition"}:
+        return "hqi"
     return normalized
 
 
 def resolve_versioned_plan(method: str, memory_ratio: float | None) -> PlanSelection:
     normalized = _normalize_method_name(method)
-    if memory_ratio is None or normalized in {"rls", "role"}:
+    if memory_ratio is None or normalized in {"rls", "role", "hqi"}:
         return PlanSelection(method=normalized)
     registry_method = "honeybee" if normalized == "honeybee" else normalized
     conn = get_db_connection()
@@ -441,7 +467,7 @@ def load_honeybee_routes(selection: PlanSelection | None = None) -> dict[int, tu
             partition_relation_map = _partition_relation_by_suffix(selection)
             if not table_exists(cur, mapping_table):
                 raise RuntimeError(f"Honeybee mapping table {mapping_table} is unavailable")
-            cur.execute("SELECT user_id, array_agg(role_id ORDER BY role_id) FROM userroles GROUP BY user_id")
+            cur.execute("SELECT user_id, array_agg(DISTINCT role_id ORDER BY role_id) FROM userroles GROUP BY user_id")
             role_sets = cur.fetchall()
             loaded: dict[int, tuple[Route, ...]] = {}
             for user_id, roles in role_sets:
@@ -465,10 +491,68 @@ def load_honeybee_routes(selection: PlanSelection | None = None) -> dict[int, tu
         conn.close()
 
 
+
+def _load_user_roles_for_queries(queries: list[Query]) -> dict[int, set[str]]:
+    user_ids = sorted({int(query.user_id) for query in queries})
+    if not user_ids:
+        return {}
+    roles_by_user: dict[int, set[str]] = {user_id: set() for user_id in user_ids}
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, role_id FROM UserRoles WHERE user_id = ANY(%s) ORDER BY user_id, role_id",
+                [user_ids],
+            )
+            for user_id, role_id in cur.fetchall():
+                roles_by_user.setdefault(int(user_id), set()).add(str(role_id))
+    finally:
+        conn.close()
+    return roles_by_user
+
+
+def load_hqi_routes(
+    selection: PlanSelection | None = None,
+    queries: list[Query] | None = None,
+) -> dict[Query, tuple[Route, ...]]:
+    if queries is None:
+        raise RuntimeError("HQI direct QPS requires the query workload to precompute per-query routes")
+    selection = selection or PlanSelection(method="hqi")
+    metadata = dict(selection.metadata or {})
+    tree_path = metadata.get("tree_path")
+    partition_prefix = str(metadata.get("partition_prefix") or HQI_DEFAULT_PARTITION_PREFIX)
+    root = get_qd_tree_root(tree_path=str(tree_path) if tree_path else None, partition_prefix=partition_prefix)
+    roles_by_user = _load_user_roles_for_queries(queries)
+    loaded: dict[Query, tuple[Route, ...]] = {}
+    for query in queries:
+        user_roles = roles_by_user.get(int(query.user_id), set())
+        if not user_roles:
+            loaded[query] = ()
+            continue
+        query_vector, _query_param = hqi_prepare_query_vector(query.vector)
+        centroid_partitions = hqi_collect_relevant_partitions(root, user_roles, query_vector)
+        selected_by_table = {}
+        for partition in centroid_partitions:
+            if hqi_partition_has_accessible_documents(partition, user_roles):
+                table_name = partition.table_name or f"{partition_prefix}_{partition.partition_id}"
+                selected_by_table[str(table_name)] = partition
+        for partition in hqi_gather_role_accessible_partitions(root, user_roles):
+            table_name = partition.table_name or f"{partition_prefix}_{partition.partition_id}"
+            selected_by_table.setdefault(str(table_name), partition)
+        routes: list[Route] = []
+        for table_name, partition in selected_by_table.items():
+            doc_ids = tuple(sorted(hqi_collect_partition_document_ids_for_user(partition, user_roles)))
+            if doc_ids:
+                routes.append(Route(table_name=str(table_name), pure=False, doc_ids=doc_ids))
+        loaded[query] = tuple(routes)
+    return loaded
+
 def configure_session(cur, ef_search: int, jit: str, parallel_workers: int) -> None:
     cur.execute("LOAD 'vector'")
     cur.execute(f"SET jit = {jit}")
     cur.execute(f"SET max_parallel_workers_per_gather = {int(parallel_workers)}")
+    cur.execute("SET hnsw.iterative_scan = off")
+    cur.execute("SET enable_seqscan = off")
     cur.execute(f"SET hnsw.ef_search = {int(ef_search)}")
 
 
@@ -537,6 +621,34 @@ def _route_candidate_params(route: Route, query: Query, *, use_sql_filter: bool)
     return [query.vector, query.vector, int(query.topk)]
 
 
+def _honeybee_route_candidate_select(route: Route) -> sql.Composed:
+    return sql.SQL(
+        "SELECT block_id, document_id, vector <-> %s::vector AS distance "
+        "FROM {} AS partition_table "
+        "WHERE EXISTS ("
+        "SELECT 1 FROM PermissionAssignment pa "
+        "JOIN UserRoles ur ON pa.role_id = ur.role_id "
+        "WHERE ur.user_id = %s AND pa.document_id = partition_table.document_id"
+        ") ORDER BY vector <-> %s::vector LIMIT %s"
+    ).format(sql.Identifier(route.table_name))
+
+
+def _honeybee_route_candidate_params(query: Query) -> list[object]:
+    return [query.vector, int(query.user_id), query.vector, int(query.topk)]
+
+
+def _execute_honeybee_route(
+    cur,
+    route: Route,
+    *,
+    query: Query,
+    settings: tuple[tuple[str, str], ...] = (),
+) -> list[tuple]:
+    prefix = _settings_prefix(settings) if settings else sql.SQL("")
+    cur.execute(prefix + _honeybee_route_candidate_select(route), _honeybee_route_candidate_params(query))
+    return _fetch_ann_rows(cur)
+
+
 def _candidate_insert(route: Route, *, use_sql_filter: bool) -> sql.Composed:
     return sql.SQL("INSERT INTO pg_temp.direct_pg_qps_candidates ") + _route_candidate_select(
         route, use_sql_filter=use_sql_filter
@@ -576,53 +688,59 @@ def execute_partition_query(
     ef_search: int,
     sql_batching: bool,
     postgresql_merge: bool,
+    auth_filter: str,
 ) -> tuple[list[tuple], int]:
     """Run each routed HNSW partition and merge its candidates globally."""
     used_routes = routes.get(query.user_id, ())
-    if postgresql_merge:
-        if not used_routes:
-            return [], 0
-        route_queries = [
-            sql.SQL("(")
-            + _route_candidate_select(route, use_sql_filter=not route.pure)
-            + sql.SQL(")")
-            for route in used_routes
-        ]
-        params: list[object] = []
+    use_rls = auth_filter == "rls"
+
+    def run() -> tuple[list[tuple], int]:
+        if postgresql_merge:
+            if not used_routes:
+                return [], 0
+            route_queries = [
+                sql.SQL("(")
+                + _route_candidate_select(route, use_sql_filter=(not route.pure) and not use_rls)
+                + sql.SQL(")")
+                for route in used_routes
+            ]
+            params: list[object] = []
+            for route in used_routes:
+                params.extend(_route_candidate_params(route, query, use_sql_filter=(not route.pure) and not use_rls))
+            statement = (
+                _settings_prefix(_hnsw_settings(ef_search))
+                + sql.SQL("WITH route_candidates AS MATERIALIZED (")
+                + sql.SQL(" UNION ALL " ).join(route_queries)
+                + sql.SQL(
+                    "), deduplicated AS ("
+                    "SELECT DISTINCT ON (block_id, document_id) block_id, document_id, distance "
+                    "FROM route_candidates ORDER BY block_id, document_id, distance"
+                    ") SELECT block_id, document_id, distance FROM deduplicated "
+                    "ORDER BY distance, block_id, document_id LIMIT %s"
+                )
+            )
+            params.append(int(query.topk))
+            cur.execute(statement, params)
+            return _fetch_ann_rows(cur), len(used_routes)
+
+        candidates: list[tuple] = []
+        settings = _hnsw_settings(ef_search) if sql_batching else ()
         for route in used_routes:
-            params.extend(_route_candidate_params(route, query, use_sql_filter=not route.pure))
-        statement = (
-            _settings_prefix(_hnsw_settings(ef_search))
-            + sql.SQL("WITH route_candidates AS MATERIALIZED (")
-            + sql.SQL(" UNION ALL ").join(route_queries)
-            + sql.SQL(
-                "), deduplicated AS ("
-                "SELECT DISTINCT ON (block_id, document_id) block_id, document_id, distance "
-                "FROM route_candidates ORDER BY block_id, document_id, distance"
-                ") SELECT block_id, document_id, distance FROM deduplicated "
-                "ORDER BY distance, block_id, document_id LIMIT %s"
+            candidates.extend(
+                _execute_ann_route(
+                    cur,
+                    route,
+                    query_vector=query.vector,
+                    topk=query.topk,
+                    use_sql_filter=(not route.pure) and not use_rls,
+                    settings=settings,
+                )
             )
-        )
-        params.append(int(query.topk))
-        cur.execute(statement, params)
-        return _fetch_ann_rows(cur), len(used_routes)
+        return merge_topk(candidates, query.topk), len(used_routes)
 
-    candidates: list[tuple] = []
-    settings = _hnsw_settings(ef_search) if sql_batching else ()
-    for route in used_routes:
-        candidates.extend(
-            _execute_ann_route(
-                cur,
-                route,
-                query_vector=query.vector,
-                topk=query.topk,
-                use_sql_filter=not route.pure,
-                settings=settings,
-            )
-        )
-    return merge_topk(candidates, query.topk), len(used_routes)
-
-
+    if use_rls:
+        return _execute_as_user(cur, query.user_id, run)
+    return run()
 
 def execute_ours_hnsw_query(
     cur,
@@ -631,26 +749,33 @@ def execute_ours_hnsw_query(
     *,
     ef_search: int,
     sql_batching: bool,
+    auth_filter: str,
     prepared_cache: PreparedRouteCache | None = None,
 ) -> tuple[list[tuple], int]:
-    """Run SQUID's routes with ordinary HNSW and SQL ACL filtering."""
+    """Run SQUID routes with ordinary HNSW and a selectable auth filter."""
     used_routes = _ordered_ours_routes(routes.get(query.user_id, ()))
     settings = _hnsw_settings(ef_search) if sql_batching else ()
-    candidates: list[tuple] = []
-    for route in used_routes:
-        execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
-        candidates.extend(
-            execute_route(
-                cur,
-                route,
-                query_vector=query.vector,
-                topk=query.topk,
-                use_sql_filter=not route.pure,
-                settings=settings,
-            )
-        )
-    return merge_topk(candidates, query.topk), len(used_routes)
+    use_rls = auth_filter == "rls"
 
+    def run() -> tuple[list[tuple], int]:
+        candidates: list[tuple] = []
+        for route in used_routes:
+            execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
+            candidates.extend(
+                execute_route(
+                    cur,
+                    route,
+                    query_vector=query.vector,
+                    topk=query.topk,
+                    use_sql_filter=(not route.pure) and not use_rls,
+                    settings=settings,
+                )
+            )
+        return merge_topk(candidates, query.topk), len(used_routes)
+
+    if use_rls:
+        return _execute_as_user(cur, query.user_id, run)
+    return run()
 
 def execute_veda_hnsw_query(
     cur,
@@ -659,25 +784,33 @@ def execute_veda_hnsw_query(
     *,
     ef_search: int,
     sql_batching: bool,
+    auth_filter: str,
     prepared_cache: PreparedRouteCache | None = None,
 ) -> tuple[list[tuple], int]:
-    """Run VEDA routes with ordinary HNSW and the corresponding SQL ACL filter."""
+    """Run VEDA routes with ordinary HNSW and a selectable auth filter."""
     used_routes = routes.get(query.user_id, ())
     settings = _hnsw_settings(ef_search) if sql_batching else ()
-    candidates: list[tuple] = []
-    for route in used_routes:
-        execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
-        candidates.extend(
-            execute_route(
-                cur,
-                route,
-                query_vector=query.vector,
-                topk=query.topk,
-                use_sql_filter=not route.pure,
-                settings=settings,
+    use_rls = auth_filter == "rls"
+
+    def run() -> tuple[list[tuple], int]:
+        candidates: list[tuple] = []
+        for route in used_routes:
+            execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
+            candidates.extend(
+                execute_route(
+                    cur,
+                    route,
+                    query_vector=query.vector,
+                    topk=query.topk,
+                    use_sql_filter=(not route.pure) and not use_rls,
+                    settings=settings,
+                )
             )
-        )
-    return merge_topk(candidates, query.topk), len(used_routes)
+        return merge_topk(candidates, query.topk), len(used_routes)
+
+    if use_rls:
+        return _execute_as_user(cur, query.user_id, run)
+    return run()
 
 def _ours_route_selectivity(route: Route) -> float:
     if route.partition_vectors <= 0 or route.accessible_vectors <= 0:
@@ -983,6 +1116,91 @@ def execute_veda_kernel_query(
     return merge_topk(candidates, query.topk), len(used_routes)
 
 
+def _hqi_route_candidate_select(route: Route) -> sql.Composed:
+    return sql.SQL(
+        "SELECT block_id, document_id, vector <-> %s::vector AS distance "
+        "FROM {} WHERE document_id = ANY(%s) "
+        "ORDER BY vector <-> %s::vector LIMIT %s"
+    ).format(sql.Identifier(route.table_name))
+
+
+def _hqi_route_candidate_params(route: Route, query: Query) -> list[object]:
+    return [query.vector, list(route.doc_ids), query.vector, int(query.topk)]
+
+
+def _execute_hqi_route(
+    cur,
+    route: Route,
+    *,
+    query: Query,
+    settings: tuple[tuple[str, str], ...] = (),
+) -> list[tuple]:
+    prefix = _settings_prefix(settings) if settings else sql.SQL("")
+    cur.execute(prefix + _hqi_route_candidate_select(route), _hqi_route_candidate_params(route, query))
+    return _fetch_ann_rows(cur)
+
+
+def execute_hqi_query(
+    cur,
+    query: Query,
+    routes: dict[Query, tuple[Route, ...]],
+    *,
+    ef_search: int,
+    sql_batching: bool,
+    auth_filter: str,
+) -> tuple[list[tuple], int]:
+    used_routes = routes.get(query, ())
+    settings = _hnsw_settings(ef_search) if sql_batching else ()
+    use_rls = auth_filter == "rls"
+
+    def hqi_select(route: Route) -> sql.Composed:
+        return _route_candidate_select(route, use_sql_filter=False) if use_rls else _hqi_route_candidate_select(route)
+
+    def hqi_params(route: Route) -> list[object]:
+        return _route_candidate_params(route, query, use_sql_filter=False) if use_rls else _hqi_route_candidate_params(route, query)
+
+    def run() -> tuple[list[tuple], int]:
+        if not used_routes:
+            return [], 0
+        if sql_batching:
+            statement = _settings_prefix(settings) + sql.SQL("WITH route_candidates AS MATERIALIZED (")
+            statement += sql.SQL(" UNION ALL " ).join(
+                sql.SQL("(") + hqi_select(route) + sql.SQL(")")
+                for route in used_routes
+            )
+            statement += sql.SQL(
+                "), deduplicated AS ("
+                "SELECT DISTINCT ON (block_id, document_id) block_id, document_id, distance "
+                "FROM route_candidates ORDER BY block_id, document_id, distance"
+                ") SELECT block_id, document_id, distance FROM deduplicated "
+                "ORDER BY distance, block_id, document_id LIMIT %s"
+            )
+            params: list[object] = []
+            for route in used_routes:
+                params.extend(hqi_params(route))
+            params.append(int(query.topk))
+            cur.execute(statement, params)
+            return _fetch_ann_rows(cur), len(used_routes)
+
+        candidates: list[tuple] = []
+        for route in used_routes:
+            if use_rls:
+                candidates.extend(
+                    _execute_ann_route(
+                        cur,
+                        route,
+                        query_vector=query.vector,
+                        topk=query.topk,
+                        use_sql_filter=False,
+                        settings=settings,
+                    )
+                )
+            else:
+                candidates.extend(_execute_hqi_route(cur, route, query=query, settings=settings))
+        return merge_topk(candidates, query.topk), len(used_routes)
+
+    return _execute_as_user(cur, query.user_id, run) if use_rls else run()
+
 def _paper_global_bound(rows: list[tuple], topk: int) -> float:
     if len(rows) < topk:
         return float("inf")
@@ -1025,29 +1243,82 @@ def _preview(values: list[str], limit: int = 5) -> str:
     return preview if len(values) <= limit else f"{preview}, ... (+{len(values) - limit})"
 
 
+def _ensure_query_roles_available(cur, user_ids: set[int], label: str) -> None:
+    if not user_ids:
+        return
+    user_names = sorted(str(user_id) for user_id in user_ids)
+    cur.execute(
+        """
+        SELECT requested.user_id
+        FROM unnest(%s::text[]) AS requested(user_id)
+        LEFT JOIN pg_roles role_entry ON role_entry.rolname = requested.user_id
+        WHERE role_entry.oid IS NULL
+           OR NOT pg_has_role(current_user, requested.user_id, 'MEMBER')
+        ORDER BY requested.user_id
+        LIMIT 5
+        """,
+        [user_names],
+    )
+    unavailable_users = [str(row[0]) for row in cur.fetchall()]
+    if unavailable_users:
+        raise RuntimeError(
+            f"{label} direct QPS cannot switch to query users: "
+            f"{_preview(unavailable_users)}. Initialize user database roles and grants first."
+        )
+
+
+def _install_partition_rls_policies(cur, table_names: set[str]) -> None:
+    if not table_names:
+        return
+    cur.execute("GRANT SELECT ON PermissionAssignment TO PUBLIC")
+    cur.execute("GRANT SELECT ON UserRoles TO PUBLIC")
+    for table_name in sorted(table_names):
+        table_ident = sql.Identifier(table_name)
+        cur.execute(sql.SQL("GRANT SELECT ON {} TO PUBLIC").format(table_ident))
+        cur.execute(sql.SQL("ALTER TABLE {} ENABLE ROW LEVEL SECURITY").format(table_ident))
+        cur.execute(sql.SQL("ALTER TABLE {} FORCE ROW LEVEL SECURITY").format(table_ident))
+        cur.execute(sql.SQL("DROP POLICY IF EXISTS direct_pg_qps_rls_policy ON {}").format(table_ident))
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE POLICY direct_pg_qps_rls_policy ON {} FOR SELECT
+                USING (
+                    EXISTS (
+                        SELECT 1
+                        FROM PermissionAssignment pa
+                        JOIN UserRoles ur ON pa.role_id = ur.role_id
+                        WHERE pa.document_id = {}.document_id
+                          AND ur.user_id = current_user::int
+                    )
+                )
+                """
+            ).format(table_ident, table_ident)
+        )
+
 def validate_method_prerequisites(
     name: str,
     queries: list[Query],
     routes: dict[int, tuple[Route, ...]] | None,
     *,
     index_mode: str,
+    auth_filter: str,
 ) -> None:
     """Fail before worker startup when a baseline has not been materialized."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             if name == "rls":
-                cur.execute("SELECT relrowsecurity FROM pg_class WHERE oid = 'documentblocks'::regclass")
+                cur.execute("SELECT relrowsecurity FROM pg_class WHERE oid = %s::regclass", ["documentblocks"])
                 row = cur.fetchone()
                 rls_enabled = bool(row and row[0])
-                cur.execute("SELECT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = 'documentblocks'::regclass)")
+                cur.execute("SELECT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = %s::regclass)", ["documentblocks"])
                 has_policy = bool(cur.fetchone()[0])
                 sample_user = str(queries[0].user_id) if queries else ""
                 cur.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)", [sample_user])
                 has_user_role = bool(cur.fetchone()[0])
-                cur.execute("SELECT has_table_privilege(%s, 'documentblocks', 'SELECT')", [sample_user])
+                cur.execute("SELECT has_table_privilege(%s, %s, %s)", [sample_user, "documentblocks", "SELECT"])
                 has_select = bool(cur.fetchone()[0])
-                cur.execute("SELECT pg_has_role(current_user, %s, 'MEMBER')", [sample_user])
+                cur.execute("SELECT pg_has_role(current_user, %s, %s)", [sample_user, "MEMBER"])
                 can_set_role = bool(cur.fetchone()[0])
                 if not (rls_enabled and has_policy and has_user_role and has_select and can_set_role):
                     raise RuntimeError(
@@ -1057,8 +1328,23 @@ def validate_method_prerequisites(
                         "Initialize RLS first; this connection-reuse harness also requires the benchmark login "
                         "to be a member of each user role, or it must use per-user database connections like the original baseline."
                     )
+                return
+
+            requested_users = {int(query.user_id) for query in queries}
+            if name == "hqi":
+                missing_queries = [str(index) for index, query in enumerate(queries) if query not in (routes or {})]
+                empty_queries = [
+                    str(index) for index, query in enumerate(queries)
+                    if not tuple((routes or {}).get(query, ()))
+                ]
+                if missing_queries or empty_queries:
+                    affected = sorted(set(missing_queries + empty_queries), key=int)
+                    raise RuntimeError(
+                        f"HQI has no materialized route for query indexes: {_preview(affected)}. "
+                        "Rebuild or persist the QD-tree baseline before direct QPS."
+                    )
+                required_routes = [route for query in queries for route in (routes or {}).get(query, ())]
             else:
-                requested_users = {int(query.user_id) for query in queries}
                 route_users = set(routes or {})
                 missing_users = sorted(str(user_id) for user_id in requested_users - route_users)
                 empty_users = sorted(
@@ -1071,83 +1357,85 @@ def validate_method_prerequisites(
                         f"{name} has no materialized route for query users: {_preview(affected)}. "
                         "Rebuild this baseline before direct QPS."
                     )
-
                 required_routes = [route for user_id in requested_users for route in (routes or {}).get(user_id, ())]
-                table_names = {route.table_name for route in required_routes}
-                missing_tables = _missing_tables(cur, table_names)
-                if missing_tables:
+
+            table_names = {route.table_name for route in required_routes}
+            missing_tables = _missing_tables(cur, table_names)
+            if missing_tables:
+                raise RuntimeError(
+                    f"{name} metadata references missing partition tables: {_preview(missing_tables)}. "
+                    "Rebuild this baseline before direct QPS."
+                )
+
+            if name == "role":
+                missing_indexes = _tables_without_index_am(cur, table_names, "hnsw")
+                if missing_indexes:
                     raise RuntimeError(
-                        f"{name} metadata references missing partition tables: {_preview(missing_tables)}. "
-                        "Rebuild this baseline before direct QPS."
+                        "ROLE partitions are missing HNSW indexes: "
+                        f"{_preview(missing_indexes)}. Rebuild ROLE indexes before direct QPS."
+                    )
+            elif name == "honeybee":
+                _ensure_query_roles_available(cur, requested_users, "HONEYBEE")
+                missing_indexes = _tables_without_index_am(cur, table_names, "hnsw")
+                if missing_indexes:
+                    raise RuntimeError(
+                        "HONEYBEE partitions are missing HNSW indexes: "
+                        f"{_preview(missing_indexes)}. Rebuild HONEYBEE before direct QPS."
+                    )
+            elif name == "hqi":
+                _ensure_query_roles_available(cur, requested_users, "HQI")
+                missing_indexes = _tables_without_index_am(cur, table_names, "hnsw")
+                if missing_indexes:
+                    raise RuntimeError(
+                        "HQI partitions are missing HNSW indexes: "
+                        f"{_preview(missing_indexes)}. Run controller/baseline/HQI/persist_tree.py --index-type hnsw."
+                    )
+            elif name == "ours":
+                access_method = "hnsw" if index_mode == "hnsw" else "squidhnsw"
+                missing_indexes = _tables_without_index_am(cur, table_names, access_method)
+                if missing_indexes:
+                    raise RuntimeError(
+                        f"SQUID partitions are missing {access_method} indexes: "
+                        f"{_preview(missing_indexes)}. Rebuild SQUID with --index-type {access_method}."
+                    )
+            elif name in {"veda", "effveda"}:
+                if index_mode == "hnsw":
+                    checked_tables = table_names
+                    access_method = "hnsw"
+                else:
+                    checked_tables = {
+                        route.table_name for route in required_routes
+                        if route.route_kind in {"index", "impure_index"}
+                    }
+                    access_method = "vedahnsw"
+                missing_indexes = _tables_without_index_am(cur, checked_tables, access_method)
+                if missing_indexes:
+                    raise RuntimeError(
+                        f"{name} routes are missing {access_method} indexes: {_preview(missing_indexes)}. "
+                        f"Rebuild the VEDA baseline with --index-type {access_method}."
                     )
 
-                if name == "role":
-                    missing_indexes = _tables_without_index_am(cur, table_names, "hnsw")
-                    if missing_indexes:
-                        raise RuntimeError(
-                            "ROLE partitions are missing HNSW indexes: "
-                            f"{_preview(missing_indexes)}. Rebuild ROLE indexes before direct QPS."
-                        )
-                elif name == "honeybee":
-                    user_ids = sorted(str(user_id) for user_id in requested_users)
-                    cur.execute(
-                        """
-                        SELECT requested.user_id
-                        FROM unnest(%s::text[]) AS requested(user_id)
-                        LEFT JOIN pg_roles role_entry ON role_entry.rolname = requested.user_id
-                        WHERE role_entry.oid IS NULL
-                           OR NOT pg_has_role(current_user, requested.user_id, 'MEMBER')
-                        ORDER BY requested.user_id
-                        LIMIT 5
-                        """,
-                        [user_ids],
-                    )
-                    unavailable_users = [str(row[0]) for row in cur.fetchall()]
-                    if unavailable_users:
-                        raise RuntimeError(
-                            "HONEYBEE direct QPS cannot switch to query users: "
-                            f"{_preview(unavailable_users)}. Initialize user database roles and grants first."
-                        )
-                    missing_indexes = _tables_without_index_am(cur, table_names, "hnsw")
-                    if missing_indexes:
-                        raise RuntimeError(
-                            "HONEYBEE partitions are missing HNSW indexes: "
-                            f"{_preview(missing_indexes)}. Rebuild HONEYBEE before direct QPS."
-                        )
-                elif name == "ours":
-                    access_method = "hnsw" if index_mode == "hnsw" else "squidhnsw"
-                    missing_indexes = _tables_without_index_am(cur, table_names, access_method)
-                    if missing_indexes:
-                        raise RuntimeError(
-                            f"SQUID partitions are missing {access_method} indexes: "
-                            f"{_preview(missing_indexes)}. Rebuild SQUID with --index-type {access_method}."
-                        )
-                elif name in {"veda", "effveda"}:
-                    if index_mode == "hnsw":
-                        checked_tables = table_names
-                        access_method = "hnsw"
-                    else:
-                        checked_tables = {
-                            route.table_name for route in required_routes
-                            if route.route_kind in {"index", "impure_index"}
-                        }
-                        access_method = "vedahnsw"
-                    missing_indexes = _tables_without_index_am(cur, checked_tables, access_method)
-                    if missing_indexes:
-                        raise RuntimeError(
-                            f"{name} routes are missing {access_method} indexes: {_preview(missing_indexes)}. "
-                            f"Rebuild the VEDA baseline with --index-type {access_method}."
-                        )
+            if auth_filter == "rls":
+                _ensure_query_roles_available(cur, requested_users, name.upper())
+                _install_partition_rls_policies(cur, table_names)
+                conn.commit()
     finally:
         conn.close()
-
 
 def _execute_as_user(cur, user_id: int, callback):
     cur.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(str(int(user_id)))))
     try:
-        return callback()
-    finally:
+        result = callback()
+    except BaseException:
+        cur.connection.rollback()
+        try:
+            cur.execute("RESET ROLE")
+        except BaseException:
+            cur.connection.rollback()
+        raise
+    else:
         cur.execute("RESET ROLE")
+        return result
 
 
 def execute_rls_query(cur, query: Query, *, ef_search: int, sql_batching: bool) -> tuple[list[tuple], int]:
@@ -1169,6 +1457,60 @@ def execute_rls_query(cur, query: Query, *, ef_search: int, sql_batching: bool) 
     )
 
 
+def execute_honeybee_partition_query(
+    cur,
+    query: Query,
+    routes: dict[int, tuple[Route, ...]],
+    *,
+    ef_search: int,
+    sql_batching: bool,
+    postgresql_merge: bool,
+    auth_filter: str,
+) -> tuple[list[tuple], int]:
+    used_routes = routes.get(query.user_id, ())
+    settings = _hnsw_settings(ef_search) if sql_batching else ()
+    use_rls = auth_filter == "rls"
+    if postgresql_merge:
+        if not used_routes:
+            return [], 0
+        statement = _settings_prefix(settings) + sql.SQL("WITH route_candidates AS MATERIALIZED (")
+        statement += sql.SQL(" UNION ALL " ).join(
+            sql.SQL("(")
+            + (_route_candidate_select(route, use_sql_filter=False) if use_rls else _honeybee_route_candidate_select(route))
+            + sql.SQL(")")
+            for route in used_routes
+        )
+        statement += sql.SQL(
+            "), deduplicated AS ("
+            "SELECT DISTINCT ON (block_id, document_id) block_id, document_id, distance "
+            "FROM route_candidates ORDER BY block_id, document_id, distance"
+            ") SELECT block_id, document_id, distance FROM deduplicated "
+            "ORDER BY distance, block_id, document_id LIMIT %s"
+        )
+        params: list[object] = []
+        for route in used_routes:
+            params.extend(_route_candidate_params(route, query, use_sql_filter=False) if use_rls else _honeybee_route_candidate_params(query))
+        params.append(int(query.topk))
+        cur.execute(statement, params)
+        return _fetch_ann_rows(cur), len(used_routes)
+
+    candidates: list[tuple] = []
+    for route in used_routes:
+        if use_rls:
+            candidates.extend(
+                _execute_ann_route(
+                    cur,
+                    route,
+                    query_vector=query.vector,
+                    topk=query.topk,
+                    use_sql_filter=False,
+                    settings=settings,
+                )
+            )
+        else:
+            candidates.extend(_execute_honeybee_route(cur, route, query=query, settings=settings))
+    return merge_topk(candidates, query.topk), len(used_routes)
+
 def execute_honeybee_query(
     cur,
     query: Query,
@@ -1177,16 +1519,22 @@ def execute_honeybee_query(
     ef_search: int,
     sql_batching: bool,
     postgresql_merge: bool,
+    auth_filter: str,
 ) -> tuple[list[tuple], int]:
-    # Dynamic-partition tables may carry RLS policies, so run as the query user.
-    return _execute_as_user(
-        cur,
-        query.user_id,
-        lambda: execute_partition_query(
-            cur, query, routes, ef_search=ef_search, sql_batching=sql_batching, postgresql_merge=postgresql_merge
-        ),
-    )
+    def run() -> tuple[list[tuple], int]:
+        return execute_honeybee_partition_query(
+            cur,
+            query,
+            routes,
+            ef_search=ef_search,
+            sql_batching=sql_batching,
+            postgresql_merge=postgresql_merge,
+            auth_filter=auth_filter,
+        )
 
+    if auth_filter == "rls":
+        return _execute_as_user(cur, query.user_id, run)
+    return run()
 
 def run_method(
     name: str,
@@ -1197,13 +1545,20 @@ def run_method(
 ) -> dict[str, float]:
     if name != "rls" and routes is None:
         raise RuntimeError(f"{name} has no routes")
-    validate_method_prerequisites(name, queries, routes, index_mode=args.index_mode)
+    validate_method_prerequisites(name, queries, routes, index_mode=args.index_mode, auth_filter=args.auth_filter)
     measured_queries = queries * max(1, int(args.query_repetitions))
-    batches = round_robin_batches(measured_queries, args.concurrency)
-    ready = threading.Barrier(len(batches) + 1)
+    worker_count = min(max(1, int(args.concurrency)), max(1, len(measured_queries)))
+    warmup_batches = round_robin_batches(measured_queries, worker_count)
+    scheduler = getattr(args, "scheduler", "dynamic")
+    work_queue: queue.Queue[Query] | None = None
+    if scheduler == "dynamic":
+        work_queue = queue.Queue()
+        for query in measured_queries:
+            work_queue.put(query)
+    ready = threading.Barrier(len(warmup_batches) + 1)
     start = threading.Event()
 
-    def worker(batch: list[Query]) -> list[tuple[float, list[tuple], int, Query]]:
+    def worker(warmup_batch: list[Query]) -> WorkerResult:
         conn = None
         try:
             conn = get_db_connection()
@@ -1212,7 +1567,6 @@ def run_method(
                 prepared_cache = PreparedRouteCache() if args.prepare_routes else None
                 if name == "ours":
                     # Match the SQUID search path, which forces its custom index only.
-                    cur.execute("SET enable_seqscan = off")
                     cur.execute("SET enable_bitmapscan = off")
                 if args.postgresql_merge and name in {"ours", "veda", "effveda"}:
                     cur.execute(
@@ -1224,7 +1578,7 @@ def run_method(
                 def execute_query(query: Query) -> tuple[list[tuple], int]:
                     if name == "rls":
                         return execute_rls_query(
-                            cur, query, ef_search=args.ef_search, sql_batching=args.sql_batching
+                            cur, query, ef_search=args.ef_search, sql_batching=method_sql_batching(name, args)
                         )
                     if name == "honeybee":
                         return execute_honeybee_query(
@@ -1232,8 +1586,18 @@ def run_method(
                             query,
                             routes,
                             ef_search=args.ef_search,
-                            sql_batching=args.sql_batching,
+                            sql_batching=method_sql_batching(name, args),
                             postgresql_merge=args.postgresql_merge,
+                            auth_filter=args.auth_filter,
+                        )
+                    if name == "hqi":
+                        return execute_hqi_query(
+                            cur,
+                            query,
+                            routes,
+                            ef_search=args.ef_search,
+                            sql_batching=method_sql_batching(name, args),
+                            auth_filter=args.auth_filter,
                         )
                     if name == "ours":
                         if args.index_mode == "hnsw":
@@ -1242,7 +1606,8 @@ def run_method(
                                 query,
                                 routes,
                                 ef_search=args.ef_search,
-                                sql_batching=args.sql_batching,
+                                sql_batching=method_sql_batching(name, args),
+                                auth_filter=args.auth_filter,
                                 prepared_cache=prepared_cache,
                             )
                         return execute_ours_kernel_query(
@@ -1251,7 +1616,7 @@ def run_method(
                             routes,
                             args.ef_search,
                             args.squidhnsw_max_ef,
-                            sql_batching=args.sql_batching,
+                            sql_batching=method_sql_batching(name, args),
                             postgresql_merge=args.postgresql_merge,
                         )
                     if name in {"veda", "effveda"}:
@@ -1261,7 +1626,8 @@ def run_method(
                                 query,
                                 routes,
                                 ef_search=args.ef_search,
-                                sql_batching=args.sql_batching,
+                                sql_batching=method_sql_batching(name, args),
+                                auth_filter=args.auth_filter,
                                 prepared_cache=prepared_cache,
                             )
                         return execute_veda_kernel_query(
@@ -1270,7 +1636,7 @@ def run_method(
                             routes,
                             args.ef_search,
                             args.vedahnsw_max_ef,
-                            sql_batching=args.sql_batching,
+                            sql_batching=method_sql_batching(name, args),
                             postgresql_merge=args.postgresql_merge,
                         )
                     return execute_partition_query(
@@ -1278,23 +1644,43 @@ def run_method(
                         query,
                         routes,
                         ef_search=args.ef_search,
-                        sql_batching=args.sql_batching,
+                        sql_batching=method_sql_batching(name, args),
                         postgresql_merge=args.postgresql_merge,
+                        auth_filter=args.auth_filter,
                     )
 
                 for _ in range(args.warmup_rounds):
-                    for query in batch:
+                    for query in warmup_batch:
                         execute_query(query)
 
                 ready.wait()
                 start.wait()
+                worker_started = time.perf_counter()
                 values: list[tuple[float, list[tuple], int, Query]] = []
-                for query in batch:
+
+                def run_timed_query(query: Query) -> None:
                     started = time.perf_counter()
                     result, route_count = execute_query(query)
                     query_elapsed = time.perf_counter() - started
                     values.append((query_elapsed, result, route_count, query))
-                return values
+
+                if scheduler == "dynamic":
+                    assert work_queue is not None
+                    while True:
+                        try:
+                            query = work_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            run_timed_query(query)
+                        finally:
+                            work_queue.task_done()
+                else:
+                    for query in warmup_batch:
+                        run_timed_query(query)
+
+                timed_elapsed = time.perf_counter() - worker_started
+                return WorkerResult(values, timed_elapsed, len(values))
 
         except BaseException:
             # A worker that fails before the common start must not strand peers at the barrier.
@@ -1306,8 +1692,9 @@ def run_method(
                 conn.close()
 
     values: list[tuple[float, list[tuple], int, Query]] = []
-    with ThreadPoolExecutor(max_workers=len(batches)) as executor:
-        futures = [executor.submit(worker, batch) for batch in batches]
+    worker_results: list[WorkerResult] = []
+    with ThreadPoolExecutor(max_workers=len(warmup_batches)) as executor:
+        futures = [executor.submit(worker, batch) for batch in warmup_batches]
         try:
             ready.wait()
         except threading.BrokenBarrierError as exc:
@@ -1320,9 +1707,14 @@ def run_method(
         started = time.perf_counter()
         start.set()
         for future in as_completed(futures):
-            values.extend(future.result())
-    elapsed = time.perf_counter() - started
+            worker_result = future.result()
+            worker_results.append(worker_result)
+            values.extend(worker_result.values)
+    total_elapsed = time.perf_counter() - started
+    worker_elapsed = [result.timed_elapsed for result in worker_results if result.query_count > 0]
+    elapsed = max(worker_elapsed) if worker_elapsed else total_elapsed
     latencies = [item[0] for item in values]
+    route_counts = [item[2] for item in values]
 
     recalls: list[float] = []
     result_counts: list[int] = []
@@ -1347,19 +1739,34 @@ def run_method(
         "queries": len(values),
         "unique_queries": len(queries),
         "query_repetitions": max(1, int(args.query_repetitions)),
+        "scheduler": scheduler,
         "qps": len(values) / elapsed,
         "avg_latency_ms": statistics.mean(latencies) * 1000,
         "p50_latency_ms": percentile(latencies, 0.50) * 1000,
         "p95_latency_ms": percentile(latencies, 0.95) * 1000,
         "p99_latency_ms": percentile(latencies, 0.99) * 1000,
+        "max_latency_ms": max(latencies) * 1000,
         "recall_at_k": statistics.mean(recalls),
-        "avg_routes": statistics.mean(item[2] for item in values),
+        "avg_routes": statistics.mean(route_counts),
+        "p50_routes": percentile(route_counts, 0.50),
+        "p95_routes": percentile(route_counts, 0.95),
+        "max_routes": max(route_counts),
         "avg_results": statistics.mean(result_counts),
         "complete_result_rate": statistics.mean(complete_results),
         "wall_time_seconds": elapsed,
+        "total_wall_time_seconds": total_elapsed,
+        "sum_latency_seconds": sum(latencies),
+        "effective_concurrency": sum(latencies) / elapsed if elapsed > 0 else 0.0,
+        "worker_elapsed_min_seconds": min(worker_elapsed) if worker_elapsed else 0.0,
+        "worker_elapsed_p50_seconds": percentile(worker_elapsed, 0.50) if worker_elapsed else 0.0,
+        "worker_elapsed_p95_seconds": percentile(worker_elapsed, 0.95) if worker_elapsed else 0.0,
+        "worker_elapsed_max_seconds": max(worker_elapsed) if worker_elapsed else 0.0,
+        "worker_query_count_min": min(result.query_count for result in worker_results) if worker_results else 0,
+        "worker_query_count_max": max(result.query_count for result in worker_results) if worker_results else 0,
         "ef_search": int(args.ef_search),
         "index_mode": args.index_mode,
-        "sql_batching": bool(args.sql_batching),
+        "auth_filter": args.auth_filter,
+        "sql_batching": method_sql_batching(name, args),
         "prepare_routes": bool(args.prepare_routes),
         "merge_location": "postgresql" if args.postgresql_merge else "python",
         "squidhnsw_max_ef": int(args.squidhnsw_max_ef) if name == "ours" else None,
@@ -1369,28 +1776,32 @@ def run_method(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Direct PostgreSQL vector-search QPS benchmark")
-    parser.add_argument("--methods", nargs="+", default=["rls", "role", "honeybee", "ours", "veda", "effveda"])
+    parser.add_argument("--methods", nargs="+", default=["rls", "role", "honeybee", "hqi", "ours", "veda", "effveda"])
     parser.add_argument("--query-file", type=Path, default=PROJECT_ROOT / "basic_benchmark" / "query_dataset.json")
     parser.add_argument("--ground-truth-file", type=Path, default=PROJECT_ROOT / "basic_benchmark" / "ground_truth_cache.json")
     parser.add_argument("--query-count", type=int, default=200)
     parser.add_argument("--query-repetitions", type=int, default=5,
                         help="Repeat the fixed query workload during measurement to reduce sub-second QPS noise")
     parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--scheduler", choices=["dynamic", "static"], default="dynamic",
+                        help="Query scheduling during timed QPS. dynamic uses a shared worker queue; static preserves the old round-robin batches.")
     parser.add_argument("--warmup-rounds", type=int, default=1)
     parser.add_argument("--ef-search", type=int, default=100,
                         help="HNSW ef_search, or SQUIDHNSW base_ef for --methods ours")
     parser.add_argument(
         "--index-mode",
         choices=["native", "hnsw"],
-        default="native",
+        default="hnsw",
         help="native uses SQUIDHNSW/VEDAHNSW; hnsw compares all partition methods with ordinary HNSW",
     )
+    parser.add_argument("--auth-filter", choices=["rls", "native"], default="rls",
+                        help="Authorization filter for partition methods. rls SET ROLEs to the query user and relies on table RLS policies; native uses each method original SQL/pattern filter.")
     parser.add_argument("--squidhnsw-max-ef", type=int, default=1000,
                         help="Adaptive SQUIDHNSW expansion cap for --methods ours")
     parser.add_argument("--vedahnsw-max-ef", type=int, default=5000,
                         help="VEDAHNSW expansion cap for --methods veda effveda")
-    parser.add_argument("--sql-batching", action=argparse.BooleanOptionalAction, default=True,
-                        help="Send each route GUC configuration and ANN SELECT in one round trip (default: enabled)")
+    parser.add_argument("--sql-batching", action=argparse.BooleanOptionalAction, default=None,
+                        help="Batch route SQL where enabled. Default: enabled except HQI, which uses per-route mode.")
     parser.add_argument("--prepare-routes", action=argparse.BooleanOptionalAction, default=True,
                         help="PREPARE repeated per-route HNSW SELECT statements inside each worker connection")
     parser.add_argument("--postgresql-merge", action="store_true",
@@ -1407,11 +1818,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.index_mode == "hnsw" and args.postgresql_merge:
         parser.error("--postgresql-merge is only available with --index-mode native")
+    if args.auth_filter == "rls" and args.index_mode == "native":
+        native_methods = {_normalize_method_name(method) for method in args.methods} & {"ours", "veda", "effveda"}
+        if native_methods:
+            parser.error("--auth-filter rls requires --index-mode hnsw for ours/veda/effveda; use --auth-filter native with --index-mode native for the custom index path")
 
     queries = load_queries(args.query_file, args.ground_truth_file, args.query_count)
     loaders: dict[str, Callable[[PlanSelection], dict[int, tuple[Route, ...]]]] = {
         "role": lambda selection: load_role_routes(),
         "honeybee": load_honeybee_routes,
+        "hqi": lambda selection: load_hqi_routes(selection, queries),
         "ours": load_ours_routes,
         "veda": lambda selection: load_veda_routes("veda", selection),
         "effveda": lambda selection: load_veda_routes("effveda", selection),
@@ -1433,7 +1849,7 @@ def main() -> None:
         method_label = "_".join(_normalize_method_name(method) for method in args.methods)
         memory_label = "current" if args.memory_ratio is None else ("memory_" + str(float(args.memory_ratio)).replace(".", "p"))
         ef_label = f"ef_{int(args.ef_search)}"
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         output_path = args.output_root / method_label / memory_label / ef_label / f"{timestamp}.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(summaries, indent=2, sort_keys=True) + "\n")
