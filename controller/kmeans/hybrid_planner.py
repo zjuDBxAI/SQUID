@@ -1374,12 +1374,12 @@ class HybridACLKMeansPlanner:
 
         operation_rank = {
             "split_overlap": 0,
-            "merge_extract_overlap": 1,
-            "move_left": 2,
-            "move_right": 3,
+            "move_left": 1,
+            "move_right": 2,
+            "merge_extract_overlap": 3,
             "full": 4,
         }
-        operations = ("full", "move_left", "move_right", "merge_extract_overlap", "split_overlap")
+        operations = ("split_overlap", "move_left", "move_right", "merge_extract_overlap", "full")
 
         def group_selectivity_profile(group_id: int, group: dict[str, object]) -> dict[str, object] | None:
             partition_vectors = int(group.get("vector_count", 0))
@@ -1830,7 +1830,7 @@ class HybridACLKMeansPlanner:
                     continue
                 delta_latency = float(after_cost) - float(before_cost)
                 op_rank = int(operation_rank[str(operation)])
-                rank = (float(delta_latency), int(max_partition_size), int(op_rank))
+                rank = (float(delta_latency), int(op_rank), int(max_partition_size))
                 if best is None or rank < best[0]:
                     best = (rank, str(operation), float(delta_latency), int(memory_saved), int(max_partition_size), specs)
             if best is None:
@@ -1890,9 +1890,9 @@ class HybridACLKMeansPlanner:
                     int(candidate["latency_class"]),
                     float(candidate["heap_score"]),
                     float(candidate["delta_latency"]),
+                    int(operation_rank[str(candidate["operation"])]),
                     int(candidate["max_result_partition_size"]),
                     -int(candidate["memory_saved"]),
-                    int(operation_rank[str(candidate["operation"])]),
                     int(edge[0]),
                     int(edge[1]),
                     int(candidate["left_version"]),
@@ -1978,9 +1978,9 @@ class HybridACLKMeansPlanner:
                     _latency_class,
                     _heap_score,
                     _delta_latency,
+                    _operation_rank,
                     _max_partition_size,
                     _negative_memory_saved,
-                    _operation_rank,
                     left_id,
                     right_id,
                     left_version,
@@ -2341,11 +2341,11 @@ class HybridACLKMeansPlanner:
             "total_latency_delta": float(total_latency_delta) + float(selectivity_refine_cost_delta) - float(tenant_similarity_total_gain),
             "cost_initial": float(initial_cost),
             "cost_final": float(current_cost),
-            "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; heap first takes delta_latency<=0 memory-saving candidates, then ranks positive-loss candidates by delta_latency/memory_saved",
+            "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; if delta_latency ties, use operation order split_overlap, move_left, move_right, merge_extract_overlap, full, so full is last; heap first takes delta_latency<=0 memory-saving candidates, ranks positive-loss candidates by delta_latency/memory_saved, and uses the same full-last tie-break when costs tie",
             "cost_model": str(cost_model_metadata(DEFAULT_COST_MODEL)["cost_model"]),
             "graph_rule": "ACL-core star graph: for each ACL choose the owner with the fewest ACLs as core, then largest in-group vector share as tie-break and connect core to other owners; edge signal vector_count(a); top-d rank uses shared_acl_count/sqrt(|ACL(Gi)|*|ACL(Gj)|); each group keeps top-d incident candidates",
             "graph_update_rule": "v16 incremental core-star: maintain pattern_star_edges, pattern_core_ids, edge_refcounts, edge_signal_scores, and group-indexed candidate cache; after each operation refresh only new groups' ACL patterns and their top-d incident star edges; rebuild graph only as fallback when heap is empty",
-            "operation_rule": "five operations: full keeps whole-group A+B merge; move_left, move_right, split_overlap, and merge_extract_overlap use I as the full ACL intersection; merge_extract_overlap produces (A-minus-I)+(B-minus-I) and I",
+            "operation_rule": "five operations in full-last priority order: split_overlap, move_left, move_right, merge_extract_overlap, full; full keeps whole-group A+B merge; the other operations use I as the full ACL intersection; merge_extract_overlap produces (A-minus-I)+(B-minus-I) and I",
             "selectivity_refinement_rule": "after memory compression, repeatedly take the globally worst average-selectivity private group, extract the worst tenant route ACL block into a separate partition if route-level Cost Model decreases; stop immediately when that worst group is pure or not beneficial",
             "private_edge_top_d": int(top_d),
             "initial_candidate_edges": int(initial_candidate_edges),

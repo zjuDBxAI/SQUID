@@ -24,6 +24,8 @@ from controller.dynamic_partition.load_result_to_database import (  # noqa: E402
     comb_role_mapping_table_name,
 )
 
+DROP_RELATION_BATCH_SIZE = 20
+
 
 def _python() -> str:
     candidate = PROJECT_ROOT / "venv" / "bin" / "python"
@@ -140,6 +142,7 @@ def _cleanup_existing_version(manifest: dict) -> None:
     if method == "honeybee":
         metadata_relations.add(comb_role_mapping_table_name(table_prefix))
 
+    relation_names: list[str] = []
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -166,9 +169,27 @@ def _cleanup_existing_version(manifest: dict) -> None:
             elif method in {"veda", "effveda"}:
                 _cleanup_veda_current_metadata(cur, method, table_prefix)
 
-            for relation_name in sorted(set(_relations_with_prefix(cur, table_prefix)) | metadata_relations):
-                _drop_relation(cur, relation_name)
+            relation_names = sorted(set(_relations_with_prefix(cur, table_prefix)) | metadata_relations)
         conn.commit()
+    finally:
+        conn.close()
+
+    if not relation_names:
+        return
+
+    conn = get_db_connection()
+    try:
+        for batch_start in range(0, len(relation_names), DROP_RELATION_BATCH_SIZE):
+            batch = relation_names[batch_start:batch_start + DROP_RELATION_BATCH_SIZE]
+            with conn.cursor() as cur:
+                for relation_name in batch:
+                    _drop_relation(cur, relation_name)
+            conn.commit()
+            print(
+                f"[cleanup] dropped {min(batch_start + len(batch), len(relation_names))}/"
+                f"{len(relation_names)} old relations for {table_prefix}",
+                flush=True,
+            )
     finally:
         conn.close()
 

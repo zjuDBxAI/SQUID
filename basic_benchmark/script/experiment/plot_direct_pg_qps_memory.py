@@ -345,8 +345,8 @@ def plot(points_by_method: dict[str, list[SelectedPoint]], output: Path, annotat
             for point in points:
                 label = f"ef={point.ef_search}\nr={point.recall:.3f}"
                 ax.annotate(label, (point.x_memory, point.qps), textcoords="offset points", xytext=(3, 4), fontsize=6.8)
-    ax.set_xlabel("Memory Replication Ratio", fontsize=13)
-    ax.set_ylabel("QPS", fontsize=13)
+    ax.set_xlabel("Memory Replication Ratio", fontsize=16)
+    ax.set_ylabel("QPS", fontsize=16)
     ax.set_xlim(max(0.8, min(all_x) - 0.2), max(all_x) + 0.2)
     ax.set_ylim(0, max(all_y) * 1.08)
     ax.xaxis.set_major_formatter(FuncFormatter(format_memory))

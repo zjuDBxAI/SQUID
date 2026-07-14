@@ -866,7 +866,51 @@ def set_ground_truth_total_queries(total):
     _faiss_query_counter['completed'] = 0
 
 
-def ground_truth_func_batch(queries, use_faiss=None, use_cache=True):
+def _ground_truth_workers(workers=None):
+    if workers is not None:
+        try:
+            return max(1, int(workers))
+        except (TypeError, ValueError):
+            return 1
+
+    raw_workers = os.environ.get("GROUND_TRUTH_WORKERS")
+    if not raw_workers:
+        return 8
+    try:
+        return max(1, int(raw_workers))
+    except ValueError:
+        print(f"Invalid GROUND_TRUTH_WORKERS={raw_workers!r}; using 8")
+        return 8
+
+
+def _ground_truth_func_postgres_batch(queries, workers=None):
+    workers = min(_ground_truth_workers(workers), max(1, len(queries)))
+    if workers <= 1 or len(queries) <= 1:
+        return [ground_truth_func(q['user_id'], q['query_vector'], q.get('topk', 5)) for q in queries]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print(f"PostgreSQL ground truth batch: {len(queries)} queries, workers={workers}")
+    results = [None] * len(queries)
+    report_every = max(1, min(50, len(queries) // 20 or 1))
+
+    def run_one(index, query):
+        return index, ground_truth_func(query['user_id'], query['query_vector'], query.get('topk', 5))
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(run_one, index, query) for index, query in enumerate(queries)]
+        for future in as_completed(futures):
+            index, query_result = future.result()
+            results[index] = query_result
+            completed += 1
+            if completed % report_every == 0 or completed == len(queries):
+                print(f"✓ PostgreSQL ground truth batch progress: [{completed}/{len(queries)}]")
+
+    return results
+
+
+def ground_truth_func_batch(queries, use_faiss=None, use_cache=True, workers=None):
     """
     Batch ground truth computation for multiple queries (much faster).
 
@@ -874,6 +918,7 @@ def ground_truth_func_batch(queries, use_faiss=None, use_cache=True):
         queries: List of query dicts with 'user_id', 'query_vector', 'topk'
         use_faiss: If True, use FAISS GPU batch search. If None, read from config.json
         use_cache: If True, cache ground truth results to disk
+        workers: PostgreSQL fallback worker count. Defaults to GROUND_TRUTH_WORKERS or 8.
 
     Returns:
         List of results corresponding to each query
@@ -919,8 +964,7 @@ def ground_truth_func_batch(queries, use_faiss=None, use_cache=True):
                 use_faiss = config.get('use_gpu_groundtruth', False)
 
     if not use_faiss:
-        # Fall back to single query processing using PostgreSQL
-        results = [ground_truth_func(q['user_id'], q['query_vector'], q.get('topk', 5)) for q in queries]
+        results = _ground_truth_func_postgres_batch(queries, workers=workers)
         if use_cache:
             _save_ground_truth_cache(queries, results, cache_file)
         return results
@@ -930,7 +974,7 @@ def ground_truth_func_batch(queries, use_faiss=None, use_cache=True):
             import faiss
         except ImportError:
             print("Warning: faiss not installed, falling back to single query processing")
-            results = [ground_truth_func(q['user_id'], q['query_vector'], q.get('topk', 5)) for q in queries]
+            results = _ground_truth_func_postgres_batch(queries, workers=workers)
             # Save cache and return
             if use_cache:
                 _save_ground_truth_cache(queries, results, cache_file)

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 """KMeans/SQUID planner cost model.
 
-The planner uses the KMeans/SQUID latency formula with Veda paper coefficients. The ef term remains adaptive: first use the learned recall model to estimate the clean base ef required for target recall, then expand it by route selectivity as base_ef / rho.
+The planner uses the KMeans/SQUID latency formula with calibrated wiki latency
+coefficients.
+The ef term remains adaptive: first use the learned recall model to estimate the
+clean base ef required for target recall, then expand it by route selectivity as
+base_ef / rho.
 """
 
 from dataclasses import dataclass
@@ -52,6 +56,9 @@ _FALLBACK_EFS_LAMBDA0 = 0.07626788754243294
 _FALLBACK_EFS_LAMBDA1 = 0.031809305747412114
 _FALLBACK_TARGET_RECALL = 0.99
 _FALLBACK_TOPK = 10
+_FALLBACK_COST_A = 0.05134035703436479
+_FALLBACK_COST_B_GRAPH = 0.04059425277225399
+_FALLBACK_COST_C = 0.0
 
 
 @dataclass(frozen=True)
@@ -109,7 +116,6 @@ def load_latency_cost_model(
 
     payload = _read_json(candidate)
     settings = payload.get("settings", {}) if isinstance(payload.get("settings", {}), dict) else {}
-    parameters = payload.get("parameters", {}) if isinstance(payload.get("parameters", {}), dict) else {}
     efs_payload = payload.get("efs_model", {}) if isinstance(payload.get("efs_model", {}), dict) else {}
 
     external_efs = _read_json(efs_candidate)
@@ -127,9 +133,9 @@ def load_latency_cost_model(
         pg_tuples_per_page_approx=float(settings.get("pg_tuples_per_page_approx", _PG_TUPLES_PER_PAGE_APPROX)),
         pg_vector_distance_ops_per_tuple=float(settings.get("pg_vector_distance_ops_per_tuple", _PG_VECTOR_DISTANCE_OPS_PER_TUPLE)),
         hnsw_max_ef_search=max(1, int(settings.get("max_ef_search", 5000))),
-        cost_a=0.0821,
-        cost_b_graph=0.1159,
-        cost_c=2.3110,
+        cost_a=_FALLBACK_COST_A,
+        cost_b_graph=_FALLBACK_COST_B_GRAPH,
+        cost_c=_FALLBACK_COST_C,
         efs_h=float(efs_payload.get("h", _FALLBACK_EFS_H)),
         efs_lambda0=float(efs_payload.get("lambda0", _FALLBACK_EFS_LAMBDA0)),
         efs_lambda1=float(efs_payload.get("lambda1", _FALLBACK_EFS_LAMBDA1)),
@@ -277,7 +283,7 @@ def estimate_partition_query_cost(
     log_n = math.log(float(max(2, n_value)))
     cost_ms = (
         float(active.cost_a) * float(log_n)
-        + float(active.cost_b_graph) * float(route_ef) * float(log_n)
+        + float(active.cost_b_graph) * float(route_ef)
         + float(active.cost_c)
     )
     return float(tenant_weight) * max(0.0, float(cost_ms))
@@ -286,14 +292,14 @@ def estimate_partition_query_cost(
 def cost_model_metadata(model: KMeansCostModel | None = None) -> dict[str, object]:
     active = model or DEFAULT_COST_MODEL
     return {
-        "cost_model": "kmeans_formula_with_veda_coefficients: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
+        "cost_model": "kmeans_formula_with_wiki_stage_constrained_coefficients: cost_ms=a*ln(N)+b*route_ef+c, route_ef=base_ef_from_recall_model/rho",
         "adaptive_ef": True,
         "cost_unit": "milliseconds",
         "cost_a": float(active.cost_a),
         "cost_b_graph": float(active.cost_b_graph),
         "cost_d_filter": 0.0,
         "cost_c": float(active.cost_c),
-        "cost_compat_note": "estimate_partition_query_cost restores the KMeans/SQUID latency formula and uses Veda.pdf Appendix B coefficients",
+        "cost_compat_note": "estimate_partition_query_cost uses the KMeans/SQUID latency formula with wiki stage-constrained latency coefficients",
         "hnsw_m": int(active.hnsw_m),
         "hnsw_scan_scaling_factor": float(active.hnsw_scan_scaling_factor),
         "pg_seq_page_cost": float(active.pg_seq_page_cost),

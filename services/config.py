@@ -9,7 +9,23 @@ def load_config():
     """
     config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
     with open(config_path, 'r') as config_file:
-        return json.load(config_file)
+        loaded = json.load(config_file)
+
+    env_overrides = {
+        "dbname": "DBNAME",
+        "user": "DB_USER",
+        "password": "DB_PASSWORD",
+        "host": "DB_HOST",
+        "port": "DB_PORT",
+        "dataset_path": "DATASET_PATH",
+        "maintenance_work_mem_gb": "MAINTENANCE_WORK_MEM_GB",
+        "max_parallel_maintenance_workers": "MAX_PARALLEL_MAINTENANCE_WORKERS",
+    }
+    for config_key, env_key in env_overrides.items():
+        value = os.environ.get(env_key)
+        if value is not None and value != "":
+            loaded[config_key] = value
+    return loaded
 
 
 config = load_config()

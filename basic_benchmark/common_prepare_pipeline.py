@@ -16,6 +16,7 @@ DATASET_VECTOR_DIMENSIONS = {
     "sift-128-euclidean": 128,
     "sift10m": 128,
     "yfcc100m": 192,
+    "wikipedia-22-12-simple": 768,
     "wikipedia-22-12": 300,
     "arxiv": 300,
 }

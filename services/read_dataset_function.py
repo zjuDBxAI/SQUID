@@ -1,4 +1,5 @@
 import hashlib
+import csv
 import json
 import re
 import sys
@@ -7,12 +8,14 @@ import random
 import tarfile
 import shutil
 from concurrent.futures.process import ProcessPoolExecutor
+from itertools import islice
 from datetime import datetime
 from psycopg2 import Binary
 import psycopg2
 from datasets import load_dataset
 import numpy as np
 from collections import Counter
+from psycopg2.extras import execute_values
 
 from basic_benchmark.generate_queries import calculate_block_selectivity, add_query_block_selectivity_to_json
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,8 +23,8 @@ sys.path.append(project_root)
 
 from services.rbac_generator.tree_based_rbac_data_generator import TreeBasedRBACDataGenerator
 from services.embedding_service import generate_embedding
-from services.config import get_db_connection, get_dataset_path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from services.config import config, get_db_connection, get_dataset_path
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from tqdm import tqdm
 
 
@@ -29,6 +32,7 @@ SIFT_DOCUMENT_VECTOR_COUNT = 100  # Group 100 vectors into a single synthetic do
 YFCC_DOCUMENT_VECTOR_COUNT = 1  # YFCC metadata is per image/vector, so each vector is one document
 SIFT10M_FEATURES_MEMBER = "SIFT10M/SIFT10Mfeatures.mat"
 YFCC100M_SUBSAMPLED_VECS = "yfcc100m/yfcc_subsampled_nvec_1000000_nlabel_1000_vecs.npy"
+WIKIPEDIA_SIMPLE_EMBEDDINGS_CSV = "wikipedia-22-12-simple-embeddings/wiki.csv"
 
 
 def store_document(document_id, document_name):
@@ -116,6 +120,50 @@ def store_document_block_duplication_bulk(document_blocks):
         conn.close()
 
 
+def store_document_block_duplication_bulk_fast(document_blocks):
+    if not document_blocks:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    created_at = datetime.now()
+    documents_data = [
+        (document_id, f"Document {document_id}", created_at, created_at)
+        for _, document_id, _, _, _ in document_blocks
+    ]
+
+    try:
+        execute_values(
+            cur,
+            """
+            INSERT INTO documents (document_id, document_name, created_at, updated_at)
+            VALUES %s
+            ON CONFLICT (document_id) DO NOTHING
+            """,
+            documents_data,
+            page_size=BATCH_SIZE,
+        )
+        execute_values(
+            cur,
+            """
+            INSERT INTO documentblocks (block_id, document_id, block_content, hash_value, vector)
+            VALUES %s
+            ON CONFLICT (block_id, document_id) DO NOTHING
+            """,
+            document_blocks,
+            page_size=BATCH_SIZE,
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Failed to insert document blocks or documents: {e}")
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 def store_document_block(block_id, document_id, block_content, vector):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -163,41 +211,188 @@ def insert_user_roles(user_role_data):
     return {"message": "User roles inserted successfully"}
 
 
-def store_rbac_data(users, roles, user_roles, permission_assignments):
+def _read_int_env(name, default, min_value=1):
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value == "":
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        print(f"Invalid {name}={raw_value!r}; using {default}")
+        return default
+    return max(min_value, value)
+
+
+def _maybe_len(rows):
+    try:
+        return len(rows)
+    except TypeError:
+        return None
+
+
+def _iter_batches(rows, batch_size):
+    if hasattr(rows, "__len__") and hasattr(rows, "__getitem__"):
+        for start in range(0, len(rows), batch_size):
+            yield rows[start:start + batch_size]
+        return
+
+    iterator = iter(rows)
+    while True:
+        batch = list(islice(iterator, batch_size))
+        if not batch:
+            return
+        yield batch
+
+
+def _execute_values_batch(query, batch, page_size, synchronous_commit):
     conn = get_db_connection()
     cur = conn.cursor()
+    try:
+        if not synchronous_commit:
+            cur.execute("SET synchronous_commit = OFF;")
+        execute_values(cur, query, batch, page_size=page_size)
+        conn.commit()
+        return len(batch)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
-    # Store Users
-    for user in users:
-        cur.execute(
-            "INSERT INTO Users (user_id, user_name) VALUES (%s, %s)",
-            (user['user_id'], user['user_name'])
-        )
 
-    # Store Roles
-    for role in roles:
-        cur.execute(
-            "INSERT INTO Roles (role_id, role_name) VALUES (%s, %s)",
-            (role.role_id, role.role_name)
-        )
+def _bulk_insert_values(label, query, rows, batch_size, page_size, workers, synchronous_commit):
+    total = _maybe_len(rows)
+    if total == 0:
+        print(f"Insert {label}: nothing to insert")
+        return 0
 
-    # Store UserRoles
-    for user_id, role_id in user_roles:
-        cur.execute(
-            "INSERT INTO UserRoles (user_id, role_id) VALUES (%s, %s)",
-            (user_id, role_id)
-        )
+    workers = max(1, workers)
+    max_pending = workers * 2
+    inserted = 0
 
-    # Store PermissionAssignments
-    for role_id, document_id in permission_assignments:
-        cur.execute(
-            "INSERT INTO PermissionAssignment (role_id, document_id) VALUES (%s, %s)",
-            (role_id, document_id)
-        )
+    if workers == 1:
+        with tqdm(total=total, desc=f"Insert {label}", unit="rows", dynamic_ncols=True) as progress:
+            for batch in _iter_batches(rows, batch_size):
+                batch_len = _execute_values_batch(query, batch, page_size, synchronous_commit)
+                inserted += batch_len
+                progress.update(batch_len)
+        return inserted
 
-    conn.commit()
-    cur.close()
-    conn.close()
+    batch_iter = iter(_iter_batches(rows, batch_size))
+    with tqdm(total=total, desc=f"Insert {label}", unit="rows", dynamic_ncols=True) as progress:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = {}
+
+            def submit_next():
+                try:
+                    batch = next(batch_iter)
+                except StopIteration:
+                    return False
+                future = executor.submit(
+                    _execute_values_batch,
+                    query,
+                    batch,
+                    page_size,
+                    synchronous_commit,
+                )
+                pending[future] = len(batch)
+                return True
+
+            while len(pending) < max_pending and submit_next():
+                pass
+
+            while pending:
+                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    batch_len = pending.pop(future)
+                    future.result()
+                    inserted += batch_len
+                    progress.update(batch_len)
+
+                while len(pending) < max_pending and submit_next():
+                    pass
+
+    return inserted
+
+
+def _normalize_user_row(user):
+    if isinstance(user, dict):
+        return user["user_id"], user["user_name"]
+    return user.user_id, user.user_name
+
+
+def _normalize_role_row(role):
+    if isinstance(role, dict):
+        return role["role_id"], role["role_name"]
+    return role.role_id, role.role_name
+
+
+def store_rbac_data(users, roles, user_roles, permission_assignments):
+    batch_size = _read_int_env("RBAC_INSERT_BATCH_SIZE", 20000)
+    page_size = _read_int_env("RBAC_INSERT_PAGE_SIZE", min(batch_size, 5000))
+    workers = _read_int_env("RBAC_INSERT_WORKERS", 4)
+    synchronous_commit = os.environ.get("RBAC_SYNCHRONOUS_COMMIT", "off").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    users_data = [_normalize_user_row(user) for user in users]
+    roles_data = [_normalize_role_row(role) for role in roles]
+
+    print(
+        "Bulk storing RBAC data: "
+        f"users={len(users_data)}, roles={len(roles_data)}, "
+        f"user_roles={_maybe_len(user_roles) if _maybe_len(user_roles) is not None else 'unknown'}, "
+        f"permission_assignments={_maybe_len(permission_assignments) if _maybe_len(permission_assignments) is not None else 'unknown'}, "
+        f"batch_size={batch_size}, page_size={page_size}, workers={workers}, "
+        f"synchronous_commit={'on' if synchronous_commit else 'off'}"
+    )
+
+    _bulk_insert_values(
+        "Users",
+        "INSERT INTO Users (user_id, user_name) VALUES %s",
+        users_data,
+        batch_size,
+        page_size,
+        workers=1,
+        synchronous_commit=synchronous_commit,
+    )
+    _bulk_insert_values(
+        "Roles",
+        "INSERT INTO Roles (role_id, role_name) VALUES %s",
+        roles_data,
+        batch_size,
+        page_size,
+        workers=1,
+        synchronous_commit=synchronous_commit,
+    )
+    _bulk_insert_values(
+        "UserRoles",
+        "INSERT INTO UserRoles (user_id, role_id) VALUES %s",
+        user_roles,
+        batch_size,
+        page_size,
+        workers=min(workers, 2),
+        synchronous_commit=synchronous_commit,
+    )
+    inserted_permissions = _bulk_insert_values(
+        "PermissionAssignment",
+        "INSERT INTO PermissionAssignment (role_id, document_id) VALUES %s",
+        permission_assignments,
+        batch_size,
+        page_size,
+        workers=workers,
+        synchronous_commit=synchronous_commit,
+    )
+    print(
+        "Finished bulk RBAC storage: "
+        f"users={len(users_data)}, roles={len(roles_data)}, "
+        f"user_roles={_maybe_len(user_roles) if _maybe_len(user_roles) is not None else 'unknown'}, "
+        f"permission_assignments={inserted_permissions}"
+    )
 
 
 def clean_block_content(block_content):
@@ -554,11 +749,116 @@ def read_and_store_yfcc100m_dataset(load_number=1000, start_row=0):
     )
 
 
+def read_and_store_wikipedia_simple_embeddings_dataset(load_number=1000, start_row=0):
+    """
+    Stream the Timescale Simple English Wikipedia embeddings CSV from disk and
+    persist one Wikipedia row as one synthetic document/block.
+    """
+    dataset_path = get_dataset_path()
+    csv_path = os.path.join(dataset_path, WIKIPEDIA_SIMPLE_EMBEDDINGS_CSV)
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Wikipedia simple embeddings CSV not found at {csv_path}. "
+            "Download it from https://huggingface.co/datasets/timescale/"
+            "wikipedia-22-12-simple-embeddings first."
+        )
+
+    if load_number is None or load_number <= 0:
+        max_rows = None
+    else:
+        max_rows = int(load_number)
+
+    start_row = max(0, int(start_row or 0))
+    inserted = 0
+    seen = 0
+    batch = []
+    progress_total = max_rows if max_rows is not None else None
+
+    print(
+        "Loading wikipedia-22-12-simple embeddings "
+        f"into database '{config.get('dbname')}' from {csv_path}. "
+        f"start_row={start_row}, load_number={'all' if max_rows is None else max_rows}, "
+        f"batch_size={BATCH_SIZE}."
+    )
+
+    with open(csv_path, newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        expected_fields = {"id", "contents", "embedding"}
+        missing_fields = expected_fields.difference(reader.fieldnames or [])
+        if missing_fields:
+            raise ValueError(
+                f"Wikipedia simple CSV is missing columns: {sorted(missing_fields)}. "
+                f"Found columns: {reader.fieldnames}"
+            )
+
+        with tqdm(
+            total=progress_total,
+            desc="Load wikipedia-22-12-simple",
+            unit="rows",
+            dynamic_ncols=True,
+        ) as progress:
+            for row_index, row in enumerate(reader):
+                if row_index < start_row:
+                    continue
+                if max_rows is not None and seen >= max_rows:
+                    break
+
+                seen += 1
+                raw_id = row.get("id")
+                try:
+                    source_id = int(raw_id)
+                except (TypeError, ValueError):
+                    source_id = start_row + seen
+
+                block_content = row.get("contents") or ""
+                embedding = row.get("embedding")
+                if not embedding:
+                    print(f"Skipping Wikipedia row {row_index}: missing embedding")
+                    continue
+
+                block_id = start_row + seen
+                document_id = block_id
+                content_bytes = block_content.encode("utf-8", errors="replace")
+                hash_value = Binary(hashlib.sha1(f"{source_id}\0".encode("utf-8") + content_bytes).digest())
+                batch.append(
+                    (
+                        block_id,
+                        document_id,
+                        Binary(content_bytes),
+                        hash_value,
+                        embedding,
+                    )
+                )
+
+                if len(batch) >= BATCH_SIZE:
+                    store_document_block_duplication_bulk_fast(batch)
+                    inserted += len(batch)
+                    progress.update(len(batch))
+                    progress.set_postfix(inserted=inserted, refresh=False)
+                    batch = []
+
+            if batch:
+                store_document_block_duplication_bulk_fast(batch)
+                inserted += len(batch)
+                progress.update(len(batch))
+                progress.set_postfix(inserted=inserted, refresh=False)
+
+            if progress.total is not None and inserted < progress.total:
+                progress.total = inserted
+                progress.refresh()
+
+    print(f"Finished loading wikipedia-22-12-simple dataset: {inserted} rows inserted.")
+
+
 def read_and_store_dataset_parallel(load_number=1000, start_row=0, num_threads=4, dataset="wikipedia-22-12"):
     # Load the dataset
     dataset_path = get_dataset_path()
     if dataset == "wikipedia-22-12":
         data = load_dataset("json", data_files=f"{dataset_path}/wikipedia-22-12/en/*.jsonl.gz")["train"]
+    elif dataset == "wikipedia-22-12-simple":
+        read_and_store_wikipedia_simple_embeddings_dataset(load_number=load_number, start_row=start_row)
+        return
     elif dataset == "sift10m":
         read_and_store_sift10m_dataset(load_number=load_number, start_row=start_row)
         return

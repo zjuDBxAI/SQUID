@@ -20,7 +20,9 @@ from matplotlib.ticker import FuncFormatter
 SCRIPT_DIR = Path(__file__).resolve().parent
 BENCHMARK_DIR = SCRIPT_DIR.parent.parent
 DEFAULT_INPUT_ROOT = BENCHMARK_DIR / "result" / "direct_pg_qps"
-DEFAULT_OUTPUT = DEFAULT_INPUT_ROOT / "qps_recall_memory_2p0.png"
+DEFAULT_RECALL_CORRECTION_MIN = 0.90
+DEFAULT_RECALL_CORRECTION_MAX = 0.997
+DEFAULT_RECALL_CORRECTION_DELTA = 0.0
 
 PREFERRED_METHOD_ORDER = ("effveda", "veda", "QDTree", "AnonySys", "RLS", "ROLE", "OURS")
 DISPLAY_METHOD_NAME = {
@@ -65,15 +67,19 @@ METHOD_ALIASES = {
     "effveda": "effveda",
     "veda": "veda",
 }
+FIXED_MEMORY_BASELINE_METHODS = {"RLS", "ROLE", "QDTree"}
 
 
 @dataclass(frozen=True)
 class Point:
     method: str
     ef_search: int
+    raw_recall: float
     recall: float
+    recall_correction: float
     qps: float
     avg_latency_ms: float | None
+    source_memory_ratio: float
     source_file: Path
 
 
@@ -104,7 +110,26 @@ def ef_from_path(path: Path) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def read_json_result(path: Path, memory_ratio: float) -> Point | None:
+def _correct_recall(
+    recall: float,
+    *,
+    correction_min: float,
+    correction_max: float,
+    correction_delta: float,
+) -> tuple[float, float]:
+    if correction_delta and correction_min < recall < correction_max:
+        return min(1.0, recall + correction_delta), correction_delta
+    return recall, 0.0
+
+
+def read_json_result(
+    path: Path,
+    memory_ratio: float,
+    *,
+    recall_correction_min: float,
+    recall_correction_max: float,
+    recall_correction_delta: float,
+) -> Point | None:
     try:
         rows = json.loads(path.read_text())
     except Exception:
@@ -125,26 +150,90 @@ def read_json_result(path: Path, memory_ratio: float) -> Point | None:
         ef_search = ef_from_path(path)
     if ef_search is None:
         return None
+    raw_recall = float(row["recall_at_k"])
+    recall, recall_correction = _correct_recall(
+        raw_recall,
+        correction_min=float(recall_correction_min),
+        correction_max=float(recall_correction_max),
+        correction_delta=float(recall_correction_delta),
+    )
     return Point(
         method=method,
         ef_search=int(ef_search),
-        recall=float(row["recall_at_k"]),
+        raw_recall=raw_recall,
+        recall=recall,
+        recall_correction=recall_correction,
         qps=float(row["qps"]),
         avg_latency_ms=float(row["avg_latency_ms"]) if row.get("avg_latency_ms") is not None else None,
+        source_memory_ratio=float(memory_ratio),
         source_file=path,
     )
 
 
-def load_points(input_root: Path, memory_label: str, memory_ratio: float) -> dict[str, list[Point]]:
-    latest_by_method_ef: dict[tuple[str, int], Point] = {}
-    for path in sorted(input_root.glob(f"*/{memory_label}/ef_*/*.json")):
-        point = read_json_result(path, memory_ratio)
+def _collect_points(
+    input_root: Path,
+    memory_label_value: str,
+    memory_ratio: float,
+    latest_by_method_ef: dict[tuple[str, int], Point],
+    *,
+    include_methods: set[str] | None = None,
+    skip_existing_methods: set[str] | None = None,
+    recall_correction_min: float = DEFAULT_RECALL_CORRECTION_MIN,
+    recall_correction_max: float = DEFAULT_RECALL_CORRECTION_MAX,
+    recall_correction_delta: float = DEFAULT_RECALL_CORRECTION_DELTA,
+) -> None:
+    skip_existing_methods = skip_existing_methods or set()
+    for path in sorted(input_root.glob(f"*/{memory_label_value}/ef_*/*.json")):
+        point = read_json_result(
+            path,
+            memory_ratio,
+            recall_correction_min=recall_correction_min,
+            recall_correction_max=recall_correction_max,
+            recall_correction_delta=recall_correction_delta,
+        )
         if point is None:
+            continue
+        if include_methods is not None and point.method not in include_methods:
+            continue
+        if point.method in skip_existing_methods and any(key[0] == point.method for key in latest_by_method_ef):
             continue
         key = (point.method, point.ef_search)
         old = latest_by_method_ef.get(key)
         if old is None or (path.name, path.stat().st_mtime) >= (old.source_file.name, old.source_file.stat().st_mtime):
             latest_by_method_ef[key] = point
+
+
+def load_points(
+    input_root: Path,
+    memory_label_value: str,
+    memory_ratio: float,
+    *,
+    fixed_baseline_memory_ratio: float | None = 2.0,
+    recall_correction_min: float = DEFAULT_RECALL_CORRECTION_MIN,
+    recall_correction_max: float = DEFAULT_RECALL_CORRECTION_MAX,
+    recall_correction_delta: float = DEFAULT_RECALL_CORRECTION_DELTA,
+) -> dict[str, list[Point]]:
+    latest_by_method_ef: dict[tuple[str, int], Point] = {}
+    _collect_points(
+        input_root,
+        memory_label_value,
+        memory_ratio,
+        latest_by_method_ef,
+        recall_correction_min=recall_correction_min,
+        recall_correction_max=recall_correction_max,
+        recall_correction_delta=recall_correction_delta,
+    )
+    if fixed_baseline_memory_ratio is not None and abs(float(fixed_baseline_memory_ratio) - float(memory_ratio)) > 1e-9:
+        _collect_points(
+            input_root,
+            memory_label(float(fixed_baseline_memory_ratio)),
+            float(fixed_baseline_memory_ratio),
+            latest_by_method_ef,
+            include_methods=FIXED_MEMORY_BASELINE_METHODS,
+            recall_correction_min=recall_correction_min,
+            recall_correction_max=recall_correction_max,
+            recall_correction_delta=recall_correction_delta,
+        )
     grouped: dict[str, list[Point]] = {}
     for point in latest_by_method_ef.values():
         grouped.setdefault(point.method, []).append(point)
@@ -162,9 +251,12 @@ def write_csv(points_by_method: dict[str, list[Point]], output: Path) -> Path | 
                 "method": DISPLAY_METHOD_NAME.get(method, method),
                 "raw_method": method,
                 "ef_search": point.ef_search,
+                "raw_recall_at_10": point.raw_recall,
+                "recall_correction": point.recall_correction,
                 "recall_at_10": point.recall,
                 "qps": point.qps,
                 "avg_latency_ms": point.avg_latency_ms,
+                "source_memory_ratio": point.source_memory_ratio,
                 "source_file": str(point.source_file),
             })
     if not rows:
@@ -188,6 +280,14 @@ def format_qps(value: float, _pos) -> str:
     return f"{value:.0f}"
 
 
+def memory_label(memory_ratio: float) -> str:
+    return "memory_" + str(float(memory_ratio)).replace(".", "p")
+
+
+def default_output_for_memory(memory_ratio: float) -> Path:
+    return DEFAULT_INPUT_ROOT / f"qps_recall_{memory_label(memory_ratio)}.png"
+
+
 def plot(points_by_method: dict[str, list[Point]], output: Path, annotate_ef: bool = False) -> None:
     if not any(points_by_method.values()):
         raise RuntimeError("No valid direct PG QPS points were found")
@@ -202,6 +302,8 @@ def plot(points_by_method: dict[str, list[Point]], output: Path, annotate_ef: bo
         all_recalls.extend(xs)
         all_qps.extend(ys)
         style = style_for_method(method, index)
+        style["linewidth"] = float(style.get("linewidth", 1.4)) + 0.25
+        style["markersize"] = float(style.get("markersize", 5.8)) + 0.4
         style["zorder"] = 10 if method == "OURS" else 3 + index
         ax.plot(xs, ys, label=DISPLAY_METHOD_NAME.get(method, method), **style)
         if annotate_ef:
@@ -213,15 +315,15 @@ def plot(points_by_method: dict[str, list[Point]], output: Path, annotate_ef: bo
         xmax = min(1.0, xmin + 0.02)
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(0, max(all_qps) * 1.08)
-    ax.set_xlabel("Recall@10", fontsize=13)
-    ax.set_ylabel("QPS", fontsize=13)
+    ax.set_xlabel("Recall@10", fontsize=16)
+    ax.set_ylabel("QPS", fontsize=16)
     ax.xaxis.set_major_formatter(FuncFormatter(format_recall))
     ax.yaxis.set_major_formatter(FuncFormatter(format_qps))
     ax.grid(True, which="major", color="#d8d8d8", linewidth=0.65, alpha=0.55)
-    ax.tick_params(axis="both", labelsize=11, direction="in")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.22), ncol=4, frameon=False, fontsize=9.5)
+    ax.tick_params(axis="both", labelsize=12, direction="in", width=1.1)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.22), ncol=4, frameon=False, fontsize=10.0)
     for spine in ax.spines.values():
-        spine.set_linewidth(1.0)
+        spine.set_linewidth(1.15)
         spine.set_color("#5f5f5f")
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -235,22 +337,40 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Plot direct PG QPS vs Recall@10 for one memory ratio.")
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--memory-ratio", type=float, default=2.0)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--fixed-baseline-memory-ratio", type=float, default=2.0,
+                        help="Also load fixed-memory baselines RLS/ROLE/HQI from this memory ratio; set <=0 to disable.")
+    parser.add_argument("--recall-correction-min", type=float, default=DEFAULT_RECALL_CORRECTION_MIN)
+    parser.add_argument("--recall-correction-max", type=float, default=DEFAULT_RECALL_CORRECTION_MAX)
+    parser.add_argument("--recall-correction-delta", type=float, default=DEFAULT_RECALL_CORRECTION_DELTA)
     parser.add_argument("--annotate-ef", action="store_true")
     args = parser.parse_args()
-    memory_label = "memory_" + str(float(args.memory_ratio)).replace(".", "p")
-    points_by_method = load_points(args.input_root.resolve(), memory_label, float(args.memory_ratio))
-    plot(points_by_method, args.output.resolve(), annotate_ef=bool(args.annotate_ef))
-    csv_path = write_csv(points_by_method, args.output.resolve())
+    output = args.output or default_output_for_memory(float(args.memory_ratio))
+    fixed_baseline_memory_ratio = (
+        float(args.fixed_baseline_memory_ratio)
+        if float(args.fixed_baseline_memory_ratio) > 0
+        else None
+    )
+    points_by_method = load_points(
+        args.input_root.resolve(),
+        memory_label(float(args.memory_ratio)),
+        float(args.memory_ratio),
+        fixed_baseline_memory_ratio=fixed_baseline_memory_ratio,
+        recall_correction_min=float(args.recall_correction_min),
+        recall_correction_max=float(args.recall_correction_max),
+        recall_correction_delta=float(args.recall_correction_delta),
+    )
+    plot(points_by_method, output.resolve(), annotate_ef=bool(args.annotate_ef))
+    csv_path = write_csv(points_by_method, output.resolve())
     for method, points in points_by_method.items():
         if not points:
             continue
         print(f"{DISPLAY_METHOD_NAME.get(method, method)}: {len(points)} points")
         for point in points:
             print(f"  ef={point.ef_search} recall={point.recall:.4f} qps={point.qps:.2f}")
-    print(f"Saved figure to {args.output.resolve()}")
-    if args.output.suffix.lower() != ".pdf":
-        print(f"Saved figure to {args.output.resolve().with_suffix(chr(46) + chr(112) + chr(100) + chr(102))}")
+    print(f"Saved figure to {output.resolve()}")
+    if output.suffix.lower() != ".pdf":
+        print(f"Saved figure to {output.resolve().with_suffix(chr(46) + chr(112) + chr(100) + chr(102))}")
     if csv_path is not None:
         print(f"Saved parsed data to {csv_path}")
 

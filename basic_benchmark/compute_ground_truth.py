@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -163,6 +164,12 @@ def main() -> None:
         action="store_true",
         help="Recompute even if caches already exist",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("GROUND_TRUTH_WORKERS", "8")),
+        help="Worker count for PostgreSQL ground-truth fallback",
+    )
 
     args = parser.parse_args()
 
@@ -200,6 +207,7 @@ def main() -> None:
         queries,
         use_faiss=True if args.use_faiss else None,
         use_cache=not args.no_basic_cache,
+        workers=args.workers,
     )
 
     pointer_results = to_pointer_results(results)

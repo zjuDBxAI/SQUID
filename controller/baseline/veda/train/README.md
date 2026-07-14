@@ -47,8 +47,13 @@ Outputs are written to `controller/baseline/veda/train/result/`:
 5. Combine intercepts:
 
    ```text
-   c_from_size = c1 - b * 1
-   c_from_efs  = c2 - a * log2(1 + N0)
+   c_from_size_raw = c1 - b * 1
+   c_from_efs_raw  = c2 - a * log2(1 + N0)
+
+   c_from_size = max(c_from_size_raw, 0)
+   c_from_efs  = max(c_from_efs_raw, 0)
    c = (c_from_size + c_from_efs) / 2
    ```
 
+   The nonnegative constraint is applied when each stage-derived `c`
+   candidate is produced, before the two candidates are averaged.

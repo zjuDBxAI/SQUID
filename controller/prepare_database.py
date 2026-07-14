@@ -1,7 +1,7 @@
-import json
 import psycopg2
 import sys
 import os
+from psycopg2 import sql
 
 from controller.clear_database import clear_tables
 
@@ -16,13 +16,19 @@ def read_file(file_path):
         return file.read()
 
 def create_database_if_not_exists():
-    conn = get_db_connection()
+    conn = psycopg2.connect(
+        dbname=os.environ.get("DB_MAINTENANCE_DB", "postgres"),
+        user=config["user"],
+        password=config["password"],
+        host=config["host"],
+        port=config["port"],
+    )
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
-    cur.execute(f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{config['dbname']}'")
+    cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (config["dbname"],))
     exists = cur.fetchone()
     if not exists:
-        cur.execute(f'CREATE DATABASE {config["dbname"]}')
+        cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(config["dbname"])))
     cur.close()
     conn.close()
 
@@ -42,5 +48,4 @@ def clear_db():
     create_pgvector_extension()
 
     clear_tables()
-
 

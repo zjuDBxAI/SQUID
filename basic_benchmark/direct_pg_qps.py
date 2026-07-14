@@ -12,11 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import queue
 import statistics
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -39,6 +41,8 @@ from controller.baseline.HQI.qd_tree import (  # noqa: E402
     get_qd_tree_root,
     partition_has_accessible_documents as hqi_partition_has_accessible_documents,
 )
+
+HNSW_ITERATIVE_SCAN_VALUES = ("off", "relaxed_order", "strict_order")
 
 
 @dataclass(frozen=True)
@@ -105,7 +109,7 @@ class PreparedRouteCache:
             prefix = _settings_prefix(settings) if settings else sql.SQL("")
             if use_sql_filter:
                 statement = prefix + sql.SQL(
-                    "PREPARE {}(vector, bigint[], integer) AS "
+                    "PREPARE {}(vector, integer[], integer) AS "
                     "SELECT block_id, document_id, vector <-> $1 AS distance "
                     "FROM {} WHERE pattern_id = ANY($2) "
                     "ORDER BY vector <-> $1 LIMIT $3"
@@ -121,7 +125,7 @@ class PreparedRouteCache:
         prefix = _settings_prefix(settings) if settings else sql.SQL("")
         if use_sql_filter:
             cur.execute(
-                prefix + sql.SQL("EXECUTE {}(%s::vector, %s::bigint[], %s)").format(sql.Identifier(statement_name)),
+                prefix + sql.SQL("EXECUTE {}(%s::vector, %s::integer[], %s)").format(sql.Identifier(statement_name)),
                 [query_vector, list(route.pattern_ids), int(topk)],
             )
         else:
@@ -312,6 +316,52 @@ def load_queries(query_path: Path, cache_path: Path, limit: int) -> list[Query]:
             if isinstance(row, (list, tuple)) and len(row) >= 2
         )
         queries.append(Query(int(raw["user_id"]), str(raw["query_vector"]), int(raw.get("topk", 10)), ground_truth))
+    return queries
+
+
+def load_db_sampled_queries(limit: int, topk: int) -> list[Query]:
+    """Sample valid query vectors directly from the connected database.
+
+    This mode is intended for QPS-only runs on databases whose vector dimension
+    differs from the repository's default query JSON. Recall is intentionally
+    disabled by leaving ground_truth empty.
+    """
+    query_count = max(1, int(limit))
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_id
+                FROM UserRoles
+                GROUP BY user_id
+                ORDER BY random()
+                LIMIT %s
+                """,
+                [query_count],
+            )
+            user_ids = [int(row[0]) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT vector::text
+                FROM documentblocks
+                ORDER BY random()
+                LIMIT %s
+                """,
+                [query_count],
+            )
+            vectors = [str(row[0]) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    if not user_ids:
+        raise RuntimeError("No users found in UserRoles for database-sampled QPS queries")
+    if not vectors:
+        raise RuntimeError("No vectors found in documentblocks for database-sampled QPS queries")
+
+    queries: list[Query] = []
+    for index in range(min(query_count, len(user_ids), len(vectors))):
+        queries.append(Query(user_ids[index], vectors[index], int(topk), frozenset()))
     return queries
 
 
@@ -547,12 +597,33 @@ def load_hqi_routes(
         loaded[query] = tuple(routes)
     return loaded
 
-def configure_session(cur, ef_search: int, jit: str, parallel_workers: int) -> None:
+def configure_session(
+    cur,
+    ef_search: int,
+    jit: str,
+    parallel_workers: int,
+    hnsw_iterative_scan: str,
+    *,
+    force_hnsw_planner: bool,
+    pg_parallel_route_scan: bool,
+) -> None:
+    if hnsw_iterative_scan not in HNSW_ITERATIVE_SCAN_VALUES:
+        raise ValueError(f"invalid hnsw.iterative_scan value: {hnsw_iterative_scan}")
     cur.execute("LOAD 'vector'")
     cur.execute(f"SET jit = {jit}")
     cur.execute(f"SET max_parallel_workers_per_gather = {int(parallel_workers)}")
-    cur.execute("SET hnsw.iterative_scan = off")
-    cur.execute("SET enable_seqscan = off")
+    cur.execute(f"SET hnsw.iterative_scan = {hnsw_iterative_scan}")
+    if force_hnsw_planner:
+        cur.execute("SET enable_seqscan = off")
+    else:
+        cur.execute("RESET enable_seqscan")
+        cur.execute("RESET enable_bitmapscan")
+    if pg_parallel_route_scan:
+        cur.execute("SET enable_parallel_append = on")
+        cur.execute("SET parallel_setup_cost = 0")
+        cur.execute("SET parallel_tuple_cost = 0")
+        cur.execute("SET min_parallel_table_scan_size = 0")
+        cur.execute("SET min_parallel_index_scan_size = 0")
     cur.execute(f"SET hnsw.ef_search = {int(ef_search)}")
 
 
@@ -602,6 +673,58 @@ def _fetch_ann_rows(cur) -> list[tuple]:
     ]
 
 
+def _execute_ann_route_client_filter(
+    cur,
+    route: Route,
+    *,
+    query_vector: str,
+    topk: int,
+    candidate_limit: int,
+    settings: tuple[tuple[str, str], ...] = (),
+) -> list[tuple]:
+    prefix = _settings_prefix(settings) if settings else sql.SQL("")
+    statement = prefix + sql.SQL(
+        "SELECT block_id, document_id, pattern_id, vector <-> %s::vector AS distance "
+        "FROM {} ORDER BY vector <-> %s::vector LIMIT %s"
+    ).format(sql.Identifier(route.table_name))
+    cur.execute(statement, [query_vector, query_vector, max(1, int(candidate_limit))])
+    allowed_patterns = set(int(pattern_id) for pattern_id in route.pattern_ids)
+    filtered: list[tuple] = []
+    for block_id, document_id, pattern_id, distance in cur.fetchall():
+        if int(pattern_id) not in allowed_patterns:
+            continue
+        filtered.append((int(block_id), int(document_id), None, float(distance)))
+        if len(filtered) >= int(topk):
+            break
+    return filtered
+
+
+def _execute_ann_route_docid_client_filter(
+    cur,
+    route: Route,
+    *,
+    query_vector: str,
+    topk: int,
+    candidate_limit: int,
+    settings: tuple[tuple[str, str], ...] = (),
+) -> list[tuple]:
+    prefix = _settings_prefix(settings) if settings else sql.SQL("")
+    statement = prefix + sql.SQL(
+        "SELECT block_id, document_id, vector <-> %s::vector AS distance "
+        "FROM {} ORDER BY vector <-> %s::vector LIMIT %s"
+    ).format(sql.Identifier(route.table_name))
+    cur.execute(statement, [query_vector, query_vector, max(1, int(candidate_limit))])
+    allowed_docs = set(int(document_id) for document_id in route.doc_ids)
+    filtered: list[tuple] = []
+    for block_id, document_id, distance in cur.fetchall():
+        if int(document_id) not in allowed_docs:
+            continue
+        filtered.append((int(block_id), int(document_id), None, float(distance)))
+        if len(filtered) >= int(topk):
+            break
+    return filtered
+
+
 def _route_candidate_select(route: Route, *, use_sql_filter: bool) -> sql.Composed:
     if use_sql_filter:
         return sql.SQL(
@@ -619,6 +742,91 @@ def _route_candidate_params(route: Route, query: Query, *, use_sql_filter: bool)
     if use_sql_filter:
         return [query.vector, list(route.pattern_ids), query.vector, int(query.topk)]
     return [query.vector, query.vector, int(query.topk)]
+
+
+def _route_candidate_limit(
+    route: Route,
+    query: Query,
+    *,
+    use_sql_filter: bool,
+    overfetch: int = 1,
+    ef_search: int | None = None,
+) -> int:
+    base_limit = max(1, int(query.topk))
+    factor = max(1, int(overfetch))
+    limit = base_limit
+    if use_sql_filter:
+        selectivity = _ours_route_selectivity(route)
+        limit = max(limit, int(math.ceil(base_limit * factor / max(selectivity, 0.000001))))
+    if ef_search is not None:
+        limit = max(limit, max(1, int(ef_search)) * factor)
+    if route.partition_vectors > 0:
+        limit = min(limit, int(route.partition_vectors))
+    return max(1, limit)
+
+
+def _route_candidate_params_with_limit(
+    route: Route,
+    query: Query,
+    *,
+    use_sql_filter: bool,
+    overfetch: int,
+) -> list[object]:
+    limit = _route_candidate_limit(route, query, use_sql_filter=use_sql_filter, overfetch=overfetch)
+    if use_sql_filter:
+        return [query.vector, list(route.pattern_ids), query.vector, limit]
+    return [query.vector, query.vector, limit]
+
+
+def _route_candidate_select_with_access_cte(route: Route, *, use_sql_filter: bool) -> sql.Composed:
+    predicate = sql.SQL(
+        "EXISTS ("
+        "SELECT 1 FROM direct_pg_qps_accessible_docs AS access_docs "
+        "WHERE access_docs.document_id = partition_table.document_id"
+        ")"
+    )
+    if use_sql_filter:
+        predicate = sql.SQL("partition_table.pattern_id = ANY(%s) AND ") + predicate
+    return sql.SQL(
+        "SELECT partition_table.block_id, partition_table.document_id, "
+        "partition_table.vector <-> %s::vector AS distance "
+        "FROM {} AS partition_table "
+        "WHERE "
+    ).format(sql.Identifier(route.table_name)) + predicate + sql.SQL(
+        " ORDER BY partition_table.vector <-> %s::vector LIMIT %s"
+    )
+
+
+def _route_candidate_params_with_access_cte(route: Route, query: Query, *, use_sql_filter: bool) -> list[object]:
+    if use_sql_filter:
+        return [query.vector, list(route.pattern_ids), query.vector, int(query.topk)]
+    return [query.vector, query.vector, int(query.topk)]
+
+
+def _route_candidate_select_with_user_access(route: Route, *, use_sql_filter: bool) -> sql.Composed:
+    predicate = sql.SQL(
+        "EXISTS ("
+        "SELECT 1 FROM PermissionAssignment pa "
+        "JOIN UserRoles ur ON pa.role_id = ur.role_id "
+        "WHERE ur.user_id = %s AND pa.document_id = partition_table.document_id"
+        ")"
+    )
+    if use_sql_filter:
+        predicate = sql.SQL("partition_table.pattern_id = ANY(%s) AND ") + predicate
+    return sql.SQL(
+        "SELECT partition_table.block_id, partition_table.document_id, "
+        "partition_table.vector <-> %s::vector AS distance "
+        "FROM {} AS partition_table "
+        "WHERE "
+    ).format(sql.Identifier(route.table_name)) + predicate + sql.SQL(
+        " ORDER BY partition_table.vector <-> %s::vector LIMIT %s"
+    )
+
+
+def _route_candidate_params_with_user_access(route: Route, query: Query, *, use_sql_filter: bool) -> list[object]:
+    if use_sql_filter:
+        return [query.vector, list(route.pattern_ids), int(query.user_id), query.vector, int(query.topk)]
+    return [query.vector, int(query.user_id), query.vector, int(query.topk)]
 
 
 def _honeybee_route_candidate_select(route: Route) -> sql.Composed:
@@ -676,8 +884,264 @@ def _sql_topk_from_candidates(topk: int) -> tuple[sql.SQL, list[int]]:
     return statement, [int(topk)]
 
 
+def install_ours_db_function(cur) -> None:
+    cur.execute(
+        """
+        CREATE OR REPLACE FUNCTION pg_temp.direct_pg_qps_ours_hnsw_search(
+            p_routes jsonb,
+            p_query vector,
+            p_topk integer,
+            p_ef_search integer
+        )
+        RETURNS TABLE(block_id bigint, document_id bigint, distance double precision)
+        LANGUAGE plpgsql
+        AS $$
+        DECLARE
+            route_item jsonb;
+            route_table text;
+            route_patterns integer[];
+            route_use_filter boolean;
+            candidate_table text := 'direct_pg_qps_candidates_' || current_user;
+        BEGIN
+            PERFORM set_config('hnsw.ef_search', GREATEST(1, p_ef_search)::text, true);
+
+            EXECUTE format(
+                'CREATE TEMP TABLE IF NOT EXISTS pg_temp.%I ('
+                'block_id BIGINT NOT NULL, '
+                'document_id BIGINT NOT NULL, '
+                'distance DOUBLE PRECISION NOT NULL'
+                ') ON COMMIT PRESERVE ROWS',
+                candidate_table
+            );
+            EXECUTE format('TRUNCATE pg_temp.%I', candidate_table);
+
+            FOR route_item IN SELECT value FROM jsonb_array_elements(p_routes)
+            LOOP
+                route_table := route_item->>'table_name';
+                route_use_filter := COALESCE((route_item->>'use_sql_filter')::boolean, false);
+                SELECT COALESCE(array_agg(value::integer), ARRAY[]::integer[])
+                INTO route_patterns
+                FROM jsonb_array_elements_text(COALESCE(route_item->'pattern_ids', '[]'::jsonb)) AS pattern_value(value);
+
+                IF route_use_filter THEN
+                    EXECUTE format(
+                        'INSERT INTO pg_temp.%I '
+                        'SELECT block_id, document_id, vector <-> $1 AS distance '
+                        'FROM %I WHERE pattern_id = ANY($2) '
+                        'ORDER BY vector <-> $1 LIMIT $3',
+                        candidate_table,
+                        route_table
+                    )
+                    USING p_query, route_patterns, p_topk;
+                ELSE
+                    EXECUTE format(
+                        'INSERT INTO pg_temp.%I '
+                        'SELECT block_id, document_id, vector <-> $1 AS distance '
+                        'FROM %I ORDER BY vector <-> $1 LIMIT $2',
+                        candidate_table,
+                        route_table
+                    )
+                    USING p_query, p_topk;
+                END IF;
+            END LOOP;
+
+            RETURN QUERY EXECUTE format(
+                'SELECT candidate.block_id, candidate.document_id, candidate.distance '
+                'FROM ('
+                'SELECT DISTINCT ON (candidate_inner.block_id, candidate_inner.document_id) '
+                'candidate_inner.block_id, candidate_inner.document_id, candidate_inner.distance '
+                'FROM pg_temp.%I AS candidate_inner '
+                'ORDER BY candidate_inner.block_id, candidate_inner.document_id, candidate_inner.distance'
+                ') AS candidate '
+                'ORDER BY candidate.distance, candidate.block_id, candidate.document_id '
+                'LIMIT $1',
+                candidate_table
+            )
+            USING p_topk;
+        END
+        $$;
+        """
+    )
+
+
+def _ours_routes_json(routes: list[Route], *, use_rls: bool) -> str:
+    return json.dumps(
+        [
+            {
+                "table_name": route.table_name,
+                "pattern_ids": list(route.pattern_ids),
+                "use_sql_filter": (not route.pure) and not use_rls,
+            }
+            for route in routes
+        ]
+    )
+
+
 def _hnsw_settings(ef_search: int) -> tuple[tuple[str, str], ...]:
     return (("hnsw.ef_search", str(max(1, int(ef_search)))),)
+
+
+def _route_hnsw_settings(route: Route, ef_search: int, indexed_tables: set[str] | None = None) -> tuple[tuple[str, str], ...]:
+    settings = list(_hnsw_settings(ef_search))
+    if indexed_tables is not None:
+        settings.append(("enable_seqscan", "off" if route.table_name in indexed_tables else "on"))
+    return tuple(settings)
+
+
+class OursRouteParallelExecutor:
+    """Shared route-level executor for SQUID-on-HNSW experiments."""
+
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        ef_search: int,
+        jit: str,
+        parallel_workers: int,
+        hnsw_iterative_scan: str,
+        pg_parallel_route_scan: bool,
+        prepare_routes: bool,
+        use_user_access_join: bool,
+        native_filter_location: str,
+        route_overfetch: int,
+    ) -> None:
+        self.max_workers = max(1, int(max_workers))
+        self.ef_search = int(ef_search)
+        self.jit = str(jit)
+        self.parallel_workers = int(parallel_workers)
+        self.hnsw_iterative_scan = str(hnsw_iterative_scan)
+        self.pg_parallel_route_scan = bool(pg_parallel_route_scan)
+        self.prepare_routes = bool(prepare_routes)
+        self.use_user_access_join = bool(use_user_access_join)
+        self.native_filter_location = str(native_filter_location)
+        self.route_overfetch = max(1, int(route_overfetch))
+        self._executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="ours-route")
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._connections: list[tuple[object, object]] = []
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn, cur in connections:
+            try:
+                cur.close()
+            except BaseException:
+                pass
+            try:
+                conn.close()
+            except BaseException:
+                pass
+
+    def _state(self) -> tuple[object, object, PreparedRouteCache | None]:
+        state = getattr(self._local, "state", None)
+        if state is not None:
+            return state
+        conn = get_db_connection()
+        conn.autocommit = True
+        cur = conn.cursor()
+        configure_session(
+            cur,
+            self.ef_search,
+            self.jit,
+            self.parallel_workers,
+            self.hnsw_iterative_scan,
+            force_hnsw_planner=True,
+            pg_parallel_route_scan=self.pg_parallel_route_scan,
+        )
+        cur.execute("SET enable_bitmapscan = off")
+        prepared_cache = PreparedRouteCache() if self.prepare_routes else None
+        state = (conn, cur, prepared_cache)
+        self._local.state = state
+        with self._lock:
+            self._connections.append((conn, cur))
+        return state
+
+    def warmup(self) -> None:
+        ready = threading.Barrier(self.max_workers + 1)
+
+        def initialize_worker() -> tuple[object, object, PreparedRouteCache | None]:
+            state = self._state()
+            ready.wait()
+            return state
+
+        futures = [self._executor.submit(initialize_worker) for _ in range(self.max_workers)]
+        ready.wait()
+        for future in as_completed(futures):
+            future.result()
+
+    def _execute_one_route(self, query: Query, route: Route, auth_filter: str) -> list[tuple]:
+        conn, cur, prepared_cache = self._state()
+        use_rls = auth_filter == "rls"
+
+        def run() -> list[tuple]:
+            if use_rls and self.use_user_access_join:
+                cur.execute(
+                    _route_candidate_select_with_user_access(route, use_sql_filter=(not route.pure)),
+                    _route_candidate_params_with_user_access(route, query, use_sql_filter=(not route.pure)),
+                )
+                return _fetch_ann_rows(cur)
+            if auth_filter == "native" and self.native_filter_location == "client" and not route.pure:
+                return _execute_ann_route_client_filter(
+                    cur,
+                    route,
+                    query_vector=query.vector,
+                    topk=query.topk,
+                    candidate_limit=_route_candidate_limit(
+                        route,
+                        query,
+                        use_sql_filter=True,
+                        overfetch=self.route_overfetch,
+                        ef_search=self.ef_search,
+                    ),
+                )
+            execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
+            return execute_route(
+                cur,
+                route,
+                query_vector=query.vector,
+                topk=_route_candidate_limit(
+                    route,
+                    query,
+                    use_sql_filter=(not route.pure) and not use_rls,
+                    overfetch=self.route_overfetch,
+                ),
+                use_sql_filter=(not route.pure) and not use_rls,
+            )
+
+        try:
+            if use_rls and not self.use_user_access_join:
+                return _execute_as_user(cur, query.user_id, run)
+            return run()
+        except BaseException:
+            try:
+                conn.rollback()
+            except BaseException:
+                pass
+            raise
+
+    def execute(
+        self,
+        query: Query,
+        used_routes: list[Route],
+        *,
+        auth_filter: str,
+        per_query_parallelism: int,
+    ) -> tuple[list[tuple], int]:
+        if not used_routes:
+            return [], 0
+        chunk_size = max(1, min(int(per_query_parallelism), len(used_routes)))
+        candidates: list[tuple] = []
+        for offset in range(0, len(used_routes), chunk_size):
+            futures = [
+                self._executor.submit(self._execute_one_route, query, route, auth_filter)
+                for route in used_routes[offset : offset + chunk_size]
+            ]
+            for future in as_completed(futures):
+                candidates.extend(future.result())
+        return merge_topk(candidates, query.topk), len(used_routes)
 
 
 def execute_partition_query(
@@ -724,7 +1188,6 @@ def execute_partition_query(
             return _fetch_ann_rows(cur), len(used_routes)
 
         candidates: list[tuple] = []
-        settings = _hnsw_settings(ef_search) if sql_batching else ()
         for route in used_routes:
             candidates.extend(
                 _execute_ann_route(
@@ -733,7 +1196,6 @@ def execute_partition_query(
                     query_vector=query.vector,
                     topk=query.topk,
                     use_sql_filter=(not route.pure) and not use_rls,
-                    settings=settings,
                 )
             )
         return merge_topk(candidates, query.topk), len(used_routes)
@@ -750,14 +1212,158 @@ def execute_ours_hnsw_query(
     ef_search: int,
     sql_batching: bool,
     auth_filter: str,
+    route_limit: int,
+    ours_db_function: bool,
     prepared_cache: PreparedRouteCache | None = None,
+    route_executor: OursRouteParallelExecutor | None = None,
+    route_parallelism: int = 1,
+    precompute_access: bool = False,
+    route_overfetch: int = 1,
+    native_filter_location: str = "client",
 ) -> tuple[list[tuple], int]:
     """Run SQUID routes with ordinary HNSW and a selectable auth filter."""
     used_routes = _ordered_ours_routes(routes.get(query.user_id, ()))
-    settings = _hnsw_settings(ef_search) if sql_batching else ()
+    if route_limit > 0:
+        used_routes = used_routes[:route_limit]
     use_rls = auth_filter == "rls"
 
+    if route_executor is not None and used_routes:
+        return route_executor.execute(
+            query,
+            used_routes,
+            auth_filter=auth_filter,
+            per_query_parallelism=int(route_parallelism),
+        )
+
     def run() -> tuple[list[tuple], int]:
+        if precompute_access and use_rls:
+            cur.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS direct_pg_qps_accessible_docs (
+                    document_id INTEGER PRIMARY KEY
+                ) ON COMMIT PRESERVE ROWS
+                """
+            )
+            cur.execute("TRUNCATE direct_pg_qps_accessible_docs")
+            cur.execute(
+                """
+                INSERT INTO direct_pg_qps_accessible_docs(document_id)
+                SELECT DISTINCT pa.document_id
+                FROM PermissionAssignment pa
+                JOIN UserRoles ur ON pa.role_id = ur.role_id
+                WHERE ur.user_id = %s
+                """,
+                [int(query.user_id)],
+            )
+            if len(used_routes) > 1 and sql_batching:
+                route_queries = [
+                    sql.SQL("(")
+                    + _route_candidate_select_with_access_cte(route, use_sql_filter=(not route.pure))
+                    + sql.SQL(")")
+                    for route in used_routes
+                ]
+                params: list[object] = []
+                for route in used_routes:
+                    params.extend(_route_candidate_params_with_access_cte(route, query, use_sql_filter=(not route.pure)))
+                statement = (
+                    sql.SQL("WITH route_candidates AS MATERIALIZED (")
+                    + sql.SQL(" UNION ALL ").join(route_queries)
+                    + sql.SQL(
+                        "), deduplicated AS ("
+                        "SELECT DISTINCT ON (block_id, document_id) block_id, document_id, distance "
+                        "FROM route_candidates ORDER BY block_id, document_id, distance"
+                        ") SELECT block_id, document_id, distance FROM deduplicated "
+                        "ORDER BY distance, block_id, document_id LIMIT %s"
+                    )
+                )
+                params.append(int(query.topk))
+                cur.execute(statement, params)
+                return _fetch_ann_rows(cur), len(used_routes)
+
+            candidates: list[tuple] = []
+            for route in used_routes:
+                cur.execute(
+                    _route_candidate_select_with_access_cte(route, use_sql_filter=(not route.pure)),
+                    _route_candidate_params_with_access_cte(route, query, use_sql_filter=(not route.pure)),
+                )
+                candidates.extend(_fetch_ann_rows(cur))
+            return merge_topk(candidates, query.topk), len(used_routes)
+
+        if ours_db_function:
+            cur.execute(
+                """
+                SELECT block_id, document_id, distance
+                FROM pg_temp.direct_pg_qps_ours_hnsw_search(%s::jsonb, %s::vector, %s, %s)
+                """,
+                [_ours_routes_json(used_routes, use_rls=use_rls), query.vector, int(query.topk), int(ef_search)],
+            )
+            return _fetch_ann_rows(cur), len(used_routes)
+
+        use_client_filter = auth_filter == "native" and native_filter_location == "client"
+        if use_client_filter:
+            candidates: list[tuple] = []
+            for route in used_routes:
+                if route.pure:
+                    execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
+                    candidates.extend(
+                        execute_route(
+                            cur,
+                            route,
+                            query_vector=query.vector,
+                            topk=query.topk,
+                            use_sql_filter=False,
+                        )
+                    )
+                    continue
+                candidates.extend(
+                    _execute_ann_route_client_filter(
+                        cur,
+                        route,
+                        query_vector=query.vector,
+                        topk=query.topk,
+                        candidate_limit=_route_candidate_limit(
+                            route,
+                            query,
+                            use_sql_filter=True,
+                            overfetch=route_overfetch,
+                            ef_search=ef_search,
+                        ),
+                    )
+                )
+            return merge_topk(candidates, query.topk), len(used_routes)
+
+        if len(used_routes) > 1 and sql_batching:
+            route_queries = [
+                sql.SQL("(")
+                + _route_candidate_select(route, use_sql_filter=(not route.pure) and not use_rls)
+                + sql.SQL(")")
+                for route in used_routes
+            ]
+            params: list[object] = []
+            for route in used_routes:
+                params.extend(
+                    _route_candidate_params_with_limit(
+                        route,
+                        query,
+                        use_sql_filter=(not route.pure) and not use_rls,
+                        overfetch=route_overfetch,
+                    )
+                )
+            statement = (
+                sql.SQL("WITH route_candidates AS MATERIALIZED (")
+                + sql.SQL(" UNION ALL ").join(route_queries)
+                + sql.SQL(
+                    "), deduplicated AS ("
+                    "SELECT DISTINCT ON (block_id, document_id) block_id, document_id, distance "
+                    "FROM route_candidates ORDER BY block_id, document_id, distance"
+                    ") SELECT block_id, document_id, distance FROM deduplicated "
+                    "ORDER BY distance, block_id, document_id LIMIT %s"
+                )
+            )
+            params.append(int(query.topk))
+            cur.execute(statement, params)
+            return _fetch_ann_rows(cur), len(used_routes)
+
         candidates: list[tuple] = []
         for route in used_routes:
             execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
@@ -766,14 +1372,18 @@ def execute_ours_hnsw_query(
                     cur,
                     route,
                     query_vector=query.vector,
-                    topk=query.topk,
+                    topk=_route_candidate_limit(
+                        route,
+                        query,
+                        use_sql_filter=(not route.pure) and not use_rls,
+                        overfetch=route_overfetch,
+                    ),
                     use_sql_filter=(not route.pure) and not use_rls,
-                    settings=settings,
                 )
             )
         return merge_topk(candidates, query.topk), len(used_routes)
 
-    if use_rls:
+    if use_rls and not precompute_access:
         return _execute_as_user(cur, query.user_id, run)
     return run()
 
@@ -786,22 +1396,48 @@ def execute_veda_hnsw_query(
     sql_batching: bool,
     auth_filter: str,
     prepared_cache: PreparedRouteCache | None = None,
+    indexed_tables: set[str] | None = None,
+    native_filter_location: str = "client",
+    route_overfetch: int = 1,
 ) -> tuple[list[tuple], int]:
     """Run VEDA routes with ordinary HNSW and a selectable auth filter."""
     used_routes = routes.get(query.user_id, ())
-    settings = _hnsw_settings(ef_search) if sql_batching else ()
     use_rls = auth_filter == "rls"
 
     def run() -> tuple[list[tuple], int]:
         candidates: list[tuple] = []
         for route in used_routes:
+            settings = _route_hnsw_settings(route, ef_search, indexed_tables) if sql_batching else ()
+            if auth_filter == "native" and native_filter_location == "client" and not route.pure:
+                candidates.extend(
+                    _execute_ann_route_client_filter(
+                        cur,
+                        route,
+                        query_vector=query.vector,
+                        topk=query.topk,
+                        candidate_limit=_route_candidate_limit(
+                            route,
+                            query,
+                            use_sql_filter=True,
+                            overfetch=route_overfetch,
+                            ef_search=ef_search,
+                        ),
+                        settings=settings,
+                    )
+                )
+                continue
             execute_route = prepared_cache.execute if prepared_cache is not None else _execute_ann_route
             candidates.extend(
                 execute_route(
                     cur,
                     route,
                     query_vector=query.vector,
-                    topk=query.topk,
+                    topk=_route_candidate_limit(
+                        route,
+                        query,
+                        use_sql_filter=(not route.pure) and not use_rls,
+                        overfetch=route_overfetch,
+                    ),
                     use_sql_filter=(not route.pure) and not use_rls,
                     settings=settings,
                 )
@@ -848,6 +1484,8 @@ def _squidhnsw_settings(
     bound = float(global_bound) if math.isfinite(float(global_bound)) else -1.0
     allowed = "" if route.pure else ",".join(str(pattern_id) for pattern_id in route.pattern_ids)
     return (
+        ("enable_seqscan", "off"),
+        ("enable_bitmapscan", "off"),
         ("squidhnsw.base_ef", str(min(max(1, int(base_ef)), effective_max_ef))),
         ("squidhnsw.max_ef", str(effective_max_ef)),
         ("squidhnsw.topk", str(max(0, int(topk)))),
@@ -873,9 +1511,12 @@ def execute_ours_kernel_query(
     *,
     sql_batching: bool,
     postgresql_merge: bool,
+    route_limit: int,
 ) -> tuple[list[tuple], int]:
     """Use SQUIDHNSW filtering and merge all route candidates globally."""
     used_routes = _ordered_ours_routes(routes.get(query.user_id, ()))
+    if route_limit > 0:
+        used_routes = used_routes[:route_limit]
     if postgresql_merge:
         statement = sql.SQL("TRUNCATE pg_temp.direct_pg_qps_candidates; ")
         params: list[object] = []
@@ -961,6 +1602,8 @@ def _vedahnsw_settings(
     bound = float(global_bound) if math.isfinite(float(global_bound)) else -1.0
     allowed = ",".join(str(pattern_id) for pattern_id in route.pattern_ids)
     return (
+        ("enable_seqscan", "off"),
+        ("enable_bitmapscan", "off"),
         ("vedahnsw.base_ef", str(effective_base_ef)),
         ("vedahnsw.max_ef", str(effective_max_ef)),
         ("vedahnsw.topk", str(max(0, int(topk)))),
@@ -986,21 +1629,33 @@ def execute_veda_kernel_query(
     *,
     sql_batching: bool,
     postgresql_merge: bool,
+    veda_native_all_routes: bool,
 ) -> tuple[list[tuple], int]:
     """Run VEDA/EffVeda routes and merge all candidates globally."""
     used_routes = routes.get(query.user_id, ())
-    pure_indices = sorted(
-        (route for route in used_routes if route.route_kind == "index"),
-        key=lambda route: (route.partition_vectors, route.partition_id),
-    )
-    impure_indices = sorted(
-        (route for route in used_routes if route.route_kind == "impure_index"),
-        key=lambda route: (route.impurity_factor, route.partition_vectors, route.partition_id),
-    )
-    leftovers = sorted(
-        (route for route in used_routes if route.route_kind == "leftover"),
-        key=lambda route: (route.partition_vectors, route.partition_id),
-    )
+    if veda_native_all_routes:
+        pure_indices = sorted(
+            (route for route in used_routes if route.route_kind != "impure_index"),
+            key=lambda route: (route.route_kind != "leftover", route.partition_vectors, route.partition_id),
+        )
+        impure_indices = sorted(
+            (route for route in used_routes if route.route_kind == "impure_index"),
+            key=lambda route: (route.impurity_factor, route.partition_vectors, route.partition_id),
+        )
+        leftovers: list[Route] = []
+    else:
+        pure_indices = sorted(
+            (route for route in used_routes if route.route_kind == "index"),
+            key=lambda route: (route.partition_vectors, route.partition_id),
+        )
+        impure_indices = sorted(
+            (route for route in used_routes if route.route_kind == "impure_index"),
+            key=lambda route: (route.impurity_factor, route.partition_vectors, route.partition_id),
+        )
+        leftovers = sorted(
+            (route for route in used_routes if route.route_kind == "leftover"),
+            key=lambda route: (route.partition_vectors, route.partition_id),
+        )
 
     if postgresql_merge:
         statement = sql.SQL("TRUNCATE pg_temp.direct_pg_qps_candidates; ")
@@ -1013,6 +1668,13 @@ def execute_veda_kernel_query(
             )
             for route in impure_indices
         )
+        for route in leftovers:
+            statement += _settings_prefix(
+                _hnsw_settings(base_ef) + (("enable_seqscan", "on"), ("enable_bitmapscan", "on"))
+            )
+            statement += _candidate_insert(route, use_sql_filter=True)
+            params.extend(_route_candidate_params(route, query, use_sql_filter=True))
+
         for route, route_max_ef in kernel_routes:
             settings = tuple(
                 (name, value)
@@ -1035,11 +1697,6 @@ def execute_veda_kernel_query(
             params.extend(bound_params)
             statement += _candidate_insert(route, use_sql_filter=False)
             params.extend(_route_candidate_params(route, query, use_sql_filter=False))
-
-        for route in leftovers:
-            statement += _settings_prefix(_hnsw_settings(base_ef))
-            statement += _candidate_insert(route, use_sql_filter=True)
-            params.extend(_route_candidate_params(route, query, use_sql_filter=True))
 
         final_statement, final_params = _sql_topk_from_candidates(query.topk)
         statement += final_statement
@@ -1092,15 +1749,11 @@ def execute_veda_kernel_query(
                 )
             )
 
-    for route in pure_indices:
-        search_kernel_route(route, base_ef)
-    for route in impure_indices:
-        expanded_ef = max(
-            int(base_ef),
-            int(math.ceil(float(route.impurity_factor) * float(base_ef))),
-        )
-        search_kernel_route(route, expanded_ef)
-    hnsw_settings = _hnsw_settings(base_ef) if sql_batching else ()
+    hnsw_settings = (
+        _hnsw_settings(base_ef) + (("enable_seqscan", "on"), ("enable_bitmapscan", "on"))
+        if sql_batching
+        else ()
+    )
     for route in leftovers:
         candidates.extend(
             _execute_ann_route(
@@ -1112,6 +1765,15 @@ def execute_veda_kernel_query(
                 settings=hnsw_settings,
             )
         )
+
+    for route in pure_indices:
+        search_kernel_route(route, base_ef)
+    for route in impure_indices:
+        expanded_ef = max(
+            int(base_ef),
+            int(math.ceil(float(route.impurity_factor) * float(base_ef))),
+        )
+        search_kernel_route(route, expanded_ef)
 
     return merge_topk(candidates, query.topk), len(used_routes)
 
@@ -1148,6 +1810,8 @@ def execute_hqi_query(
     ef_search: int,
     sql_batching: bool,
     auth_filter: str,
+    native_filter_location: str = "client",
+    route_overfetch: int = 1,
 ) -> tuple[list[tuple], int]:
     used_routes = routes.get(query, ())
     settings = _hnsw_settings(ef_search) if sql_batching else ()
@@ -1162,6 +1826,26 @@ def execute_hqi_query(
     def run() -> tuple[list[tuple], int]:
         if not used_routes:
             return [], 0
+        if auth_filter == "native" and native_filter_location == "client":
+            candidates: list[tuple] = []
+            for route in used_routes:
+                candidates.extend(
+                    _execute_ann_route_docid_client_filter(
+                        cur,
+                        route,
+                        query_vector=query.vector,
+                        topk=query.topk,
+                        candidate_limit=_route_candidate_limit(
+                            route,
+                            query,
+                            use_sql_filter=True,
+                            overfetch=route_overfetch,
+                            ef_search=ef_search,
+                        ),
+                        settings=settings,
+                    )
+                )
+            return merge_topk(candidates, query.topk), len(used_routes)
         if sql_batching:
             statement = _settings_prefix(settings) + sql.SQL("WITH route_candidates AS MATERIALIZED (")
             statement += sql.SQL(" UNION ALL " ).join(
@@ -1238,6 +1922,28 @@ def _tables_without_index_am(cur, table_names: set[str], access_method: str) -> 
     return missing
 
 
+def _tables_with_index_am(cur, table_names: set[str], access_method: str) -> set[str]:
+    indexed: set[str] = set()
+    for table_name in sorted(table_names):
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_index ix
+                JOIN pg_class index_class ON index_class.oid = ix.indexrelid
+                JOIN pg_am am ON am.oid = index_class.relam
+                WHERE ix.indrelid = to_regclass(%s)
+                  AND ix.indisvalid
+                  AND am.amname = %s
+            )
+            """,
+            [table_name, access_method],
+        )
+        if bool(cur.fetchone()[0]):
+            indexed.add(table_name)
+    return indexed
+
+
 def _preview(values: list[str], limit: int = 5) -> str:
     preview = ", ".join(values[:limit])
     return preview if len(values) <= limit else f"{preview}, ... (+{len(values) - limit})"
@@ -1302,6 +2008,7 @@ def validate_method_prerequisites(
     *,
     index_mode: str,
     auth_filter: str,
+    veda_native_all_routes: bool = False,
 ) -> None:
     """Fail before worker startup when a baseline has not been materialized."""
     conn = get_db_connection()
@@ -1399,21 +2106,20 @@ def validate_method_prerequisites(
                         f"{_preview(missing_indexes)}. Rebuild SQUID with --index-type {access_method}."
                     )
             elif name in {"veda", "effveda"}:
-                if index_mode == "hnsw":
-                    checked_tables = table_names
-                    access_method = "hnsw"
-                else:
+                if index_mode != "hnsw":
                     checked_tables = {
                         route.table_name for route in required_routes
                         if route.route_kind in {"index", "impure_index"}
                     }
                     access_method = "vedahnsw"
-                missing_indexes = _tables_without_index_am(cur, checked_tables, access_method)
-                if missing_indexes:
-                    raise RuntimeError(
-                        f"{name} routes are missing {access_method} indexes: {_preview(missing_indexes)}. "
-                        f"Rebuild the VEDA baseline with --index-type {access_method}."
-                    )
+                    if veda_native_all_routes:
+                        checked_tables = {route.table_name for route in required_routes}
+                    missing_indexes = _tables_without_index_am(cur, checked_tables, access_method)
+                    if missing_indexes:
+                        raise RuntimeError(
+                            f"{name} routes are missing {access_method} indexes: {_preview(missing_indexes)}. "
+                            f"Rebuild the VEDA baseline with --index-type {access_method}."
+                        )
 
             if auth_filter == "rls":
                 _ensure_query_roles_available(cur, requested_users, name.upper())
@@ -1545,7 +2251,24 @@ def run_method(
 ) -> dict[str, float]:
     if name != "rls" and routes is None:
         raise RuntimeError(f"{name} has no routes")
-    validate_method_prerequisites(name, queries, routes, index_mode=args.index_mode, auth_filter=args.auth_filter)
+    validate_method_prerequisites(
+        name,
+        queries,
+        routes,
+        index_mode=args.index_mode,
+        auth_filter=args.auth_filter,
+        veda_native_all_routes=bool(args.veda_native_all_routes),
+    )
+    indexed_tables: set[str] | None = None
+    if name in {"veda", "effveda"} and args.index_mode == "hnsw":
+        route_tables = {route.table_name for user_routes in (routes or {}).values() for route in user_routes}
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                indexed_tables = _tables_with_index_am(cur, route_tables, "hnsw")
+        finally:
+            conn.close()
+    duration_seconds = max(0.0, float(getattr(args, "duration_seconds", 0.0)))
     measured_queries = queries * max(1, int(args.query_repetitions))
     worker_count = min(max(1, int(args.concurrency)), max(1, len(measured_queries)))
     warmup_batches = round_robin_batches(measured_queries, worker_count)
@@ -1557,24 +2280,66 @@ def run_method(
             work_queue.put(query)
     ready = threading.Barrier(len(warmup_batches) + 1)
     start = threading.Event()
+    route_parallelism = max(1, int(getattr(args, "route_parallelism", 1)))
+    route_scheduler = str(getattr(args, "route_scheduler", "inline"))
+    use_route_pool = route_scheduler == "pool" or route_parallelism > 1
+    route_worker_count = int(getattr(args, "route_worker_count", 0))
+    if route_worker_count <= 0:
+        route_worker_count = max(route_parallelism, worker_count * route_parallelism)
+    route_executor: OursRouteParallelExecutor | None = None
+    if name == "ours" and args.index_mode == "hnsw" and use_route_pool:
+        route_executor = OursRouteParallelExecutor(
+            max_workers=route_worker_count,
+            ef_search=args.ef_search,
+            jit=args.jit,
+            parallel_workers=args.parallel_workers,
+            hnsw_iterative_scan=args.hnsw_iterative_scan,
+            pg_parallel_route_scan=bool(args.pg_parallel_route_scan),
+            prepare_routes=bool(args.prepare_routes),
+            use_user_access_join=bool(args.ours_precompute_access and args.auth_filter == "rls"),
+            native_filter_location=str(args.native_filter_location),
+            route_overfetch=int(args.route_overfetch),
+        )
+        route_executor.warmup()
 
     def worker(warmup_batch: list[Query]) -> WorkerResult:
         conn = None
         try:
-            conn = get_db_connection()
-            with conn.cursor() as cur:
-                configure_session(cur, args.ef_search, args.jit, args.parallel_workers)
-                prepared_cache = PreparedRouteCache() if args.prepare_routes else None
-                if name == "ours":
-                    # Match the SQUID search path, which forces its custom index only.
-                    cur.execute("SET enable_bitmapscan = off")
-                if args.postgresql_merge and name in {"ours", "veda", "effveda"}:
-                    cur.execute(
-                        "CREATE TEMP TABLE IF NOT EXISTS direct_pg_qps_candidates ("
-                        "block_id BIGINT NOT NULL, document_id BIGINT NOT NULL, "
-                        "distance DOUBLE PRECISION NOT NULL"
-                        ") ON COMMIT PRESERVE ROWS"
+            pool_only_worker = name == "ours" and args.index_mode == "hnsw" and route_executor is not None
+            conn = None if pool_only_worker else get_db_connection()
+            # Direct QPS should not accumulate AccessShareLocks for every routed
+            # partition in one long transaction, especially for VEDA/EffVeda
+            # plans with hundreds of route tables.
+            if conn is not None:
+                conn.autocommit = True
+            cursor_context = conn.cursor() if conn is not None else nullcontext(None)
+            with cursor_context as cur:
+                if cur is not None:
+                    configure_session(
+                        cur,
+                        args.ef_search,
+                        args.jit,
+                        args.parallel_workers,
+                        args.hnsw_iterative_scan,
+                        force_hnsw_planner=args.index_mode == "hnsw",
+                        pg_parallel_route_scan=bool(args.pg_parallel_route_scan),
                     )
+                    prepared_cache = PreparedRouteCache() if args.prepare_routes else None
+                    if name == "ours":
+                        # Match the SQUID search path, which forces its custom index only.
+                        cur.execute("SET enable_bitmapscan = off")
+                        if args.ours_db_function:
+                            install_ours_db_function(cur)
+                    if args.postgresql_merge and name in {"ours", "veda", "effveda"}:
+                        cur.execute(
+                            "CREATE TEMP TABLE IF NOT EXISTS direct_pg_qps_candidates ("
+                            "block_id BIGINT NOT NULL, document_id BIGINT NOT NULL, "
+                            "distance DOUBLE PRECISION NOT NULL"
+                            ") ON COMMIT PRESERVE ROWS"
+                        )
+                else:
+                    prepared_cache = None
+
                 def execute_query(query: Query) -> tuple[list[tuple], int]:
                     if name == "rls":
                         return execute_rls_query(
@@ -1598,6 +2363,8 @@ def run_method(
                             ef_search=args.ef_search,
                             sql_batching=method_sql_batching(name, args),
                             auth_filter=args.auth_filter,
+                            native_filter_location=str(args.native_filter_location),
+                            route_overfetch=int(args.route_overfetch),
                         )
                     if name == "ours":
                         if args.index_mode == "hnsw":
@@ -1608,7 +2375,14 @@ def run_method(
                                 ef_search=args.ef_search,
                                 sql_batching=method_sql_batching(name, args),
                                 auth_filter=args.auth_filter,
+                                route_limit=args.route_limit,
+                                ours_db_function=bool(args.ours_db_function),
                                 prepared_cache=prepared_cache,
+                                route_executor=route_executor,
+                                route_parallelism=route_parallelism,
+                                precompute_access=bool(args.ours_precompute_access),
+                                route_overfetch=int(args.route_overfetch),
+                                native_filter_location=str(args.native_filter_location),
                             )
                         return execute_ours_kernel_query(
                             cur,
@@ -1618,6 +2392,7 @@ def run_method(
                             args.squidhnsw_max_ef,
                             sql_batching=method_sql_batching(name, args),
                             postgresql_merge=args.postgresql_merge,
+                            route_limit=args.route_limit,
                         )
                     if name in {"veda", "effveda"}:
                         if args.index_mode == "hnsw":
@@ -1629,6 +2404,9 @@ def run_method(
                                 sql_batching=method_sql_batching(name, args),
                                 auth_filter=args.auth_filter,
                                 prepared_cache=prepared_cache,
+                                indexed_tables=indexed_tables,
+                                native_filter_location=str(args.native_filter_location),
+                                route_overfetch=int(args.route_overfetch),
                             )
                         return execute_veda_kernel_query(
                             cur,
@@ -1638,6 +2416,7 @@ def run_method(
                             args.vedahnsw_max_ef,
                             sql_batching=method_sql_batching(name, args),
                             postgresql_merge=args.postgresql_merge,
+                            veda_native_all_routes=bool(args.veda_native_all_routes),
                         )
                     return execute_partition_query(
                         cur,
@@ -1664,7 +2443,15 @@ def run_method(
                     query_elapsed = time.perf_counter() - started
                     values.append((query_elapsed, result, route_count, query))
 
-                if scheduler == "dynamic":
+                if duration_seconds > 0.0:
+                    deadline = worker_started + duration_seconds
+                    index = 0
+                    if not warmup_batch:
+                        return WorkerResult(values, time.perf_counter() - worker_started, 0)
+                    while time.perf_counter() < deadline:
+                        run_timed_query(warmup_batch[index % len(warmup_batch)])
+                        index += 1
+                elif scheduler == "dynamic":
                     assert work_queue is not None
                     while True:
                         try:
@@ -1693,23 +2480,27 @@ def run_method(
 
     values: list[tuple[float, list[tuple], int, Query]] = []
     worker_results: list[WorkerResult] = []
-    with ThreadPoolExecutor(max_workers=len(warmup_batches)) as executor:
-        futures = [executor.submit(worker, batch) for batch in warmup_batches]
-        try:
-            ready.wait()
-        except threading.BrokenBarrierError as exc:
-            for future in futures:
-                try:
-                    future.result()
-                except BaseException as worker_exc:
-                    raise RuntimeError(f"{name} worker failed before timed QPS execution: {worker_exc}") from worker_exc
-            raise RuntimeError(f"{name} worker startup barrier broke") from exc
-        started = time.perf_counter()
-        start.set()
-        for future in as_completed(futures):
-            worker_result = future.result()
-            worker_results.append(worker_result)
-            values.extend(worker_result.values)
+    try:
+        with ThreadPoolExecutor(max_workers=len(warmup_batches)) as executor:
+            futures = [executor.submit(worker, batch) for batch in warmup_batches]
+            try:
+                ready.wait()
+            except threading.BrokenBarrierError as exc:
+                for future in futures:
+                    try:
+                        future.result()
+                    except BaseException as worker_exc:
+                        raise RuntimeError(f"{name} worker failed before timed QPS execution: {worker_exc}") from worker_exc
+                raise RuntimeError(f"{name} worker startup barrier broke") from exc
+            started = time.perf_counter()
+            start.set()
+            for future in as_completed(futures):
+                worker_result = future.result()
+                worker_results.append(worker_result)
+                values.extend(worker_result.values)
+    finally:
+        if route_executor is not None:
+            route_executor.close()
     total_elapsed = time.perf_counter() - started
     worker_elapsed = [result.timed_elapsed for result in worker_results if result.query_count > 0]
     elapsed = max(worker_elapsed) if worker_elapsed else total_elapsed
@@ -1721,11 +2512,8 @@ def run_method(
     complete_results: list[float] = []
     for _, result, _, query in values:
         predicted = {(int(row[0]), int(row[1])) for row in result}
-        recalls.append(
-            len(predicted & query.ground_truth) / len(query.ground_truth)
-            if query.ground_truth
-            else 0.0
-        )
+        if query.ground_truth:
+            recalls.append(len(predicted & query.ground_truth) / len(query.ground_truth))
         result_counts.append(len(result))
         complete_results.append(1.0 if len(result) >= query.topk else 0.0)
 
@@ -1739,6 +2527,7 @@ def run_method(
         "queries": len(values),
         "unique_queries": len(queries),
         "query_repetitions": max(1, int(args.query_repetitions)),
+        "duration_seconds": duration_seconds if duration_seconds > 0.0 else None,
         "scheduler": scheduler,
         "qps": len(values) / elapsed,
         "avg_latency_ms": statistics.mean(latencies) * 1000,
@@ -1746,11 +2535,14 @@ def run_method(
         "p95_latency_ms": percentile(latencies, 0.95) * 1000,
         "p99_latency_ms": percentile(latencies, 0.99) * 1000,
         "max_latency_ms": max(latencies) * 1000,
-        "recall_at_k": statistics.mean(recalls),
+        "recall_at_k": statistics.mean(recalls) if recalls else None,
+        "recall_evaluated": bool(recalls),
         "avg_routes": statistics.mean(route_counts),
         "p50_routes": percentile(route_counts, 0.50),
         "p95_routes": percentile(route_counts, 0.95),
         "max_routes": max(route_counts),
+        "route_scans": sum(route_counts),
+        "route_scans_per_second": sum(route_counts) / elapsed if elapsed > 0 else 0.0,
         "avg_results": statistics.mean(result_counts),
         "complete_result_rate": statistics.mean(complete_results),
         "wall_time_seconds": elapsed,
@@ -1766,10 +2558,30 @@ def run_method(
         "ef_search": int(args.ef_search),
         "index_mode": args.index_mode,
         "auth_filter": args.auth_filter,
+        "hnsw_iterative_scan": args.hnsw_iterative_scan,
+        "pg_parallel_route_scan": bool(args.pg_parallel_route_scan),
+        "veda_native_all_routes": bool(args.veda_native_all_routes) if name in {"veda", "effveda"} else None,
         "sql_batching": method_sql_batching(name, args),
         "prepare_routes": bool(args.prepare_routes),
-        "merge_location": "postgresql" if args.postgresql_merge else "python",
+        "merge_location": (
+            "postgresql_function" if name == "ours" and bool(args.ours_db_function)
+            else ("postgresql" if args.postgresql_merge else "python")
+        ),
+        "hnsw_indexed_route_tables": len(indexed_tables) if indexed_tables is not None else None,
         "squidhnsw_max_ef": int(args.squidhnsw_max_ef) if name == "ours" else None,
+        "route_limit": int(args.route_limit) if name == "ours" and int(args.route_limit) > 0 else None,
+        "route_parallelism": route_parallelism if name == "ours" else None,
+        "route_scheduler": route_scheduler if name == "ours" else None,
+        "route_overfetch": int(args.route_overfetch) if name in {"ours", "hqi", "veda", "effveda"} else None,
+        "native_filter_location": str(args.native_filter_location) if name in {"ours", "hqi", "veda", "effveda"} else None,
+        "route_worker_count": route_worker_count if route_executor is not None else None,
+        "route_parallel_access_mode": (
+            "user_access_join"
+            if name == "ours" and route_executor is not None and bool(args.ours_precompute_access and args.auth_filter == "rls")
+            else ("set_role_rls" if name == "ours" and route_executor is not None and args.auth_filter == "rls" else None)
+        ),
+        "ours_precompute_access": bool(args.ours_precompute_access) if name == "ours" else None,
+        "ours_db_function": bool(args.ours_db_function) if name == "ours" else None,
         "vedahnsw_max_ef": int(args.vedahnsw_max_ef) if name in {"veda", "effveda"} else None,
     }
 
@@ -1777,11 +2589,17 @@ def run_method(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Direct PostgreSQL vector-search QPS benchmark")
     parser.add_argument("--methods", nargs="+", default=["rls", "role", "honeybee", "hqi", "ours", "veda", "effveda"])
+    parser.add_argument("--query-source", choices=["file", "db"], default="file",
+                        help="file reads --query-file/--ground-truth-file; db samples vectors and users from the connected database for QPS-only runs")
     parser.add_argument("--query-file", type=Path, default=PROJECT_ROOT / "basic_benchmark" / "query_dataset.json")
     parser.add_argument("--ground-truth-file", type=Path, default=PROJECT_ROOT / "basic_benchmark" / "ground_truth_cache.json")
     parser.add_argument("--query-count", type=int, default=200)
+    parser.add_argument("--topk", type=int, default=10,
+                        help="Top-k used with --query-source db")
     parser.add_argument("--query-repetitions", type=int, default=5,
                         help="Repeat the fixed query workload during measurement to reduce sub-second QPS noise")
+    parser.add_argument("--duration-seconds", type=float, default=0.0,
+                        help="If positive, run each worker for this many timed seconds instead of a fixed query count")
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--scheduler", choices=["dynamic", "static"], default="dynamic",
                         help="Query scheduling during timed QPS. dynamic uses a shared worker queue; static preserves the old round-robin batches.")
@@ -1798,6 +2616,22 @@ def main() -> None:
                         help="Authorization filter for partition methods. rls SET ROLEs to the query user and relies on table RLS policies; native uses each method original SQL/pattern filter.")
     parser.add_argument("--squidhnsw-max-ef", type=int, default=1000,
                         help="Adaptive SQUIDHNSW expansion cap for --methods ours")
+    parser.add_argument("--route-limit", type=int, default=0,
+                        help="For --methods ours only, search only the first N ordered routes; 0 means unlimited")
+    parser.add_argument("--route-parallelism", type=int, default=1,
+                        help="For --methods ours --index-mode hnsw, run up to N routes for one query concurrently")
+    parser.add_argument("--route-worker-count", type=int, default=0,
+                        help="Shared route-worker connection count for --route-parallelism; 0 derives concurrency * route_parallelism")
+    parser.add_argument("--route-scheduler", choices=["inline", "pool"], default="inline",
+                        help="For OURS HNSW, inline scans routes in the query worker; pool sends route scans to a fixed worker pool")
+    parser.add_argument("--route-overfetch", type=int, default=1,
+                        help="For OURS HNSW native SQL filtering, increase impure-route LIMIT by topk/selectivity * this factor")
+    parser.add_argument("--native-filter-location", choices=["sql", "client"], default="client",
+                        help="For OURS HNSW native auth, apply impure-route pattern filtering in SQL or after pure HNSW candidate fetch")
+    parser.add_argument("--ours-db-function", action="store_true",
+                        help="For --methods ours --index-mode hnsw, fill candidates and merge top-k inside a pg_temp function")
+    parser.add_argument("--ours-precompute-access", action=argparse.BooleanOptionalAction, default=True,
+                        help="For --methods ours --index-mode hnsw --auth-filter rls, precompute accessible document ids once per query and reuse them across route scans")
     parser.add_argument("--vedahnsw-max-ef", type=int, default=5000,
                         help="VEDAHNSW expansion cap for --methods veda effveda")
     parser.add_argument("--sql-batching", action=argparse.BooleanOptionalAction, default=None,
@@ -1810,20 +2644,41 @@ def main() -> None:
                         help="Kept for CLI compatibility; VEDA methods always use VEDAHNSW when selected")
     parser.add_argument("--jit", choices=["on", "off"], default="off")
     parser.add_argument("--parallel-workers", type=int, default=0)
+    parser.add_argument("--pg-parallel-route-scan", action="store_true",
+                        help="Lower PostgreSQL parallel costs and enable parallel append inside each worker session")
+    parser.add_argument(
+        "--hnsw-iterative-scan",
+        choices=HNSW_ITERATIVE_SCAN_VALUES,
+        default="off",
+        help="pgvector HNSW iterative scan mode: off, relaxed_order, or strict_order",
+    )
+    parser.add_argument("--veda-native-all-routes", action="store_true",
+                        help="For VEDA/EffVeda native mode, require and use VEDAHNSW for every route, including leftover nodes.")
     parser.add_argument("--memory-ratio", type=float, default=None,
                         help="Resolve a versioned materialization by method and memory ratio before timed QPS")
+    parser.add_argument("--current-label", default=os.environ.get("CURRENT_RESULT_LABEL", "current"),
+                        help="Output label used when --memory-ratio is omitted; keeps current-mode datasets separate")
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "basic_benchmark" / "result" / "direct_pg_qps",
                         help="Root for structured QPS outputs when --output is not set")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
     if args.index_mode == "hnsw" and args.postgresql_merge:
         parser.error("--postgresql-merge is only available with --index-mode native")
+    if args.route_parallelism < 1:
+        parser.error("--route-parallelism must be >= 1")
+    if args.route_worker_count < 0:
+        parser.error("--route-worker-count must be >= 0")
+    if args.ours_db_function and args.route_parallelism > 1:
+        parser.error("--ours-db-function and --route-parallelism > 1 are separate execution modes; use one at a time")
     if args.auth_filter == "rls" and args.index_mode == "native":
         native_methods = {_normalize_method_name(method) for method in args.methods} & {"ours", "veda", "effveda"}
         if native_methods:
             parser.error("--auth-filter rls requires --index-mode hnsw for ours/veda/effveda; use --auth-filter native with --index-mode native for the custom index path")
 
-    queries = load_queries(args.query_file, args.ground_truth_file, args.query_count)
+    if args.query_source == "db":
+        queries = load_db_sampled_queries(args.query_count, args.topk)
+    else:
+        queries = load_queries(args.query_file, args.ground_truth_file, args.query_count)
     loaders: dict[str, Callable[[PlanSelection], dict[int, tuple[Route, ...]]]] = {
         "role": lambda selection: load_role_routes(),
         "honeybee": load_honeybee_routes,
@@ -1841,13 +2696,22 @@ def main() -> None:
             summary = run_method(method, queries, routes, args, selection)
             summaries.append(summary)
             print(json.dumps(summary, sort_keys=True))
-        except (KeyError, RuntimeError) as exc:
-            print(json.dumps({"method": method, "skipped": str(exc)}, sort_keys=True))
+        except (KeyError, RuntimeError, ValueError) as exc:
+            print(
+                json.dumps(
+                    {
+                        "method": method,
+                        "skipped": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                    sort_keys=True,
+                )
+            )
 
     output_path = args.output
     if output_path is None:
         method_label = "_".join(_normalize_method_name(method) for method in args.methods)
-        memory_label = "current" if args.memory_ratio is None else ("memory_" + str(float(args.memory_ratio)).replace(".", "p"))
+        memory_label = str(args.current_label) if args.memory_ratio is None else ("memory_" + str(float(args.memory_ratio)).replace(".", "p"))
         ef_label = f"ef_{int(args.ef_search)}"
         timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         output_path = args.output_root / method_label / memory_label / ef_label / f"{timestamp}.json"

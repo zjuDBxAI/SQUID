@@ -1675,7 +1675,8 @@ class VedaPlanner:
             "copy_operations": int(copy_count),
             "merge_operations": int(merge_count),
             "copy_goal": "bottom-up valid-partition full-node duplication",
-            "merge_goal": "grow large unindexable nodes to the indexing threshold with virtual-decomposition impurity scoring",
+            "merge_goal": "threshold-driven direct merge of role-overlapping unindexable nodes",
+            "merge_policy": "largest_unindexable_first_min_overshoot",
         }
 
     def _effveda_copy_phase(self, lattice: dict[str, _LatticeNode], *, show_progress: bool) -> int:
@@ -1808,73 +1809,60 @@ class VedaPlanner:
     def _effveda_merge_phase(self, lattice: dict[str, _LatticeNode], *, show_progress: bool) -> int:
         node_order = sorted(lattice, key=lambda node_id: self._node_size(lattice[node_id]), reverse=True)
         applied = 0
-        index = 0
-        deferred_unindexable: set[str] = set()
-        iterator_total = len(node_order)
-        progress = tqdm(total=iterator_total, desc="EffVeda merge nodes", unit="node", disable=not show_progress)
-
-        def requeue_deferred(*, exclude: set[str] | None = None) -> None:
-            if not deferred_unindexable:
-                return
-            excluded = exclude or set()
-            requeued = 0
-            for deferred_id in sorted(deferred_unindexable):
-                if deferred_id in excluded:
-                    continue
-                if deferred_id in lattice and self._node_size(lattice[deferred_id]) < self.indexing_threshold:
-                    node_order.append(deferred_id)
-                    requeued += 1
-            deferred_unindexable.clear()
-            if requeued > 0:
-                try:
-                    progress.total = (progress.total or 0) + requeued
-                    progress.refresh()
-                except Exception:
-                    pass
+        progress = tqdm(total=len(node_order), desc="EffVeda merge nodes", unit="node", disable=not show_progress)
 
         try:
-            while index < len(node_order):
-                node_id = node_order[index]
+            for node_id in node_order:
                 if node_id not in lattice or self._node_size(lattice[node_id]) >= self.indexing_threshold:
-                    deferred_unindexable.discard(str(node_id))
-                    index += 1
                     progress.update(1)
                     continue
-                node = lattice[node_id]
-                candidates = self._merge_candidates(node, lattice)
-                scored = [
-                    (self._eff_merge_benefit(node, candidate), candidate.node_id)
-                    for candidate in candidates
-                    if candidate.node_id in lattice
-                ]
-                scored.sort(key=lambda item: item[0], reverse=True)
-                merged_this_node = False
-                for initial_benefit, candidate_id in scored:
-                    if initial_benefit <= 0.0 or node_id not in lattice or candidate_id not in lattice:
+
+                while node_id in lattice and self._node_size(lattice[node_id]) < self.indexing_threshold:
+                    node = lattice[node_id]
+                    candidate = self._select_threshold_merge_candidate(node, lattice)
+                    if candidate is None:
                         break
-                    renewed = self._eff_merge_benefit(lattice[node_id], lattice[candidate_id])
-                    if renewed <= 0.0:
-                        continue
-                    lattice[node_id] = self._merge_nodes(lattice[node_id], lattice[candidate_id])
-                    del lattice[candidate_id]
+                    lattice[node_id] = self._merge_nodes(node, candidate)
+                    del lattice[candidate.node_id]
                     applied += 1
-                    merged_this_node = True
-                    deferred_unindexable.discard(str(node_id))
-                    deferred_unindexable.discard(str(candidate_id))
-                    requeue_deferred(exclude={str(node_id), str(candidate_id)})
-                    if self._node_size(lattice[node_id]) >= self.indexing_threshold:
-                        break
-                if node_id in lattice and self._node_size(lattice[node_id]) < self.indexing_threshold:
-                    if merged_this_node:
-                        continue
-                    deferred_unindexable.add(str(node_id))
-                else:
-                    deferred_unindexable.discard(str(node_id))
-                index += 1
+
                 progress.update(1)
         finally:
             progress.close()
         return applied
+
+    def _select_threshold_merge_candidate(
+        self,
+        node: _LatticeNode,
+        lattice: dict[str, _LatticeNode],
+    ) -> _LatticeNode | None:
+        candidates = [
+            candidate
+            for candidate in self._merge_candidates(node, lattice)
+            if candidate.node_id in lattice and candidate.node_id != node.node_id
+        ]
+        if not candidates:
+            return None
+
+        needed = max(1, self.indexing_threshold - self._node_size(node))
+        reaching = [candidate for candidate in candidates if self._node_size(candidate) >= needed]
+        if reaching:
+            return min(
+                reaching,
+                key=lambda candidate: (
+                    self._node_size(candidate) - needed,
+                    -len(candidate.role_ids),
+                    candidate.node_id,
+                ),
+            )
+        return max(
+            candidates,
+            key=lambda candidate: (
+                self._node_size(candidate),
+                len(candidate.role_ids),
+                candidate.node_id,
+            ),
+        )
 
     def _refresh_virtual_components(self, lattice: dict[str, _LatticeNode]) -> None:
         self.post_copy_lattice = {

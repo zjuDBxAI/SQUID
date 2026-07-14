@@ -265,12 +265,19 @@ def run_calibration(args: argparse.Namespace) -> dict[str, object]:
         y_joint,
         nonnegative=not args.allow_negative,
     )
-    a = float(joint_coef[0])
-    b = float(joint_coef[1])
-    c = float(joint_coef[2])
+    joint_a = float(joint_coef[0])
+    joint_b = float(joint_coef[1])
+    joint_c = float(joint_coef[2])
 
-    c_from_size = c1 - b * 1.0
-    c_from_efs = c2 - a * math.log2(1.0 + float(fixed_size))
+    c_from_size_raw = float(c1 - b * 1.0)
+    c_from_efs_raw = float(c2 - a * math.log2(1.0 + float(fixed_size)))
+    if args.allow_negative:
+        c_from_size = c_from_size_raw
+        c_from_efs = c_from_efs_raw
+    else:
+        c_from_size = max(0.0, c_from_size_raw)
+        c_from_efs = max(0.0, c_from_efs_raw)
+    c = float(0.5 * (float(c_from_size) + float(c_from_efs)))
 
     selected_efs_term = "linear_efs" if linear_r2 >= log_r2 else "efs_log_efs"
     payload: dict[str, object] = {
@@ -285,16 +292,32 @@ def run_calibration(args: argparse.Namespace) -> dict[str, object]:
         "c2_efs_intercept": c2,
         "c_from_size": c_from_size,
         "c_from_efs": c_from_efs,
+        "c_from_size_raw": c_from_size_raw,
+        "c_from_efs_raw": c_from_efs_raw,
+        "c_from_size_constrained": c_from_size,
+        "c_from_efs_constrained": c_from_efs,
+        "c_combination_rule": (
+            "c_size = max(c1 - b * 1, 0); c_efs = max(c2 - a * log2(1 + fixed_size), 0); "
+            "c = 0.5 * (c_size + c_efs)"
+            if not args.allow_negative
+            else "c = 0.5 * (c_from_size + c_from_efs); unconstrained fit"
+        ),
         "selected_efs_term_by_r2": selected_efs_term,
         "joint_fit": {
             "formula": "T(N,efs)=a*log2(1+N)+b*efs+c",
+            "a": joint_a,
+            "b": joint_b,
+            "c": joint_c,
             "rmse_ms": joint_rmse,
             "mae_ms": joint_mae,
             "r2": joint_r2,
             "nonnegative": not args.allow_negative,
+            "diagnostic_only": True,
         },
         "size_sweep": {
             "formula": "T_size(N)=a*log2(1+N)+c1",
+            "a": a,
+            "c1": c1,
             "rmse_ms": size_rmse,
             "mae_ms": size_mae,
             "r2": size_r2,
@@ -345,6 +368,10 @@ def run_calibration(args: argparse.Namespace) -> dict[str, object]:
                 f"a = {a:.10f}",
                 f"b = {b:.10f}",
                 f"c = {c:.10f}",
+                f"c_from_size_raw = {c_from_size_raw:.10f}",
+                f"c_from_efs_raw = {c_from_efs_raw:.10f}",
+                f"c_from_size_constrained = {c_from_size:.10f}",
+                f"c_from_efs_constrained = {c_from_efs:.10f}",
                 "",
                 f"joint_fit_r2 = {joint_r2:.6f}",
                 f"size_sweep_r2 = {size_r2:.6f}",

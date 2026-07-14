@@ -1,0 +1,73 @@
+{
+  "model_name": "veda_appendix_b_hnsw_cost",
+  "formula": "C_theta(N,efs)=a*log2(1+N)+b*efs+c",
+  "latency_unit": "ms",
+  "latency_stat": "median",
+  "a": 0.04903240377677421,
+  "b": 0.04061619145480957,
+  "c": 1.2148781407184922e-15,
+  "c1_size_intercept": 9.812650919955957e-15,
+  "c2_efs_intercept": 0.9407072346771238,
+  "c_from_size": -0.040616191454799756,
+  "c_from_efs": 0.01533447222755302,
+  "selected_efs_term_by_r2": "linear_efs",
+  "joint_fit": {
+    "formula": "T(N,efs)=a*log2(1+N)+b*efs+c",
+    "rmse_ms": 1.9063461745603507,
+    "mae_ms": 1.088156472036609,
+    "r2": 0.975762648052683,
+    "nonnegative": true
+  },
+  "size_sweep": {
+    "formula": "T_size(N)=a*log2(1+N)+c1",
+    "rmse_ms": 0.11331155843630211,
+    "mae_ms": 0.1045467516030845,
+    "r2": 0.6348360062255587
+  },
+  "efs_sweep_linear": {
+    "formula": "T_efs(efs)=b*efs+c2",
+    "b": 0.04061619145480957,
+    "c2": 0.9407072346771238,
+    "rmse_ms": 2.297711960315452,
+    "mae_ms": 1.5350080811732902,
+    "r2": 0.971742795381397
+  },
+  "efs_sweep_log": {
+    "formula": "T_efs(efs)=b_log*efs*log2(efs)+c2_log",
+    "b_log": 0.004067853556722639,
+    "c2_log": 1.812576449544303,
+    "rmse_ms": 2.441068407047967,
+    "mae_ms": 1.6945023203391285,
+    "r2": 0.9681068124556733
+  },
+  "sizes": [
+    10000,
+    50000,
+    100000,
+    300000,
+    480000
+  ],
+  "efs_values": [
+    1,
+    5,
+    10,
+    20,
+    40,
+    80,
+    120,
+    200,
+    400,
+    800,
+    1000
+  ],
+  "fixed_size": 480000,
+  "query_file": "basic_benchmark/query_dataset.json",
+  "query_count": 50,
+  "query_topk": 1,
+  "source_table": "documentblocks",
+  "table_prefix": "veda_cost_wiki_current",
+  "hnsw_m": 16,
+  "hnsw_ef_construction": 64,
+  "size_sweep_csv": "controller/baseline/veda/train/result_wiki_current_20260714/veda_cost_size_sweep.csv",
+  "efs_sweep_csv": "controller/baseline/veda/train/result_wiki_current_20260714/veda_cost_efs_sweep.csv"
+}
