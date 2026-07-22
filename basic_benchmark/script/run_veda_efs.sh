@@ -9,6 +9,8 @@ PYTHON_BIN="${PYTHON_BIN:-/home/chenyang/.conda/envs/multitenant/bin/python}"
 
 # Algorithm can be "veda" or "effveda".
 ALGORITHM="${ALGORITHM:-effveda}"
+PLAN_MODE="${PLAN_MODE:-current}"
+MEMORY_RATIO="${MEMORY_RATIO:-1.5}"
 
 # Space-separated ef_search values. Override with: EFS_VALUES="40 80 120" ./script/run_veda_efs.sh
 EFS_VALUES="${EFS_VALUES:-100}"
@@ -18,6 +20,9 @@ read -r -a EFS_LIST <<< "${EFS_VALUES}"
 PREPARE="${PREPARE:-true}"
 # Veda planning uses ef_search in the cost model, so rebuilding per ef is the safer default.
 REBUILD_EACH_EF="${REBUILD_EACH_EF:-false}"
+BUILD_CURRENT="${BUILD_CURRENT:-false}"
+CURRENT_BUILD_EF="${CURRENT_BUILD_EF:-${EFS_VALUES%% *}}"
+CURRENT_BUILD_WORKERS="${CURRENT_BUILD_WORKERS:-10}"
 
 QUERY_NUM="${QUERY_NUM:-200}"
 ITERATIONS="${ITERATIONS:-1}"
@@ -54,6 +59,40 @@ _bool_true() {
   esac
 }
 
+if _bool_true "${BUILD_CURRENT}"; then
+  build_args=(
+    "${PYTHON_BIN}" "${ROOT_DIR}/script/squid/build_current_partitions.py"
+    --methods "${ALGORITHM}"
+    --memory-ratio "${STORAGE_AMPLIFICATION}"
+    --ef-search "${CURRENT_BUILD_EF}"
+    --workers "${CURRENT_BUILD_WORKERS}"
+    --veda-index-type "${INDEX_TYPE}"
+    --veda-indexing-threshold "${INDEXING_THRESHOLD}"
+  )
+  if [[ -n "${DOCUMENT_LIMIT}" ]]; then
+    build_args+=(--document-limit "${DOCUMENT_LIMIT}")
+  fi
+  if [[ -n "${QUERY_DATASET_PATH}" ]]; then
+    build_args+=(--query-dataset-path "${QUERY_DATASET_PATH}")
+  fi
+
+  echo "[run_veda_efs] building current ${ALGORITHM} partitions before SQL query-time sweep"
+  printf '[CMD]'
+  printf ' %q' "${build_args[@]}"
+  printf '\n'
+  "${build_args[@]}"
+  PREPARE=false
+fi
+
+if [[ "$(printf '%s' "${PLAN_MODE}" | tr '[:upper:]' '[:lower:]')" == "versioned" ]]; then
+  echo "[run_veda_efs] using existing versioned ${ALGORITHM} plan: memory_ratio=${MEMORY_RATIO}"
+  eval "$("${PYTHON_BIN}" "${ROOT_DIR}/script/squid/resolve_versioned_env.py" \
+    --method "${ALGORITHM}" \
+    --memory-ratio "${MEMORY_RATIO}")"
+  export SKIP_INDEX_MAINTENANCE=true
+  PREPARE=false
+fi
+
 run_case() {
   local efs="$1"
   local prepare="$2"
@@ -63,7 +102,7 @@ run_case() {
   local log_file="${METHOD_LOG_DIR}/${result_tag}_${ts}.log"
 
   local cmd=(
-    python test_veda.py
+    "${PYTHON_BIN}" test_veda.py
     --prepare "${prepare}"
     --algorithm "${ALGORITHM}"
     --enable-index "${ENABLE_INDEX}"

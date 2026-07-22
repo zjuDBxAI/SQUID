@@ -27,9 +27,21 @@ def test_dynamic_partition_search(iterations=1, enable_index=True, index_type="h
     """
     Test search across partitions with optional index creation and verification.
     """
-    current_index_type = get_index_type("documentblocks_partition_0")
+    table_prefix = os.environ.get("HONEYBEE_TABLE_PREFIX") or os.environ.get("DYNAMIC_PARTITION_TABLE_PREFIX")
+    sample_table = f"{table_prefix}_partition_0" if table_prefix else "documentblocks_partition_0"
+    current_index_type = get_index_type(sample_table)
+    skip_index_maintenance = str(os.environ.get("SKIP_INDEX_MAINTENANCE", "")).strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    }
 
-    if enable_index:
+    if skip_index_maintenance:
+        logger.info("Skipping dynamic partition index maintenance; using existing indexes.")
+    elif enable_index:
         if current_index_type is not None and current_index_type != index_type:
             logger.info(
                 "Index type %s does not match %s. Recreating index.",
@@ -37,7 +49,7 @@ def test_dynamic_partition_search(iterations=1, enable_index=True, index_type="h
                 index_type,
             )
             drop_indexes_for_all_partitions()
-        create_indexes_for_all_partitions(index_type)
+        create_indexes_for_all_partitions(index_type, table_prefix=table_prefix)
     else:
         drop_indexes_for_all_partitions()
 

@@ -31,11 +31,16 @@ CURRENT_MEMORY_RATIO="${CURRENT_MEMORY_RATIO:-${MEMORY_VALUES%% *}}"
 CURRENT_RESULT_LABEL="${CURRENT_RESULT_LABEL:-current}"
 CURRENT_BUILD_EF="${CURRENT_BUILD_EF:-${EF_VALUES%% *}}"
 CURRENT_OURS_COST_EF="${CURRENT_OURS_COST_EF:-18}"
+KMEANS_COST_MODEL_JSON="${KMEANS_COST_MODEL_JSON:-${PROJECT_ROOT}/controller/kmeans/train/result/wiki_latency_cost_095_regrouped_20260715/wiki_latency_cost_095_regrouped_20260715_planner_model.json}"
+export KMEANS_COST_MODEL_JSON
 OURS_EFS_MODEL_JSON="${OURS_EFS_MODEL_JSON:-${PROJECT_ROOT}/controller/kmeans/train/result/yfcc_recall_fit/yfcc_hnsw_recall_model.json}"
 OURS_TARGET_RECALL="${OURS_TARGET_RECALL:-0.95}"
 ROLE_INDEX_TYPE="${ROLE_INDEX_TYPE:-hnsw}"
 VEDA_INDEXING_THRESHOLD="${VEDA_INDEXING_THRESHOLD:-1000}"
 CURRENT_BUILD_WORKERS="${CURRENT_BUILD_WORKERS:-10}"
+HONEYBEE_RECALL="${HONEYBEE_RECALL:-0.99}"
+HQI_MIN_SIZE="${HQI_MIN_SIZE:-512}"
+HQI_INDEX_TYPE="${HQI_INDEX_TYPE:-hnsw}"
 JIT="${JIT:-off}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-0}"
 AUTH_FILTER="${AUTH_FILTER:-rls}"
@@ -118,6 +123,9 @@ for memory in "${MEMORY_LIST[@]}"; do
             --ours-index-type "${OURS_INDEX_TYPE}" \
             --veda-index-type "${VEDA_INDEX_TYPE}" \
             --veda-indexing-threshold "${VEDA_INDEXING_THRESHOLD}" \
+            --honeybee-recall "${HONEYBEE_RECALL}" \
+            --hqi-min-size "${HQI_MIN_SIZE}" \
+            --hqi-index-type "${HQI_INDEX_TYPE}" \
             --no-enable-split
       else
         timeout --foreground "${PLANNER_TIMEOUT}" \

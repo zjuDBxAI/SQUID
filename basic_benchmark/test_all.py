@@ -20,6 +20,8 @@ from basic_benchmark.space_calculate import (
 from basic_benchmark.test_dynamic_partition import test_dynamic_partition_search
 from basic_benchmark.test_row_level_security import test_row_level_security
 from basic_benchmark.test_qd_tree_partition import test_qd_tree_partition_search
+from basic_benchmark.test_kmeans_partition import test_kmeans_partition_search
+from basic_benchmark.test_veda import test_veda_search
 import efconfig
 
 
@@ -32,6 +34,23 @@ def _str_to_bool(value: str) -> bool:
     raise ValueError(f'Invalid boolean value: {value}')
 
 
+ALGORITHM_ALIASES = {
+    'rls': 'RLS',
+    'role': 'ROLE',
+    'user': 'USER',
+    'anonysys': 'AnonySys',
+    'honeybee': 'AnonySys',
+    'dynamic_partition': 'AnonySys',
+    'qdtree': 'QDTree',
+    'qd_tree': 'QDTree',
+    'hqi': 'QDTree',
+    'ours': 'OURS',
+    'squid': 'SQUID',
+    'veda': 'VEDA',
+    'effveda': 'EFFVEDA',
+}
+
+
 # python test_all.py --algorithm AnonySys --efs 40
 if __name__ == '__main__':
     import argparse
@@ -40,9 +59,13 @@ if __name__ == '__main__':
 
     parser.add_argument(
         '--algorithm',
-        choices=['RLS', 'ROLE', 'USER', 'AnonySys', 'QDTree'],
+        choices=[
+            'RLS', 'ROLE', 'USER', 'AnonySys', 'QDTree', 'OURS', 'SQUID', 'VEDA', 'EFFVEDA',
+            'rls', 'role', 'user', 'anonysys', 'honeybee', 'dynamic_partition',
+            'qdtree', 'qd_tree', 'hqi', 'ours', 'squid', 'veda', 'effveda',
+        ],
         required=True,
-        help='Select which test to run: RLS, ROLE, USER, AnonySys, or QDTree',
+        help='Select which test to run: RLS, ROLE, USER, AnonySys, QDTree, OURS/SQUID, VEDA, or EFFVEDA',
     )
     parser.add_argument(
         '--efs',
@@ -52,13 +75,18 @@ if __name__ == '__main__':
         help='List of EF search values to use (space-separated integers).',
     )
     parser.add_argument('--enable-index', type=_str_to_bool, default=True, help='Whether to build ANN indexes for the selected method.')
-    parser.add_argument('--index-type', choices=['hnsw', 'ivfflat'], default='hnsw', help='ANN index type used by the selected method.')
+    parser.add_argument('--index-type', choices=['hnsw', 'squidhnsw', 'vedahnsw', 'ivfflat'], default='hnsw', help='ANN index type used by the selected method.')
     parser.add_argument('--statistics-type', choices=['sql', 'system'], default='sql', help='Latency source: EXPLAIN SQL time or wall-clock system time.')
     parser.add_argument('--generator-type', default='', help='Tag included in output filenames.')
     parser.add_argument('--iterations', type=int, default=1, help='Repeat each query this many times and average the result.')
     parser.add_argument('--query-num', type=int, default=1000, help='Number of queries to run.')
     parser.add_argument('--record-recall', type=_str_to_bool, default=True, help='Whether to compute recall against ground truth.')
     parser.add_argument('--warm-up', type=_str_to_bool, default=True, help='Whether to warm up each query before measuring.')
+    parser.add_argument('--use-ground-truth-cache', type=_str_to_bool, default=True, help='Whether to reuse the ground-truth cache when supported.')
+    parser.add_argument('--veda-search-mode', default='coordinated', help='Search mode for VEDA/EFFVEDA current layouts.')
+    parser.add_argument('--veda-sql-timing-mode', default='fair', help='SQL timing mode for VEDA/EFFVEDA current layouts.')
+    parser.add_argument('--hnsw-iterative-scan', default='off', help='pgvector hnsw.iterative_scan setting for VEDA/EFFVEDA.')
+    parser.add_argument('--hnsw-max-scan-tuples', type=int, default=None, help='Optional pgvector hnsw.max_scan_tuples for VEDA/EFFVEDA.')
 
     args = parser.parse_args()
     enable_index = args.enable_index
@@ -69,8 +97,9 @@ if __name__ == '__main__':
     query_num = args.query_num
     record_recall = args.record_recall
     warm_up = args.warm_up
+    use_ground_truth_cache = args.use_ground_truth_cache
 
-    test_type = args.algorithm
+    test_type = ALGORITHM_ALIASES.get(str(args.algorithm).strip().lower(), args.algorithm)
     ef_search_values = args.efs
 
     logger.info('Test Type: %s', test_type)
@@ -161,3 +190,47 @@ if __name__ == '__main__':
             )
             qdt_space_mb = calculate_qd_tree_storage('qd_tree_partition', enable_index=enable_index)
             logger.info('QDTree partition storage footprint: %.2f MB', qdt_space_mb)
+
+    elif test_type in {'OURS', 'SQUID'}:
+        for ef in ef_search_values:
+            efconfig.ef_search = ef
+            logger.info('Running OURS/SQUID current-layout test with ef_search=%s', ef)
+            test_kmeans_partition_search(
+                iterations=iterations,
+                enable_index=enable_index,
+                index_type=index_type,
+                statistics_type=statistics_type,
+                generator_type=generator_type,
+                record_recall=record_recall,
+                warm_up=warm_up,
+                query_num=query_num,
+                prepare_before_test=False,
+                ef_search=ef,
+                result_tag=f"{generator_type}_current_ef{ef}" if generator_type else f"current_ef{ef}",
+                use_ground_truth_cache=use_ground_truth_cache,
+            )
+
+    elif test_type in {'VEDA', 'EFFVEDA'}:
+        algorithm = test_type.lower()
+        for ef in ef_search_values:
+            efconfig.ef_search = ef
+            logger.info('Running %s current-layout test with ef_search=%s', algorithm, ef)
+            test_veda_search(
+                iterations=iterations,
+                enable_index=enable_index,
+                index_type=index_type,
+                statistics_type=statistics_type,
+                generator_type=generator_type,
+                record_recall=record_recall,
+                warm_up=warm_up,
+                query_num=query_num,
+                prepare_before_test=False,
+                algorithm=algorithm,
+                ef_search=ef,
+                hnsw_iterative_scan=args.hnsw_iterative_scan,
+                hnsw_max_scan_tuples=args.hnsw_max_scan_tuples,
+                search_mode=args.veda_search_mode,
+                sql_timing_mode=args.veda_sql_timing_mode,
+                result_tag=f"{generator_type}_{algorithm}_current_ef{ef}" if generator_type else f"{algorithm}_current_ef{ef}",
+                use_ground_truth_cache=use_ground_truth_cache,
+            )

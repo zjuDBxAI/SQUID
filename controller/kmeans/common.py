@@ -9,11 +9,11 @@ import numpy as np
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_QUERY_DATASET_PATH = os.path.join(PROJECT_ROOT, "basic_benchmark", "query_dataset.json")
 
-KMEANS_PARTITION_TABLE_PREFIX = "kmeans_documentblocks_partition_"
-PLAN_TABLE = "kmeans_current_plan"
-PARTITION_TABLE = "kmeans_current_partitions"
-ROUTE_TABLE = "kmeans_current_routes"
-PATTERN_TABLE = "kmeans_current_patterns"
+KMEANS_PARTITION_TABLE_PREFIX = os.environ.get("KMEANS_PARTITION_TABLE_PREFIX", "kmeans_documentblocks_partition_")
+PLAN_TABLE = os.environ.get("KMEANS_PLAN_TABLE", "kmeans_current_plan")
+PARTITION_TABLE = os.environ.get("KMEANS_PARTITION_TABLE", "kmeans_current_partitions")
+ROUTE_TABLE = os.environ.get("KMEANS_ROUTE_TABLE", "kmeans_current_routes")
+PATTERN_TABLE = os.environ.get("KMEANS_PATTERN_TABLE", "kmeans_current_patterns")
 
 
 def _parse_vector(raw_value) -> np.ndarray:

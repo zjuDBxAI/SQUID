@@ -299,14 +299,18 @@ def calculate_rls_policy_size(dynamic_partition=False):
     cur.execute("""
         SELECT pg_total_relation_size('pg_policy') / 1024.0 / 1024.0;
     """)
-    rls_policy_size_mb = cur.fetchone()[0]
+    rls_policy_size_mb = float(cur.fetchone()[0] or 0.0)
 
     # If dynamic_partition is True, include the size of the materialized view
     if dynamic_partition:
-        cur.execute("""
-            SELECT pg_total_relation_size('user_accessible_documents') / 1024.0 / 1024.0;
-        """)
-        materialized_view_size_mb = cur.fetchone()[0]
+        cur.execute("SELECT to_regclass('user_accessible_documents') IS NOT NULL;")
+        if cur.fetchone()[0]:
+            cur.execute("""
+                SELECT pg_total_relation_size('user_accessible_documents') / 1024.0 / 1024.0;
+            """)
+            materialized_view_size_mb = float(cur.fetchone()[0] or 0.0)
+        else:
+            materialized_view_size_mb = 0.0
         total_size_mb = rls_policy_size_mb + materialized_view_size_mb
     else:
         total_size_mb = rls_policy_size_mb
@@ -368,14 +372,17 @@ def calculate_dynamic_partition(condition=None, *, enable_index=None):
     Returns:
         float: The total size of the dynamic partition tables in MB.
     """
+    mapping_table = os.environ.get("HONEYBEE_MAPPING_TABLE") or os.environ.get("DYNAMIC_PARTITION_MAPPING_TABLE") or "CombRolePartitions"
+    table_prefix = os.environ.get("HONEYBEE_TABLE_PREFIX") or os.environ.get("DYNAMIC_PARTITION_TABLE_PREFIX")
     tables = [
         'Documents', 'PermissionAssignment', 'Roles',
-        'UserRoles', 'Users', 'CombRolePartitions'
+        'UserRoles', 'Users', mapping_table
     ]
 
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE 'documentblocks_partition_%';")
+    like_pattern = f"{table_prefix}_partition_%" if table_prefix else "documentblocks_partition_%"
+    cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE %s;", [like_pattern])
     tables.extend(row[0] for row in cur.fetchall())
     cur.close()
     conn.close()
@@ -427,10 +434,13 @@ def calculate_method_partition(condition=None, *, enable_index=None):
 
 def calculate_kmeans_partition(condition=None, *, enable_index=None):
     """Calculate total physical storage for the kmeans tenant-cluster partition implementation."""
+    plan_table = os.environ.get('KMEANS_PLAN_TABLE', 'kmeans_current_plan')
+    partition_table = os.environ.get('KMEANS_PARTITION_TABLE', 'kmeans_current_partitions')
+    pattern_table = os.environ.get('KMEANS_PATTERN_TABLE', 'kmeans_current_patterns')
+    route_table = os.environ.get('KMEANS_ROUTE_TABLE', 'kmeans_current_routes')
     base_tables = [
         'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
-        'kmeans_current_plan', 'kmeans_current_partitions',
-        'kmeans_current_patterns', 'kmeans_current_routes',
+        plan_table, partition_table, pattern_table, route_table,
     ]
 
     total_storage_mb = 0.0
@@ -446,11 +456,15 @@ def calculate_kmeans_partition(condition=None, *, enable_index=None):
             total_storage_mb += calculate_table_storage_in_mb(existing_base_tables)
 
         cur.execute(
-            """
-            SELECT tablename
-            FROM pg_tables
-            WHERE tablename LIKE 'kmeans_documentblocks_partition_%';
-            """
+            sql.SQL(
+                """
+                SELECT table_name
+                FROM {}
+                WHERE plan_id = (
+                    SELECT plan_id FROM {} ORDER BY plan_id DESC LIMIT 1
+                );
+                """
+            ).format(sql.Identifier(partition_table), sql.Identifier(plan_table))
         )
         partition_tables = [row[0] for row in cur.fetchall()]
         if partition_tables:
@@ -597,10 +611,13 @@ def calculate_sieve(condition=None, *, enable_index=None):
 
 def calculate_veda(condition=None, *, enable_index=None):
     """Calculate total physical storage for the Veda/EffVeda access-aware lattice baseline."""
+    plan_table = os.environ.get('VEDA_PLAN_TABLE', 'veda_current_plan')
+    pattern_table = os.environ.get('VEDA_PATTERN_TABLE', 'veda_current_patterns')
+    node_table = os.environ.get('VEDA_NODE_TABLE', 'veda_current_nodes')
+    route_table = os.environ.get('VEDA_ROUTE_TABLE', 'veda_current_user_routes')
     tables = [
         'Documents', 'PermissionAssignment', 'Roles', 'UserRoles', 'Users',
-        'veda_current_plan', 'veda_current_patterns', 'veda_current_nodes',
-        'veda_current_role_plans', 'veda_current_user_routes',
+        plan_table, pattern_table, node_table, route_table,
     ]
 
     normalized = str(condition or "").strip().lower()
@@ -620,15 +637,29 @@ def calculate_veda(condition=None, *, enable_index=None):
             if cur.fetchone()[0] is not None:
                 existing_tables.append(table_name)
 
-        cur.execute(
-            """
-            SELECT tablename
-            FROM pg_tables
-            WHERE tablename LIKE %s;
-            """,
-            [node_table_like],
-        )
-        existing_tables.extend(row[0] for row in cur.fetchall())
+        if os.environ.get('VEDA_NODE_TABLE'):
+            cur.execute(
+                sql.SQL(
+                    """
+                    SELECT table_name
+                    FROM {}
+                    WHERE plan_id = (
+                        SELECT plan_id FROM {} ORDER BY plan_id DESC LIMIT 1
+                    );
+                    """
+                ).format(sql.Identifier(node_table), sql.Identifier(plan_table))
+            )
+            existing_tables.extend(row[0] for row in cur.fetchall())
+        else:
+            cur.execute(
+                """
+                SELECT tablename
+                FROM pg_tables
+                WHERE tablename LIKE %s;
+                """,
+                [node_table_like],
+            )
+            existing_tables.extend(row[0] for row in cur.fetchall())
     finally:
         cur.close()
         conn.close()

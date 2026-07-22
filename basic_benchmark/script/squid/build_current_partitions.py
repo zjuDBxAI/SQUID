@@ -8,6 +8,7 @@ It intentionally uses the existing non-versioned/current metadata paths:
 * VEDA/EffVeda -> veda_current_* tables
 * ROLE -> documentblocks_role_* tables
 * RLS -> documentblocks row-level security
+* HONEYBEE -> documentblocks_partition_* and CombRolePartitions
 * HQI -> QD-tree pickle + partition tables
 """
 
@@ -56,6 +57,9 @@ METHOD_ALIASES = {
     "veda": "veda",
     "role": "role",
     "rls": "rls",
+    "honeybee": "honeybee",
+    "anonysys": "honeybee",
+    "dynamic_partition": "honeybee",
     "hqi": "hqi",
     "qdtree": "hqi",
     "qd_tree": "hqi",
@@ -136,6 +140,21 @@ def build_veda(method: str, args: argparse.Namespace) -> None:
     )
 
 
+def build_honeybee(args: argparse.Namespace) -> None:
+    subprocess.run(
+        [
+            str(args.python_bin),
+            str(PROJECT_ROOT / "controller" / "dynamic_partition" / "hnsw" / "AnonySys_dynamic_partition.py"),
+            "--storage",
+            str(float(args.memory_ratio)),
+            "--recall",
+            str(float(args.honeybee_recall)),
+        ],
+        check=True,
+        cwd=str(PROJECT_ROOT),
+    )
+
+
 def build_hqi(args: argparse.Namespace) -> None:
     python = str(args.python_bin)
     subprocess.run(
@@ -164,7 +183,7 @@ def build_hqi(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build current-style partitions for direct current-mode QPS.")
-    parser.add_argument("--methods", nargs="+", required=True, help="Methods: rls role ours effveda veda hqi")
+    parser.add_argument("--methods", nargs="+", required=True, help="Methods: rls role ours effveda veda honeybee hqi")
     parser.add_argument("--memory-ratio", type=float, default=2.0,
                         help="Total storage/memory ratio. OURS internally receives max(memory_ratio - 1, 0).")
     parser.add_argument("--ef-search", type=int, default=50,
@@ -185,6 +204,8 @@ def main() -> None:
     parser.add_argument("--ours-index-type", choices=["squidhnsw", "hnsw", "ivfflat"], default="squidhnsw")
     parser.add_argument("--veda-index-type", choices=["hnsw", "vedahnsw", "ivfflat"], default="hnsw")
     parser.add_argument("--veda-indexing-threshold", type=int, default=1000)
+    parser.add_argument("--honeybee-recall", type=float,
+                        default=float(os.environ.get("HONEYBEE_RECALL", "0.99")))
     parser.add_argument("--enable-split", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--private-edge-top-d", type=int, default=32)
     parser.add_argument("--hqi-min-size", type=int, default=512)
@@ -204,6 +225,8 @@ def main() -> None:
             build_ours(args)
         elif method in {"veda", "effveda"}:
             build_veda(method, args)
+        elif method == "honeybee":
+            build_honeybee(args)
         elif method == "hqi":
             build_hqi(args)
         else:

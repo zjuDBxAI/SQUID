@@ -2,8 +2,8 @@ from __future__ import annotations
 
 """KMeans/SQUID planner cost model.
 
-The planner uses the KMeans/SQUID latency formula with calibrated wiki latency
-coefficients.
+The planner uses the KMeans/SQUID latency formula with the VEDA Appendix B
+latency coefficients.
 The ef term remains adaptive: first use the learned recall model to estimate the
 clean base ef required for target recall, then expand it by route selectivity as
 base_ef / rho.
@@ -56,9 +56,10 @@ _FALLBACK_EFS_LAMBDA0 = 0.07626788754243294
 _FALLBACK_EFS_LAMBDA1 = 0.031809305747412114
 _FALLBACK_TARGET_RECALL = 0.99
 _FALLBACK_TOPK = 10
-_FALLBACK_COST_A = 0.05134035703436479
-_FALLBACK_COST_B_GRAPH = 0.04059425277225399
-_FALLBACK_COST_C = 0.0
+_FALLBACK_COST_A = 0.0821
+_FALLBACK_COST_B_GRAPH = 0.1159
+_FALLBACK_COST_C = 2.3110
+_VEDA_PAPER_COST_SOURCE = "Veda.pdf Appendix B coefficients: a=0.0821,b=0.1159,c=2.3110"
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,8 @@ def load_latency_cost_model(
     settings = payload.get("settings", {}) if isinstance(payload.get("settings", {}), dict) else {}
     efs_payload = payload.get("efs_model", {}) if isinstance(payload.get("efs_model", {}), dict) else {}
 
-    external_efs = _read_json(efs_candidate)
+    use_external_efs = efs_path is not None or "KMEANS_EFS_MODEL_JSON" in os.environ or not efs_payload
+    external_efs = _read_json(efs_candidate) if use_external_efs else {}
     if external_efs:
         efs_payload = {**efs_payload, **external_efs}
 
@@ -141,8 +143,8 @@ def load_latency_cost_model(
         efs_lambda1=float(efs_payload.get("lambda1", _FALLBACK_EFS_LAMBDA1)),
         target_recall=float(os.environ.get("KMEANS_TARGET_RECALL", efs_payload.get("target_recall", settings.get("target_recall", _FALLBACK_TARGET_RECALL)))),
         topk=max(1, int(settings.get("topk", _FALLBACK_TOPK))),
-        source="Veda.pdf Appendix B coefficients: a=0.0821,b=0.1159,c=2.3110",
-        efs_source=str(efs_candidate),
+        source=_VEDA_PAPER_COST_SOURCE,
+        efs_source=str(efs_candidate if external_efs else efs_payload.get("source", candidate)),
     )
 
 
@@ -283,7 +285,7 @@ def estimate_partition_query_cost(
     log_n = math.log(float(max(2, n_value)))
     cost_ms = (
         float(active.cost_a) * float(log_n)
-        + float(active.cost_b_graph) * float(route_ef)
+        + float(active.cost_b_graph) * float(route_ef) * float(log_n)
         + float(active.cost_c)
     )
     return float(tenant_weight) * max(0.0, float(cost_ms))
@@ -292,14 +294,14 @@ def estimate_partition_query_cost(
 def cost_model_metadata(model: KMeansCostModel | None = None) -> dict[str, object]:
     active = model or DEFAULT_COST_MODEL
     return {
-        "cost_model": "kmeans_formula_with_wiki_stage_constrained_coefficients: cost_ms=a*ln(N)+b*route_ef+c, route_ef=base_ef_from_recall_model/rho",
+        "cost_model": "kmeans_formula_with_veda_appendix_b_coefficients: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
         "adaptive_ef": True,
         "cost_unit": "milliseconds",
         "cost_a": float(active.cost_a),
         "cost_b_graph": float(active.cost_b_graph),
         "cost_d_filter": 0.0,
         "cost_c": float(active.cost_c),
-        "cost_compat_note": "estimate_partition_query_cost uses the KMeans/SQUID latency formula with wiki stage-constrained latency coefficients",
+        "cost_compat_note": "estimate_partition_query_cost keeps the KMeans/SQUID latency formula and uses VEDA Appendix B a/b/c coefficients",
         "hnsw_m": int(active.hnsw_m),
         "hnsw_scan_scaling_factor": float(active.hnsw_scan_scaling_factor),
         "pg_seq_page_cost": float(active.pg_seq_page_cost),

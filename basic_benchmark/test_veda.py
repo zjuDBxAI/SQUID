@@ -97,6 +97,17 @@ def _ensure_index_state(partitions, index_type: str, algorithm: str) -> None:
         create_indexes_for_materialized_partitions(index_type=index_type, algorithm=algorithm)
 
 
+def _skip_index_maintenance() -> bool:
+    return str(os.environ.get("SKIP_INDEX_MAINTENANCE", "")).strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    }
+
+
 def test_veda_search(
     iterations=1,
     enable_index=True,
@@ -154,7 +165,9 @@ def test_veda_search(
     if not partitions:
         raise RuntimeError(f"No {algorithm} nodes are materialized. Run with --prepare true first.")
 
-    if enable_index:
+    if _skip_index_maintenance():
+        pass
+    elif enable_index:
         _ensure_index_state(partitions, index_type, algorithm)
     else:
         drop_indexes_for_materialized_partitions(algorithm=algorithm)

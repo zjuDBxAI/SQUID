@@ -9,16 +9,67 @@ from typing import Iterable
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 DEFAULT_QUERY_DATASET_PATH = os.path.join(PROJECT_ROOT, "basic_benchmark", "query_dataset.json")
 
-VEDA_NODE_TABLE_PREFIX = "veda_documentblocks_node_"
-VEDA_PLAN_TABLE = "veda_current_plan"
-VEDA_PATTERN_TABLE = "veda_current_patterns"
-VEDA_NODE_TABLE = "veda_current_nodes"
-VEDA_ROLE_PLAN_TABLE = "veda_current_role_plans"
-VEDA_ROUTE_TABLE = "veda_current_user_routes"
+VEDA_NODE_TABLE_PREFIX = os.environ.get("VEDA_NODE_TABLE_PREFIX", "veda_documentblocks_node_")
+VEDA_PLAN_TABLE = os.environ.get("VEDA_PLAN_TABLE", "veda_current_plan")
+VEDA_PATTERN_TABLE = os.environ.get("VEDA_PATTERN_TABLE", "veda_current_patterns")
+VEDA_NODE_TABLE = os.environ.get("VEDA_NODE_TABLE", "veda_current_nodes")
+VEDA_ROLE_PLAN_TABLE = os.environ.get("VEDA_ROLE_PLAN_TABLE", "veda_current_role_plans")
+VEDA_ROUTE_TABLE = os.environ.get("VEDA_ROUTE_TABLE", "veda_current_user_routes")
 
-DEFAULT_COST_A = 0.0821
-DEFAULT_COST_B = 0.1159
-DEFAULT_COST_C = 2.3110
+_PAPER_DEFAULT_COST_A = 0.0821
+_PAPER_DEFAULT_COST_B = 0.1159
+_PAPER_DEFAULT_COST_C = 2.3110
+
+
+def _load_shared_cost_defaults() -> tuple[float, float, float, str, str, str]:
+    use_shared = str(os.environ.get("VEDA_USE_SHARED_COST_MODEL", "")).strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    }
+    if not use_shared:
+        return (
+            _PAPER_DEFAULT_COST_A,
+            _PAPER_DEFAULT_COST_B,
+            _PAPER_DEFAULT_COST_C,
+            "veda_appendix_b_hnsw_cost: a*log2(N+1)+b*ef+c",
+            "paper_default",
+            "paper",
+        )
+    try:
+        from controller.kmeans.cost_model import DEFAULT_COST_MODEL, cost_model_metadata
+
+        metadata = cost_model_metadata(DEFAULT_COST_MODEL)
+        return (
+            float(DEFAULT_COST_MODEL.cost_a),
+            float(DEFAULT_COST_MODEL.cost_b_graph),
+            float(DEFAULT_COST_MODEL.cost_c),
+            "veda_hnsw_cost_with_shared_parameters: a*log2(N+1)+b*ef+c",
+            str(metadata.get("cost_model_source", DEFAULT_COST_MODEL.source)),
+            "shared_parameters",
+        )
+    except Exception:
+        return (
+            _PAPER_DEFAULT_COST_A,
+            _PAPER_DEFAULT_COST_B,
+            _PAPER_DEFAULT_COST_C,
+            "veda_appendix_b_hnsw_cost: a*log2(N+1)+b*ef+c",
+            "paper_default_after_shared_cost_load_failure",
+            "paper",
+        )
+
+
+(
+    DEFAULT_COST_A,
+    DEFAULT_COST_B,
+    DEFAULT_COST_C,
+    DEFAULT_COST_FORMULA,
+    DEFAULT_COST_SOURCE,
+    DEFAULT_COST_STYLE,
+) = _load_shared_cost_defaults()
 
 
 def normalize_int_tuple(values: Iterable[int] | None) -> tuple[int, ...]:

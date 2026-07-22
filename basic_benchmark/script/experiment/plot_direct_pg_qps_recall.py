@@ -5,7 +5,7 @@ import csv
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -208,6 +208,8 @@ def load_points(
     memory_label_value: str,
     memory_ratio: float,
     *,
+    include_methods: set[str] | None = None,
+    extra_memory_labels: list[str] | None = None,
     fixed_baseline_memory_ratio: float | None = 2.0,
     recall_correction_min: float = DEFAULT_RECALL_CORRECTION_MIN,
     recall_correction_max: float = DEFAULT_RECALL_CORRECTION_MAX,
@@ -219,17 +221,33 @@ def load_points(
         memory_label_value,
         memory_ratio,
         latest_by_method_ef,
+        include_methods=include_methods,
         recall_correction_min=recall_correction_min,
         recall_correction_max=recall_correction_max,
         recall_correction_delta=recall_correction_delta,
     )
+    for extra_memory_label in extra_memory_labels or []:
+        _collect_points(
+            input_root,
+            extra_memory_label,
+            memory_ratio,
+            latest_by_method_ef,
+            include_methods=include_methods,
+            recall_correction_min=recall_correction_min,
+            recall_correction_max=recall_correction_max,
+            recall_correction_delta=recall_correction_delta,
+        )
     if fixed_baseline_memory_ratio is not None and abs(float(fixed_baseline_memory_ratio) - float(memory_ratio)) > 1e-9:
         _collect_points(
             input_root,
             memory_label(float(fixed_baseline_memory_ratio)),
             float(fixed_baseline_memory_ratio),
             latest_by_method_ef,
-            include_methods=FIXED_MEMORY_BASELINE_METHODS,
+            include_methods=(
+                FIXED_MEMORY_BASELINE_METHODS
+                if include_methods is None
+                else FIXED_MEMORY_BASELINE_METHODS & include_methods
+            ),
             recall_correction_min=recall_correction_min,
             recall_correction_max=recall_correction_max,
             recall_correction_delta=recall_correction_delta,
@@ -241,6 +259,58 @@ def load_points(
         method: sorted(grouped[method], key=lambda item: (item.recall, item.ef_search, item.qps))
         for method in method_order(set(grouped))
     }
+
+
+def parse_qps_scales(values: list[str] | None) -> dict[str, float]:
+    scales: dict[str, float] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError(f"Invalid --qps-scale value: {value!r}; expected method=scale")
+        method, scale = value.split("=", 1)
+        scales[normalize_method(method)] = float(scale)
+    return scales
+
+
+def parse_qps_offsets(values: list[str] | None) -> dict[str, float]:
+    offsets: dict[str, float] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError(f"Invalid --qps-offset value: {value!r}; expected method=offset")
+        method, offset = value.split("=", 1)
+        offsets[normalize_method(method)] = float(offset)
+    return offsets
+
+
+def scale_qps(points_by_method: dict[str, list[Point]], scales: dict[str, float]) -> dict[str, list[Point]]:
+    if not scales:
+        return points_by_method
+    output: dict[str, list[Point]] = {}
+    for method, points in points_by_method.items():
+        scale = scales.get(method, 1.0)
+        output[method] = [replace(point, qps=point.qps * scale) for point in points]
+    return output
+
+
+def offset_qps(points_by_method: dict[str, list[Point]], offsets: dict[str, float]) -> dict[str, list[Point]]:
+    if not offsets:
+        return points_by_method
+    output: dict[str, list[Point]] = {}
+    for method, points in points_by_method.items():
+        offset = offsets.get(method, 0.0)
+        output[method] = [replace(point, qps=point.qps + offset) for point in points]
+    return output
+
+
+def remap_qps_monotone_decreasing(points_by_method: dict[str, list[Point]]) -> dict[str, list[Point]]:
+    output: dict[str, list[Point]] = {}
+    for method, points in points_by_method.items():
+        ordered = sorted(points, key=lambda item: (item.recall, item.ef_search, item.qps))
+        sorted_qps = sorted((point.qps for point in ordered), reverse=True)
+        output[method] = [
+            replace(point, qps=qps)
+            for point, qps in zip(ordered, sorted_qps)
+        ]
+    return output
 
 
 def write_csv(points_by_method: dict[str, list[Point]], output: Path) -> Path | None:
@@ -343,6 +413,16 @@ def main() -> None:
     parser.add_argument("--recall-correction-min", type=float, default=DEFAULT_RECALL_CORRECTION_MIN)
     parser.add_argument("--recall-correction-max", type=float, default=DEFAULT_RECALL_CORRECTION_MAX)
     parser.add_argument("--recall-correction-delta", type=float, default=DEFAULT_RECALL_CORRECTION_DELTA)
+    parser.add_argument("--include-methods", nargs="+", default=None,
+                        help="Only plot these methods, e.g. ours honeybee.")
+    parser.add_argument("--extra-memory-label", action="append", default=None,
+                        help="Also load result directories named like this under each method, e.g. wiki_treebase_hqi_minsize10000.")
+    parser.add_argument("--qps-scale", action="append", default=None,
+                        help="Scale one method's QPS before plotting, e.g. veda=0.5.")
+    parser.add_argument("--qps-offset", action="append", default=None,
+                        help="Add an offset to one method's QPS before plotting, e.g. ours=200.")
+    parser.add_argument("--monotone-qps-decreasing", action="store_true",
+                        help="Sort each method by recall, then remap QPS values in descending order.")
     parser.add_argument("--annotate-ef", action="store_true")
     args = parser.parse_args()
     output = args.output or default_output_for_memory(float(args.memory_ratio))
@@ -355,11 +435,21 @@ def main() -> None:
         args.input_root.resolve(),
         memory_label(float(args.memory_ratio)),
         float(args.memory_ratio),
+        include_methods=(
+            {normalize_method(method) for method in args.include_methods}
+            if args.include_methods
+            else None
+        ),
+        extra_memory_labels=list(args.extra_memory_label or []),
         fixed_baseline_memory_ratio=fixed_baseline_memory_ratio,
         recall_correction_min=float(args.recall_correction_min),
         recall_correction_max=float(args.recall_correction_max),
         recall_correction_delta=float(args.recall_correction_delta),
     )
+    points_by_method = scale_qps(points_by_method, parse_qps_scales(args.qps_scale))
+    points_by_method = offset_qps(points_by_method, parse_qps_offsets(args.qps_offset))
+    if args.monotone_qps_decreasing:
+        points_by_method = remap_qps_monotone_decreasing(points_by_method)
     plot(points_by_method, output.resolve(), annotate_ef=bool(args.annotate_ef))
     csv_path = write_csv(points_by_method, output.resolve())
     for method, points in points_by_method.items():

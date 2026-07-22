@@ -14,6 +14,18 @@ from basic_benchmark import efconfig
 from controller.baseline.pg_row_security.row_level_security import get_db_connection_for_many_users
 from services.config import get_db_connection
 
+
+def _honeybee_mapping_table() -> str:
+    return os.environ.get("HONEYBEE_MAPPING_TABLE") or os.environ.get("DYNAMIC_PARTITION_MAPPING_TABLE") or "CombRolePartitions"
+
+
+def _honeybee_partition_table(partition_id) -> str:
+    prefix = os.environ.get("HONEYBEE_TABLE_PREFIX") or os.environ.get("DYNAMIC_PARTITION_TABLE_PREFIX")
+    if prefix:
+        return f"{prefix}_partition_{int(partition_id)}"
+    return f"documentblocks_partition_{int(partition_id)}"
+
+
 def dynamic_partition_search(user_id, query_vector, topk=5, statistics_type="sql"):
     """
     Entry point for dynamic partition search with SQL or system time measurement.
@@ -51,17 +63,22 @@ def dynamic_partition_search_statistics_sql(user_id, query_vector, topk=10, ef_s
     # Step 2: Sort the roles to create a canonical representation
     sorted_roles = sorted(user_roles)
 
-    cur.execute("""
-        SELECT partition_id
-        FROM CombRolePartitions
-        WHERE comb_role = %s::integer[];
-    """, [sorted_roles])
+    cur.execute(
+        sql.SQL(
+            """
+            SELECT partition_id
+            FROM {}
+            WHERE comb_role = %s::integer[];
+            """
+        ).format(sql.Identifier(_honeybee_mapping_table())),
+        [sorted_roles],
+    )
 
     accessible_partitions = {row[0] for row in cur.fetchall()}
     # Step 2: Search each partition with EXPLAIN ANALYZE
     all_results = []
     for partition_id in accessible_partitions:
-        partition_table = sql.Identifier(f"documentblocks_partition_{partition_id}")
+        partition_table = sql.Identifier(_honeybee_partition_table(partition_id))
 
         explain_query = sql.SQL(
             """
@@ -156,17 +173,22 @@ def dynamic_partition_search_statistics_system(user_id, query_vector, topk=5):
     user_roles = {row[0] for row in cur.fetchall()}
     sorted_roles = sorted(user_roles)
 
-    cur.execute("""
-        SELECT partition_id
-        FROM CombRolePartitions
-        WHERE comb_role = %s::integer[];
-    """, [sorted_roles])
+    cur.execute(
+        sql.SQL(
+            """
+            SELECT partition_id
+            FROM {}
+            WHERE comb_role = %s::integer[];
+            """
+        ).format(sql.Identifier(_honeybee_mapping_table())),
+        [sorted_roles],
+    )
     accessible_partitions = {row[0] for row in cur.fetchall()}
 
     # Step 2: Search across partitions
     all_results = []
     for partition_id in accessible_partitions:
-        partition_table = sql.Identifier(f"documentblocks_partition_{partition_id}")
+        partition_table = sql.Identifier(_honeybee_partition_table(partition_id))
 
         query = sql.SQL(
             """

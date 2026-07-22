@@ -14,6 +14,8 @@ from .common import (
     DEFAULT_COST_A,
     DEFAULT_COST_B,
     DEFAULT_COST_C,
+    DEFAULT_COST_FORMULA,
+    DEFAULT_COST_SOURCE,
     VedaNode,
     VedaPattern,
     VedaPlan,
@@ -228,7 +230,9 @@ class VedaPlanner:
             "indexing_threshold": int(self.indexing_threshold),
             "storage_amplification_budget": float(self.storage_amplification),
             "ef_search_for_cost": int(self.ef_search),
-            "cost_model": "C_theta(|idx|, efs) = a*log2(|idx|+1) + b*efs + c; impure routes inflate efs by lambda",
+            "cost_model": DEFAULT_COST_FORMULA,
+            "cost_model_source": DEFAULT_COST_SOURCE,
+            "cost_model_note": "Veda/EffVeda keep the original a*log2(N+1)+b*ef+c formula; a/b/c use the VEDA Appendix B defaults unless VEDA_USE_SHARED_COST_MODEL is enabled.",
             "cost_a": float(self.cost_a),
             "cost_b": float(self.cost_b),
             "cost_c": float(self.cost_c),
@@ -2411,5 +2415,7 @@ class VedaPlanner:
             parts.append(str(suffix))
         return "_".join(parts)
 
-    def _hnsw_cost(self, size: int, ef_search: int) -> float:
-        return float(self.cost_a * math.log2(max(1, int(size)) + 1) + self.cost_b * max(1, int(ef_search)) + self.cost_c)
+    def _hnsw_cost(self, size: int, ef_search: int | float) -> float:
+        node_size = max(1, int(size))
+        route_ef = max(1.0, float(ef_search))
+        return float(self.cost_a * math.log2(node_size + 1) + self.cost_b * route_ef + self.cost_c)

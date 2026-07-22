@@ -73,6 +73,17 @@ def _ensure_index_state(partitions, index_type: str) -> None:
         create_indexes_for_materialized_partitions(index_type=index_type)
 
 
+def _skip_index_maintenance() -> bool:
+    return str(os.environ.get("SKIP_INDEX_MAINTENANCE", "")).strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    }
+
+
 def test_kmeans_partition_search(
     iterations=1,
     enable_index=True,
@@ -136,7 +147,9 @@ def test_kmeans_partition_search(
             f"{preview}{suffix}. Run with --prepare true to rebuild the plan and materialized tables."
         )
 
-    if enable_index:
+    if _skip_index_maintenance():
+        pass
+    elif enable_index:
         _ensure_index_state(partitions, index_type)
     else:
         drop_indexes_for_materialized_partitions()

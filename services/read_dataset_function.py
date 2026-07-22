@@ -30,6 +30,10 @@ from tqdm import tqdm
 
 SIFT_DOCUMENT_VECTOR_COUNT = 100  # Group 100 vectors into a single synthetic document
 YFCC_DOCUMENT_VECTOR_COUNT = 1  # YFCC metadata is per image/vector, so each vector is one document
+WIKIPEDIA_SIMPLE_DOCUMENT_VECTOR_COUNT = max(
+    1,
+    int(os.environ.get("WIKIPEDIA_SIMPLE_DOCUMENT_VECTOR_COUNT", str(SIFT_DOCUMENT_VECTOR_COUNT))),
+)
 SIFT10M_FEATURES_MEMBER = "SIFT10M/SIFT10Mfeatures.mat"
 YFCC100M_SUBSAMPLED_VECS = "yfcc100m/yfcc_subsampled_nvec_1000000_nlabel_1000_vecs.npy"
 WIKIPEDIA_SIMPLE_EMBEDDINGS_CSV = "wikipedia-22-12-simple-embeddings/wiki.csv"
@@ -779,7 +783,8 @@ def read_and_store_wikipedia_simple_embeddings_dataset(load_number=1000, start_r
         "Loading wikipedia-22-12-simple embeddings "
         f"into database '{config.get('dbname')}' from {csv_path}. "
         f"start_row={start_row}, load_number={'all' if max_rows is None else max_rows}, "
-        f"batch_size={BATCH_SIZE}."
+        f"batch_size={BATCH_SIZE}, "
+        f"document_vector_count={WIKIPEDIA_SIMPLE_DOCUMENT_VECTOR_COUNT}."
     )
 
     with open(csv_path, newline="", encoding="utf-8") as csv_file:
@@ -817,8 +822,9 @@ def read_and_store_wikipedia_simple_embeddings_dataset(load_number=1000, start_r
                     print(f"Skipping Wikipedia row {row_index}: missing embedding")
                     continue
 
-                block_id = start_row + seen
-                document_id = block_id
+                global_index = start_row + seen - 1
+                block_id = global_index + 1
+                document_id = (global_index // WIKIPEDIA_SIMPLE_DOCUMENT_VECTOR_COUNT) + 1
                 content_bytes = block_content.encode("utf-8", errors="replace")
                 hash_value = Binary(hashlib.sha1(f"{source_id}\0".encode("utf-8") + content_bytes).digest())
                 batch.append(
