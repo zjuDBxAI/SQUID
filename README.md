@@ -92,19 +92,11 @@ python -m spacy download en_core_web_md
 
 Download the dataset to {project directory}/dataset/:
 
-- [Cohere Wikipedia 22-12 Dataset](https://huggingface.co/datasets/Cohere/wikipedia-22-12)
-```shell
-mkdir dataset
-cd dataset
-sudo apt-get install git-lfs
-git lfs install
-git clone https://huggingface.co/datasets/Cohere/wikipedia-22-12
-```
 
-- [SIFT10M features](https://people.otago.ac.nz/xipingfu/SIFT10M.html) (Fu et al.)
-  - Download `SIFT10M.tar.gz` and place it in the directory pointed to by `dataset_path` (the template defaults to `dataset`).
-  - The loader extracts `SIFT10M/SIFT10Mfeatures.mat` automatically on first run, or you can run  
-    `tar -xf SIFT10M.tar.gz SIFT10M/SIFT10Mfeatures.mat`.
+- [SIFT1M features](https://people.otago.ac.nz/xipingfu/SIFT10M.html) (Fu et al.)
+  - Download `SIFT1M.tar.gz` and place it in the directory pointed to by `dataset_path` (the template defaults to `dataset`).
+  - The loader extracts `SIFT1M/SIFT1Mfeatures.mat` automatically on first run, or you can run  
+    `tar -xf SIFT1M.tar.gz SIFT1M/SIFT1Mfeatures.mat`.
 
 
 ### Configure Database Access
@@ -136,17 +128,16 @@ If you use the unmodified `setup_db.sh`, the matching defaults are user `x`, pas
 
 ### Prepare Data
 ```sh
-# Load the default Wikipedia dataset (1M rows by default)
+# Load the default Wikipedia dataset
 python3 basic_benchmark/common_prepare_pipeline.py --dataset wikipedia-22-12
 
 # Example: load the SIFT 1M benchmark vectors (load-number 0 loads the entire file)
 python3 basic_benchmark/common_prepare_pipeline.py --dataset sift-128-euclidean --load-number 0
 
-# Example: load the 10M SIFT feature matrix (auto-extracts SIFT10Mfeatures.mat if needed)
-python3 basic_benchmark/common_prepare_pipeline.py --dataset sift10m --load-number 0
+comming soon
 
 # Flags:
-#   --dataset       One of {wikipedia-22-12, arxiv, sift-128-euclidean, sift10m}
+#   --dataset       One of {wikipedia-22-12, YFCC, sift1M}
 #   --load-number   Number of rows to ingest (0 or negative means “all remaining rows”)
 #   --start-row     Offset within the dataset before loading
 #   --num-threads   Worker processes used for ingestion (defaults to CPU count)
