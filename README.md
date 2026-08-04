@@ -1,5 +1,10 @@
-<<<<<<< HEAD
-# Experiment Code
+# Store Less, Search Better: Access-Controlled Vector Search over Resolved Visibility
+
+We present SQUID, a framework that performs database-internal physical design over resolved visibility for access-controlled vector search.
+SQUID groups vectors with the same visible-user set into policy-independent \emph{Access Atoms}.
+Starting from a selective per-user seed, its sparse Shared-Atom Graph exposes redundant Atom copies, and its recall-aware cost model ranks their consolidation under a memory budget.
+At query time, SQUID allocates partition-specific search effort, filters candidates under current resolved visibility, and merges authorized candidates across routed partitions.
+When vectors or visibility change, SQUID preserves query correctness while repairing the affected partitions and indexes.
 ## Prerequisites
 
 - PostgreSQL
