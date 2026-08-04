@@ -25,6 +25,9 @@ from .common import (
     PLAN_TABLE,
     ROUTE_TABLE,
     TenantRoute,
+    UPDATE_ACL_ROLE_TABLE,
+    UPDATE_BATCH_TABLE,
+    UPDATE_TOMBSTONE_TABLE,
 )
 from .hybrid_planner import HybridACLKMeansPlanner
 from .repository import KMeansRepository
@@ -276,6 +279,51 @@ def initialize_schema(*, db_connection_factory=_default_db_connection_factory) -
             cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING GIN (tenant_ids);").format(
                 sql.Identifier(f"idx_{PATTERN_TABLE}_tenant_ids"),
                 sql.Identifier(PATTERN_TABLE),
+            ))
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {UPDATE_BATCH_TABLE} (
+                    batch_id BIGSERIAL PRIMARY KEY,
+                    update_count INTEGER NOT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {UPDATE_TOMBSTONE_TABLE} (
+                    partition_id TEXT NOT NULL,
+                    block_id BIGINT NOT NULL,
+                    document_id BIGINT NOT NULL,
+                    pattern_id BIGINT NOT NULL,
+                    batch_id BIGINT REFERENCES {UPDATE_BATCH_TABLE}(batch_id) ON DELETE SET NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (partition_id, block_id, document_id)
+                );
+                """
+            )
+            cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (partition_id);").format(
+                sql.Identifier(f"idx_{UPDATE_TOMBSTONE_TABLE}_partition"),
+                sql.Identifier(UPDATE_TOMBSTONE_TABLE),
+            ))
+            cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (document_id);").format(
+                sql.Identifier(f"idx_{UPDATE_TOMBSTONE_TABLE}_document"),
+                sql.Identifier(UPDATE_TOMBSTONE_TABLE),
+            ))
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {UPDATE_ACL_ROLE_TABLE} (
+                    acl_key TEXT PRIMARY KEY,
+                    tenant_ids BIGINT[] NOT NULL,
+                    role_id BIGINT NOT NULL UNIQUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING GIN (tenant_ids);").format(
+                sql.Identifier(f"idx_{UPDATE_ACL_ROLE_TABLE}_tenant_ids"),
+                sql.Identifier(UPDATE_ACL_ROLE_TABLE),
             ))
         conn.commit()
     finally:
@@ -845,6 +893,73 @@ def create_indexes_for_materialized_partitions(
         print(f"KMeans partition index build: [{index}/{len(ordered_table_names)}] finished {table_name} in {elapsed:.2f}s", flush=True)
 
 
+def _create_index_for_partition_object_timed(partition: KMeansPartition, index_type: str) -> tuple[str, float]:
+    started_at = time.time()
+    create_index_for_partition(str(partition.table_name), index_type=index_type)
+    return str(partition.table_name), time.time() - started_at
+
+
+def create_indexes_for_partitions(
+    partitions: list[KMeansPartition],
+    *,
+    index_type: str = "squidhnsw",
+    vector_index_min_vectors: int = 0,
+    parallel: bool = True,
+    max_workers: Optional[int] = None,
+    db_connection_factory=_default_db_connection_factory,
+) -> None:
+    eligible = [
+        partition
+        for partition in partitions
+        if int(partition.vector_count) >= int(vector_index_min_vectors)
+    ]
+    if not eligible:
+        return
+    worker_count = _recommended_worker_count(len(eligible), max_workers=max_workers)
+    if parallel and worker_count > 1 and db_connection_factory is _default_db_connection_factory:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(_create_index_for_partition_object_timed, partition, index_type): partition
+                for partition in eligible
+            }
+            for future in as_completed(futures):
+                future.result()
+        return
+    for partition in eligible:
+        create_index_for_partition(
+            str(partition.table_name),
+            index_type=index_type,
+            db_connection_factory=db_connection_factory,
+        )
+
+
+def drop_vector_indexes_below_threshold(
+    partitions: list[KMeansPartition],
+    *,
+    vector_index_min_vectors: int,
+    db_connection_factory=_default_db_connection_factory,
+) -> None:
+    small_tables = [
+        str(partition.table_name)
+        for partition in partitions
+        if int(partition.vector_count) < int(vector_index_min_vectors)
+    ]
+    if not small_tables:
+        return
+    conn = db_connection_factory()
+    try:
+        with conn.cursor() as cur:
+            for table_name in small_tables:
+                cur.execute(
+                    sql.SQL("DROP INDEX IF EXISTS {} CASCADE;").format(
+                        sql.Identifier(_safe_index_name(table_name, "vector_idx"))
+                    )
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def drop_indexes_for_materialized_partitions(*, db_connection_factory=_default_db_connection_factory) -> None:
     conn = db_connection_factory()
     try:
@@ -882,7 +997,7 @@ def build_and_materialize_kmeans_plan(
     shared_score_ratio: float = 0.10,
     shared_route_limit: int = 3,
     private_replication_budget_ratio: float = 0.0,
-    ef_search: int = 120,
+    ef_search: int | None = None,
     embedding_dim: Optional[int] = None,
     document_limit: Optional[int] = None,
     query_dataset_path: Optional[str] = None,
@@ -909,7 +1024,7 @@ def build_and_materialize_kmeans_plan(
         f"shared_score_ratio={float(shared_score_ratio):.4f}, "
         f"shared_route_limit={int(shared_route_limit)}, "
         f"private_replication_budget_ratio={float(private_replication_budget_ratio):.4f}, "
-        f"ef_search={int(ef_search)}, "
+        f"cost_ef={'trained_recall_model' if ef_search is None else int(ef_search)}, "
         f"enable_split={bool(enable_split)}, "
         f"private_edge_top_d={int(private_edge_top_d)}",
         flush=True,
@@ -921,7 +1036,7 @@ def build_and_materialize_kmeans_plan(
         shared_score_ratio=float(shared_score_ratio),
         shared_route_limit=int(shared_route_limit),
         private_replication_budget_ratio=float(private_replication_budget_ratio),
-        ef_search=int(ef_search),
+        ef_search=None if ef_search is None else int(ef_search),
         embedding_dim=embedding_dim,
         query_dataset_path=query_dataset_path,
         show_progress=show_progress,

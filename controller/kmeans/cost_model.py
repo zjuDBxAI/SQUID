@@ -2,8 +2,7 @@ from __future__ import annotations
 
 """KMeans/SQUID planner cost model.
 
-The planner uses the KMeans/SQUID latency formula with the VEDA Appendix B
-latency coefficients.
+The planner uses the KMeans/SQUID latency formula with Veda paper coefficients.
 The ef term remains adaptive: first use the learned recall model to estimate the
 clean base ef required for target recall, then expand it by route selectivity as
 base_ef / rho.
@@ -56,10 +55,9 @@ _FALLBACK_EFS_LAMBDA0 = 0.07626788754243294
 _FALLBACK_EFS_LAMBDA1 = 0.031809305747412114
 _FALLBACK_TARGET_RECALL = 0.99
 _FALLBACK_TOPK = 10
-_FALLBACK_COST_A = 0.0821
-_FALLBACK_COST_B_GRAPH = 0.1159
-_FALLBACK_COST_C = 2.3110
-_VEDA_PAPER_COST_SOURCE = "Veda.pdf Appendix B coefficients: a=0.0821,b=0.1159,c=2.3110"
+_FALLBACK_COST_A = 0.05134035703436479
+_FALLBACK_COST_B_GRAPH = 0.04059425277225399
+_FALLBACK_COST_C = 0.0
 
 
 @dataclass(frozen=True)
@@ -82,6 +80,7 @@ class KMeansCostModel:
     efs_lambda1: float
     target_recall: float
     topk: int
+    profile: str
     source: str
     efs_source: str
 
@@ -117,10 +116,29 @@ def load_latency_cost_model(
 
     payload = _read_json(candidate)
     settings = payload.get("settings", {}) if isinstance(payload.get("settings", {}), dict) else {}
+    parameters = payload.get("parameters", {}) if isinstance(payload.get("parameters", {}), dict) else {}
     efs_payload = payload.get("efs_model", {}) if isinstance(payload.get("efs_model", {}), dict) else {}
 
-    use_external_efs = efs_path is not None or "KMEANS_EFS_MODEL_JSON" in os.environ or not efs_payload
-    external_efs = _read_json(efs_candidate) if use_external_efs else {}
+    profile = str(os.environ.get("KMEANS_COST_PROFILE", "legacy_veda")).strip().lower()
+    if profile not in {"legacy_veda", "trained"}:
+        raise ValueError(
+            f"Unsupported KMEANS_COST_PROFILE={profile!r}; expected 'legacy_veda' or 'trained'"
+        )
+    if profile == "trained":
+        missing = [name for name in ("a", "b", "c") if name not in parameters]
+        if missing:
+            raise ValueError(f"Trained cost model {candidate} is missing parameters: {missing}")
+        cost_a = float(parameters["a"])
+        cost_b_graph = float(parameters["b"])
+        cost_c = float(parameters["c"])
+        cost_source = str(candidate)
+    else:
+        cost_a = 0.0821
+        cost_b_graph = 0.1159
+        cost_c = 2.3110
+        cost_source = "Veda.pdf Appendix B coefficients: a=0.0821,b=0.1159,c=2.3110"
+
+    external_efs = _read_json(efs_candidate)
     if external_efs:
         efs_payload = {**efs_payload, **external_efs}
 
@@ -135,16 +153,17 @@ def load_latency_cost_model(
         pg_tuples_per_page_approx=float(settings.get("pg_tuples_per_page_approx", _PG_TUPLES_PER_PAGE_APPROX)),
         pg_vector_distance_ops_per_tuple=float(settings.get("pg_vector_distance_ops_per_tuple", _PG_VECTOR_DISTANCE_OPS_PER_TUPLE)),
         hnsw_max_ef_search=max(1, int(settings.get("max_ef_search", 5000))),
-        cost_a=_FALLBACK_COST_A,
-        cost_b_graph=_FALLBACK_COST_B_GRAPH,
-        cost_c=_FALLBACK_COST_C,
+        cost_a=cost_a,
+        cost_b_graph=cost_b_graph,
+        cost_c=cost_c,
         efs_h=float(efs_payload.get("h", _FALLBACK_EFS_H)),
         efs_lambda0=float(efs_payload.get("lambda0", _FALLBACK_EFS_LAMBDA0)),
         efs_lambda1=float(efs_payload.get("lambda1", _FALLBACK_EFS_LAMBDA1)),
         target_recall=float(os.environ.get("KMEANS_TARGET_RECALL", efs_payload.get("target_recall", settings.get("target_recall", _FALLBACK_TARGET_RECALL)))),
         topk=max(1, int(settings.get("topk", _FALLBACK_TOPK))),
-        source=_VEDA_PAPER_COST_SOURCE,
-        efs_source=str(efs_candidate if external_efs else efs_payload.get("source", candidate)),
+        profile=profile,
+        source=cost_source,
+        efs_source=str(efs_candidate),
     )
 
 
@@ -294,14 +313,15 @@ def estimate_partition_query_cost(
 def cost_model_metadata(model: KMeansCostModel | None = None) -> dict[str, object]:
     active = model or DEFAULT_COST_MODEL
     return {
-        "cost_model": "kmeans_formula_with_veda_appendix_b_coefficients: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
+        "cost_model": f"kmeans_formula_{active.profile}: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
+        "cost_profile": str(active.profile),
         "adaptive_ef": True,
         "cost_unit": "milliseconds",
         "cost_a": float(active.cost_a),
         "cost_b_graph": float(active.cost_b_graph),
         "cost_d_filter": 0.0,
         "cost_c": float(active.cost_c),
-        "cost_compat_note": "estimate_partition_query_cost keeps the KMeans/SQUID latency formula and uses VEDA Appendix B a/b/c coefficients",
+        "cost_compat_note": f"estimate_partition_query_cost uses the SQUID log-N formula with the {active.profile} coefficient profile",
         "hnsw_m": int(active.hnsw_m),
         "hnsw_scan_scaling_factor": float(active.hnsw_scan_scaling_factor),
         "pg_seq_page_cost": float(active.pg_seq_page_cost),

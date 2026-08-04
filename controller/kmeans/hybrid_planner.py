@@ -109,7 +109,7 @@ class HybridACLKMeansPlanner:
         private_replication_budget_ratio: float = 0.0,
         embedding_dim: Optional[int] = None,
         query_dataset_path: Optional[str] = None,
-        ef_search: int = 120,
+        ef_search: Optional[int] = None,
         show_progress: bool = True,
         enable_split: bool = True,
         private_edge_top_d: int = 32,
@@ -140,7 +140,7 @@ class HybridACLKMeansPlanner:
                 tenant_vector_counts=tenant_vector_counts,
                 tenant_query_weights=split_tenant_query_weights,
                 total_original_vectors=total_original_vectors,
-                ef_search=int(ef_search),
+                ef_search=ef_search,
                 private_replication_budget_ratio=float(private_replication_budget_ratio),
                 enable_split=bool(enable_split),
             )
@@ -152,7 +152,7 @@ class HybridACLKMeansPlanner:
                 route_limit=int(shared_route_limit),
                 tenant_query_weights=tenant_query_weights,
                 total_original_vectors=total_original_vectors,
-                ef_search=int(ef_search),
+                ef_search=ef_search,
                 show_progress=show_progress,
             )
             progress.update(1)
@@ -167,7 +167,7 @@ class HybridACLKMeansPlanner:
                 tenant_query_weights=tenant_query_weights,
                 total_original_vectors=total_original_vectors,
                 shared_vector_count=int(shared_vector_count),
-                ef_search=int(ef_search),
+                ef_search=ef_search,
                 show_progress=show_progress,
                 private_edge_top_d=int(private_edge_top_d),
             )
@@ -219,7 +219,8 @@ class HybridACLKMeansPlanner:
             "private_replication_budget_ratio": float(private_replication_budget_ratio),
             "enable_split": bool(enable_split),
             "private_edge_top_d": int(private_edge_top_d),
-            "ef_search_for_cost": int(ef_search),
+            "ef_search_for_cost": None if ef_search is None else int(ef_search),
+            "ef_search_source": "trained_recall_model" if ef_search is None else "manual",
             "topk_for_cost": int(_COST_TOPK),
             **cost_model_metadata(DEFAULT_COST_MODEL),
             "shared_cost_model": "bottom-up ACL group merge using exact pre/post adaptive-ef latency cost",
@@ -298,7 +299,7 @@ class HybridACLKMeansPlanner:
         tenant_vector_counts: dict[int, int],
         tenant_query_weights: dict[int, float],
         total_original_vectors: int,
-        ef_search: int,
+        ef_search: Optional[int],
         private_replication_budget_ratio: float,
         enable_split: bool = True,
     ) -> tuple[list[ACLPattern], list[ACLPattern], Optional[float]]:
@@ -352,7 +353,7 @@ class HybridACLKMeansPlanner:
                 accessible_vectors=max(1, int(pattern.vector_count)),
                 tenant_weight=1.0,
                 total_vectors=int(total_original_vectors),
-                ef_search=int(ef_search),
+                ef_search=ef_search,
             )
             for pattern in patterns
             if int(pattern.vector_count) > 0
@@ -371,7 +372,7 @@ class HybridACLKMeansPlanner:
                 accessible_vectors=int(accessible_vectors),
                 tenant_weight=1.0,
                 total_vectors=int(total_original_vectors),
-                ef_search=int(ef_search),
+                ef_search=ef_search,
             )
 
         # Same split shape as SQUID: build reference private groups only for deciding
@@ -654,7 +655,7 @@ class HybridACLKMeansPlanner:
         accessible_vectors: int,
         tenant_weight: float,
         total_vectors: int,
-        ef_search: int,
+        ef_search: Optional[int],
     ) -> float:
         if int(partition_vectors) <= 0 or int(accessible_vectors) <= 0 or float(tenant_weight) <= 0.0:
             return 0.0
@@ -662,7 +663,7 @@ class HybridACLKMeansPlanner:
             partition_vectors=max(1, int(partition_vectors)),
             accessible_vectors=max(1, int(accessible_vectors)),
             tenant_weight=float(tenant_weight),
-            ef_search=int(ef_search),
+            ef_search=ef_search,
             topk=int(_COST_TOPK),
             use_adaptive_ef=True,
         )
@@ -675,7 +676,7 @@ class HybridACLKMeansPlanner:
         route_limit: int,
         tenant_query_weights: dict[int, float],
         total_original_vectors: int,
-        ef_search: int,
+        ef_search: Optional[int],
         show_progress: bool,
     ) -> dict[int, int]:
         if not patterns:
@@ -691,7 +692,7 @@ class HybridACLKMeansPlanner:
                 accessible_vectors=max(1, int(pattern.vector_count)),
                 tenant_weight=1.0,
                 total_vectors=int(total_original_vectors),
-                ef_search=int(ef_search),
+                ef_search=ef_search,
             )
             for pattern in patterns
             if int(pattern.vector_count) > 0
@@ -711,7 +712,7 @@ class HybridACLKMeansPlanner:
                 accessible_vectors=int(accessible_vectors),
                 tenant_weight=float(tenant_weight(int(tenant_id))),
                 total_vectors=int(total_original_vectors),
-                ef_search=int(ef_search),
+                ef_search=ef_search,
             )
 
         def group_query_cost_from_access(vector_count: int, tenant_access: Counter) -> float:
@@ -1061,7 +1062,7 @@ class HybridACLKMeansPlanner:
         tenant_query_weights: dict[int, float],
         total_original_vectors: int,
         shared_vector_count: int,
-        ef_search: int,
+        ef_search: Optional[int],
         show_progress: bool,
         private_edge_top_d: int = 32,
     ) -> dict[int, int]:
@@ -1073,7 +1074,7 @@ class HybridACLKMeansPlanner:
             tenant_query_weights=tenant_query_weights,
             total_original_vectors=int(total_original_vectors),
             shared_vector_count=int(shared_vector_count),
-            ef_search=int(ef_search),
+            ef_search=ef_search,
             show_progress=bool(show_progress),
             private_edge_top_d=int(private_edge_top_d),
         )
@@ -1088,7 +1089,7 @@ class HybridACLKMeansPlanner:
         tenant_query_weights: dict[int, float],
         total_original_vectors: int,
         shared_vector_count: int,
-        ef_search: int,
+        ef_search: Optional[int],
         show_progress: bool,
         private_edge_top_d: int = 32,
     ) -> dict[int, int]:
@@ -1213,7 +1214,7 @@ class HybridACLKMeansPlanner:
                     partition_vectors=int(partition_vectors),
                     accessible_vectors=int(accessible_vectors),
                     tenant_weight=1.0,
-                    ef_search=int(ef_search),
+                    ef_search=ef_search,
                     topk=int(_COST_TOPK),
                     use_adaptive_ef=True,
                 )
@@ -1374,12 +1375,12 @@ class HybridACLKMeansPlanner:
 
         operation_rank = {
             "split_overlap": 0,
-            "move_left": 1,
-            "move_right": 2,
-            "merge_extract_overlap": 3,
+            "merge_extract_overlap": 1,
+            "move_left": 2,
+            "move_right": 3,
             "full": 4,
         }
-        operations = ("split_overlap", "move_left", "move_right", "merge_extract_overlap", "full")
+        operations = ("full", "move_left", "move_right", "merge_extract_overlap", "split_overlap")
 
         def group_selectivity_profile(group_id: int, group: dict[str, object]) -> dict[str, object] | None:
             partition_vectors = int(group.get("vector_count", 0))
@@ -1830,7 +1831,7 @@ class HybridACLKMeansPlanner:
                     continue
                 delta_latency = float(after_cost) - float(before_cost)
                 op_rank = int(operation_rank[str(operation)])
-                rank = (float(delta_latency), int(op_rank), int(max_partition_size))
+                rank = (float(delta_latency), int(max_partition_size), int(op_rank))
                 if best is None or rank < best[0]:
                     best = (rank, str(operation), float(delta_latency), int(memory_saved), int(max_partition_size), specs)
             if best is None:
@@ -1890,9 +1891,9 @@ class HybridACLKMeansPlanner:
                     int(candidate["latency_class"]),
                     float(candidate["heap_score"]),
                     float(candidate["delta_latency"]),
-                    int(operation_rank[str(candidate["operation"])]),
                     int(candidate["max_result_partition_size"]),
                     -int(candidate["memory_saved"]),
+                    int(operation_rank[str(candidate["operation"])]),
                     int(edge[0]),
                     int(edge[1]),
                     int(candidate["left_version"]),
@@ -1978,9 +1979,9 @@ class HybridACLKMeansPlanner:
                     _latency_class,
                     _heap_score,
                     _delta_latency,
-                    _operation_rank,
                     _max_partition_size,
                     _negative_memory_saved,
+                    _operation_rank,
                     left_id,
                     right_id,
                     left_version,
@@ -2341,11 +2342,11 @@ class HybridACLKMeansPlanner:
             "total_latency_delta": float(total_latency_delta) + float(selectivity_refine_cost_delta) - float(tenant_similarity_total_gain),
             "cost_initial": float(initial_cost),
             "cost_final": float(current_cost),
-            "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; if delta_latency ties, use operation order split_overlap, move_left, move_right, merge_extract_overlap, full, so full is last; heap first takes delta_latency<=0 memory-saving candidates, ranks positive-loss candidates by delta_latency/memory_saved, and uses the same full-last tie-break when costs tie",
+            "candidate_score_rule": "for each edge choose op with min delta_latency among memory-saving operations; heap first takes delta_latency<=0 memory-saving candidates, then ranks positive-loss candidates by delta_latency/memory_saved",
             "cost_model": str(cost_model_metadata(DEFAULT_COST_MODEL)["cost_model"]),
             "graph_rule": "ACL-core star graph: for each ACL choose the owner with the fewest ACLs as core, then largest in-group vector share as tie-break and connect core to other owners; edge signal vector_count(a); top-d rank uses shared_acl_count/sqrt(|ACL(Gi)|*|ACL(Gj)|); each group keeps top-d incident candidates",
             "graph_update_rule": "v16 incremental core-star: maintain pattern_star_edges, pattern_core_ids, edge_refcounts, edge_signal_scores, and group-indexed candidate cache; after each operation refresh only new groups' ACL patterns and their top-d incident star edges; rebuild graph only as fallback when heap is empty",
-            "operation_rule": "five operations in full-last priority order: split_overlap, move_left, move_right, merge_extract_overlap, full; full keeps whole-group A+B merge; the other operations use I as the full ACL intersection; merge_extract_overlap produces (A-minus-I)+(B-minus-I) and I",
+            "operation_rule": "five operations: full keeps whole-group A+B merge; move_left, move_right, split_overlap, and merge_extract_overlap use I as the full ACL intersection; merge_extract_overlap produces (A-minus-I)+(B-minus-I) and I",
             "selectivity_refinement_rule": "after memory compression, repeatedly take the globally worst average-selectivity private group, extract the worst tenant route ACL block into a separate partition if route-level Cost Model decreases; stop immediately when that worst group is pure or not beneficial",
             "private_edge_top_d": int(top_d),
             "initial_candidate_edges": int(initial_candidate_edges),

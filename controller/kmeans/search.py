@@ -510,8 +510,12 @@ def _execute_hnsw_filtered_search(cur, route: TenantRoute, *, query_vector, topk
     try:
         cur.execute(query, params)
         return cur.fetchall()
+    except Exception:
+        cur.connection.rollback()
+        raise
     finally:
-        _reset_index_planner(cur)
+        if not cur.connection.closed:
+            _reset_index_planner(cur)
 
 
 def _explain_hnsw_filtered_search_time(cur, route: TenantRoute, *, query_vector, topk: int, ef_search: int) -> float:
@@ -527,8 +531,12 @@ def _explain_hnsw_filtered_search_time(cur, route: TenantRoute, *, query_vector,
     try:
         cur.execute(sql.SQL("EXPLAIN ANALYZE {}").format(query), params)
         return _extract_execution_time_seconds(cur.fetchall())
+    except Exception:
+        cur.connection.rollback()
+        raise
     finally:
-        _reset_index_planner(cur)
+        if not cur.connection.closed:
+            _reset_index_planner(cur)
 
 
 def _search_hnsw_filtered_route(cur, route: TenantRoute, *, query_vector, topk: int, ef_min: int, collect_sql_time: bool):
