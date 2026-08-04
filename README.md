@@ -235,7 +235,7 @@ python3 basic_benchmark/test_all.py --algorithm EFFVEDA --efs 100 --index-type v
 ```sh
 python3 basic_benchmark/direct_pg_qps.py \
   --methods rls role honeybee hqi ours veda effveda \
-  --query-count 200 --query-repetitions 5 --concurrency 16 \
+  --query-count 200 --query-repetitions 5 --concurrency 64 \
   --ef-search 100 --index-mode hnsw --auth-filter rls
 ```
 
