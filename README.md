@@ -87,6 +87,7 @@ pip install -r requirements.txt
 ```sh
 python -m spacy download en_core_web_md
 ```
+## Dataset and workload
 
 ### Download Dataset
 
@@ -154,7 +155,17 @@ python3 basic_benchmark/generate_queries.py --num_queries 1000 --topk 100 --num_
 python3 basic_benchmark/compute_ground_truth.py
 ```
 
-### Build Current Layouts
+## Evaluation
+### Bash Experiment Entrypoints
+
+- `basic_benchmark/script/treebase.sh`, `uniform.sh`, and `erbac.sh` prepare RBAC data, queries, and selected baseline layouts. Set their `PROJECT_ROOT` and `PYTHON_BIN` values for the local environment.
+- `basic_benchmark/script/run_baseline.sh` sweeps EF values over existing layouts and writes logs below `efs_logs/`.
+- `basic_benchmark/script/run_ours.sh` and `basic_benchmark/script/run_veda_efs.sh` are dedicated EF sweeps for SQUID and VEDA/EFFVEDA, respectively.
+- `basic_benchmark/script/run_memory_sweep.sh` runs the memory-amplification study.
+- `basic_benchmark/script/run_updates.py` executes JSON/JSONL incremental-update workloads against the current SQUID layout.
+- `basic_benchmark/script/squid/run_versioned_qps.sh` builds and/or evaluates versioned plans through `basic_benchmark/direct_pg_qps.py`.
+  
+### Build Current Partition plan
 
 Build partitions before query-time or QPS experiments. The unified current-layout entrypoint is `basic_benchmark/script/squid/build_current_partitions.py`. Its `--methods` list accepts `rls`, `role`, `honeybee`/`anonysys`, `hqi`/`qdtree`, `ours`/`squid`, `veda`, and `effveda`. `USER` is intentionally not included in this unified path.
 
@@ -167,7 +178,7 @@ python3 basic_benchmark/script/squid/build_current_partitions.py \
   --ours-index-type hnsw --veda-index-type hnsw
 ```
 
-Build only the layouts required for a specific experiment when appropriate:
+Build only the plans required for a specific experiment when appropriate:
 
 ```sh
 python3 basic_benchmark/script/squid/build_current_partitions.py \
@@ -264,14 +275,6 @@ python3 basic_benchmark/script/run_updates.py \
 
 Results are written under `basic_benchmark/result/updates/` by default; use `--output path/to/result.json` to choose a file. The runner applies real database changes, so use disposable benchmark data or reset the database between trials.
 
-### Bash Experiment Entrypoints
-
-- `basic_benchmark/script/treebase.sh`, `uniform.sh`, and `erbac.sh` prepare RBAC data, queries, and selected baseline layouts. Set their `PROJECT_ROOT` and `PYTHON_BIN` values for the local environment.
-- `basic_benchmark/script/run_baseline.sh` sweeps EF values over existing layouts and writes logs below `efs_logs/`.
-- `basic_benchmark/script/run_ours.sh` and `basic_benchmark/script/run_veda_efs.sh` are dedicated EF sweeps for SQUID and VEDA/EFFVEDA, respectively.
-- `basic_benchmark/script/run_memory_sweep.sh` runs the memory-amplification study.
-- `basic_benchmark/script/run_updates.py` executes JSON/JSONL incremental-update workloads against the current SQUID layout.
-- `basic_benchmark/script/squid/run_versioned_qps.sh` builds and/or evaluates versioned plans through `basic_benchmark/direct_pg_qps.py`.
 
 
 ### Run the ACORN Benchmark
