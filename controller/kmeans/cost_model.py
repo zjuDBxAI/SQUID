@@ -2,11 +2,7 @@ from __future__ import annotations
 
 """KMeans/SQUID planner cost model.
 
-The planner uses the KMeans/SQUID latency formula with the VEDA Appendix B
-latency coefficients.
-The ef term remains adaptive: first use the learned recall model to estimate the
-clean base ef required for target recall, then expand it by route selectivity as
-base_ef / rho.
+The planner uses the KMeans/SQUID latency formula with Veda paper coefficients. The ef term remains adaptive: first use the learned recall model to estimate the clean base ef required for target recall, then expand it by route selectivity as base_ef / rho.
 """
 
 from dataclasses import dataclass
@@ -21,18 +17,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_COST_MODEL_PATH = Path(
     os.environ.get(
         "KMEANS_COST_MODEL_JSON",
-        PROJECT_ROOT
-        / "controller"
-        / "kmeans"
-        / "train"
-        / "result"
-        / "logefrho_cost_dense_nnls_model.json",
+        PROJECT_ROOT / "train" / "result" / "logefrho_cost_dense_nnls_model.json",
     )
 )
 DEFAULT_EFS_MODEL_PATH = Path(
     os.environ.get(
         "KMEANS_EFS_MODEL_JSON",
-        PROJECT_ROOT / "controller" / "kmeans" / "train" / "result" / "hnsw_only_main_model.json",
+        PROJECT_ROOT / "train" / "result" / "hnsw_only_main_model.json",
     )
 )
 
@@ -56,10 +47,6 @@ _FALLBACK_EFS_LAMBDA0 = 0.07626788754243294
 _FALLBACK_EFS_LAMBDA1 = 0.031809305747412114
 _FALLBACK_TARGET_RECALL = 0.99
 _FALLBACK_TOPK = 10
-_FALLBACK_COST_A = 0.0821
-_FALLBACK_COST_B_GRAPH = 0.1159
-_FALLBACK_COST_C = 2.3110
-_VEDA_PAPER_COST_SOURCE = "Veda.pdf Appendix B coefficients: a=0.0821,b=0.1159,c=2.3110"
 
 
 @dataclass(frozen=True)
@@ -74,6 +61,8 @@ class KMeansCostModel:
     pg_tuples_per_page_approx: float
     pg_vector_distance_ops_per_tuple: float
     hnsw_max_ef_search: int
+    vector_dimension: int
+    acorn_gamma: float
     cost_a: float
     cost_b_graph: float
     cost_c: float
@@ -117,10 +106,10 @@ def load_latency_cost_model(
 
     payload = _read_json(candidate)
     settings = payload.get("settings", {}) if isinstance(payload.get("settings", {}), dict) else {}
+    parameters = payload.get("parameters", {}) if isinstance(payload.get("parameters", {}), dict) else {}
     efs_payload = payload.get("efs_model", {}) if isinstance(payload.get("efs_model", {}), dict) else {}
 
-    use_external_efs = efs_path is not None or "KMEANS_EFS_MODEL_JSON" in os.environ or not efs_payload
-    external_efs = _read_json(efs_candidate) if use_external_efs else {}
+    external_efs = _read_json(efs_candidate)
     if external_efs:
         efs_payload = {**efs_payload, **external_efs}
 
@@ -135,16 +124,18 @@ def load_latency_cost_model(
         pg_tuples_per_page_approx=float(settings.get("pg_tuples_per_page_approx", _PG_TUPLES_PER_PAGE_APPROX)),
         pg_vector_distance_ops_per_tuple=float(settings.get("pg_vector_distance_ops_per_tuple", _PG_VECTOR_DISTANCE_OPS_PER_TUPLE)),
         hnsw_max_ef_search=max(1, int(settings.get("max_ef_search", 5000))),
-        cost_a=_FALLBACK_COST_A,
-        cost_b_graph=_FALLBACK_COST_B_GRAPH,
-        cost_c=_FALLBACK_COST_C,
+        vector_dimension=max(1, int(settings.get("vector_dimension", settings.get("dimension", 300)))),
+        acorn_gamma=float(settings.get("acorn_gamma", 12.0)),
+        cost_a=float(parameters.get("a", 0.0821)),
+        cost_b_graph=float(parameters.get("b", parameters.get("b_graph", 0.1159))),
+        cost_c=float(parameters.get("c", 2.3110)),
         efs_h=float(efs_payload.get("h", _FALLBACK_EFS_H)),
         efs_lambda0=float(efs_payload.get("lambda0", _FALLBACK_EFS_LAMBDA0)),
         efs_lambda1=float(efs_payload.get("lambda1", _FALLBACK_EFS_LAMBDA1)),
         target_recall=float(os.environ.get("KMEANS_TARGET_RECALL", efs_payload.get("target_recall", settings.get("target_recall", _FALLBACK_TARGET_RECALL)))),
         topk=max(1, int(settings.get("topk", _FALLBACK_TOPK))),
-        source=_VEDA_PAPER_COST_SOURCE,
-        efs_source=str(efs_candidate if external_efs else efs_payload.get("source", candidate)),
+        source=str(candidate) if parameters else "Veda.pdf Appendix B coefficients: a=0.0821,b=0.1159,c=2.3110",
+        efs_source=str(efs_candidate),
     )
 
 
@@ -264,6 +255,7 @@ def estimate_partition_query_cost(
     topk: int | None = None,
     target_recall: float | None = None,
     use_adaptive_ef: bool = True,
+    index_type: str = "hnsw",
     model: KMeansCostModel | None = None,
 ) -> float:
     if int(partition_vectors) <= 0 or int(accessible_vectors) <= 0 or float(tenant_weight) <= 0.0:
@@ -272,6 +264,14 @@ def estimate_partition_query_cost(
     active = model or DEFAULT_COST_MODEL
     n_value = max(1, int(partition_vectors))
     accessible = max(1, int(accessible_vectors))
+    normalized_index_type = str(index_type or "hnsw").strip().lower()
+    if normalized_index_type in {"acorn", "hybrid_acorn", "honeybee_acorn"} and accessible < n_value:
+        return estimate_acorn_partition_query_cost(
+            partition_vectors=n_value,
+            accessible_vectors=accessible,
+            tenant_weight=float(tenant_weight),
+            model=active,
+        )
     k_value = max(1, int(topk if topk is not None else active.topk))
     route_ef = _route_ef_for_cost(
         partition_vectors=n_value,
@@ -291,17 +291,43 @@ def estimate_partition_query_cost(
     return float(tenant_weight) * max(0.0, float(cost_ms))
 
 
+def estimate_acorn_partition_query_cost(
+    *,
+    partition_vectors: int,
+    accessible_vectors: int,
+    tenant_weight: float = 1.0,
+    model: KMeansCostModel | None = None,
+) -> float:
+    """Honeybee-style ACORN analytical search cost.
+
+    The expression follows O((d + gamma) * log(s * n) + log(1 / s)), where
+    s is route selectivity, n is the partition size, d is vector dimension,
+    and gamma is ACORN's neighbor expansion factor.
+    """
+
+    if int(partition_vectors) <= 0 or int(accessible_vectors) <= 0 or float(tenant_weight) <= 0.0:
+        return 0.0
+    active = model or DEFAULT_COST_MODEL
+    n_value = max(1, int(partition_vectors))
+    accessible = max(1, min(int(accessible_vectors), n_value))
+    selectivity = max(1e-12, min(1.0, float(accessible) / float(n_value)))
+    candidate_count = max(2.0, float(selectivity) * float(n_value))
+    cost = (float(active.vector_dimension) + float(active.acorn_gamma)) * math.log(candidate_count) + math.log(1.0 / selectivity)
+    return float(tenant_weight) * max(0.0, float(cost))
+
+
 def cost_model_metadata(model: KMeansCostModel | None = None) -> dict[str, object]:
     active = model or DEFAULT_COST_MODEL
     return {
-        "cost_model": "kmeans_formula_with_veda_appendix_b_coefficients: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
+        "cost_model": "kmeans_fitted_formula: cost_ms=a*ln(N)+b*route_ef*ln(N)+c, route_ef=base_ef_from_recall_model/rho",
+        "acorn_cost_model": "honeybee_hybrid: use ACORN only when route selectivity s<1; cost=(d+gamma)*ln(s*n)+ln(1/s); otherwise use HNSW cost",
         "adaptive_ef": True,
         "cost_unit": "milliseconds",
         "cost_a": float(active.cost_a),
         "cost_b_graph": float(active.cost_b_graph),
         "cost_d_filter": 0.0,
         "cost_c": float(active.cost_c),
-        "cost_compat_note": "estimate_partition_query_cost keeps the KMeans/SQUID latency formula and uses VEDA Appendix B a/b/c coefficients",
+        "cost_compat_note": "estimate_partition_query_cost restores the KMeans/SQUID latency formula and uses Veda.pdf Appendix B coefficients",
         "hnsw_m": int(active.hnsw_m),
         "hnsw_scan_scaling_factor": float(active.hnsw_scan_scaling_factor),
         "pg_seq_page_cost": float(active.pg_seq_page_cost),
@@ -316,6 +342,8 @@ def cost_model_metadata(model: KMeansCostModel | None = None) -> dict[str, objec
         "efs_lambda1": float(active.efs_lambda1),
         "target_recall": float(active.target_recall),
         "hnsw_max_ef_search": int(active.hnsw_max_ef_search),
+        "vector_dimension": int(active.vector_dimension),
+        "acorn_gamma": float(active.acorn_gamma),
         "topk_for_cost": int(active.topk),
         "cost_model_source": str(active.source),
         "efs_model_source": str(active.efs_source),

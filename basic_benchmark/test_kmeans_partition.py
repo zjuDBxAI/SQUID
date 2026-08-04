@@ -3,6 +3,8 @@ import importlib
 import os
 import sys
 
+from psycopg2 import sql
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
@@ -14,8 +16,10 @@ from controller.kmeans import (
     drop_indexes_for_materialized_partitions,
     load_current_partitions,
     list_materialized_partition_tables,
+    kmeans_acorn_index_is_current,
 )
 from controller.kmeans.common import DEFAULT_QUERY_DATASET_PATH
+from services.config import get_db_connection
 
 
 def _sync_efconfig_value(name: str, value) -> None:
@@ -59,7 +63,99 @@ def _compose_generator_label(generator_type: str, result_tag) -> str:
     return f"{label}_{safe_tag}" if label else safe_tag
 
 
+def _current_kmeans_plan_id() -> int | None:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT plan_id FROM kmeans_current_plan ORDER BY plan_id DESC LIMIT 1;")
+            row = cur.fetchone()
+            return int(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def _expected_acorn_index_kinds() -> dict[str, str]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH current_plan AS (
+                    SELECT plan_id
+                    FROM kmeans_current_plan
+                    ORDER BY plan_id DESC
+                    LIMIT 1
+                ),
+                route_access AS (
+                    SELECT
+                        r.table_name,
+                        p.vector_count AS partition_vector_count,
+                        COALESCE(SUM(patterns.vector_count), 0)::BIGINT AS accessible_vector_count
+                    FROM kmeans_current_routes r
+                    JOIN kmeans_current_partitions p
+                      ON p.plan_id = r.plan_id
+                     AND p.partition_id = r.partition_id
+                    LEFT JOIN kmeans_current_patterns patterns
+                      ON patterns.plan_id = r.plan_id
+                     AND patterns.pattern_id = ANY(r.pattern_ids)
+                    WHERE r.plan_id = (SELECT plan_id FROM current_plan)
+                    GROUP BY r.table_name, p.vector_count, r.tenant_id
+                )
+                SELECT
+                    table_name,
+                    BOOL_OR(accessible_vector_count > 0 AND accessible_vector_count < partition_vector_count)
+                FROM route_access
+                GROUP BY table_name;
+                """
+            )
+            return {str(table_name): ("acorn" if bool(requires_filter) else "hnsw") for table_name, requires_filter in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def _current_partition_row_counts(table_names: list[str]) -> dict[str, int]:
+    conn = get_db_connection()
+    try:
+        counts = {}
+        with conn.cursor() as cur:
+            for table_name in table_names:
+                cur.execute(sql.SQL("SELECT count(*) FROM {};").format(sql.Identifier(str(table_name))))
+                counts[str(table_name)] = int(cur.fetchone()[0])
+        return counts
+    finally:
+        conn.close()
+
+
 def _ensure_index_state(partitions, index_type: str) -> None:
+    if str(index_type).lower() == "acorn":
+        plan_id = _current_kmeans_plan_id()
+        expected_kinds = _expected_acorn_index_kinds()
+        row_counts = _current_partition_row_counts([partition.table_name for partition in partitions])
+        stale = []
+        for partition in partitions:
+            table_name = str(partition.table_name)
+            table_row_count = row_counts.get(table_name)
+            if table_row_count != int(partition.vector_count):
+                stale.append(
+                    f"{table_name} table_rows={table_row_count} plan_vectors={int(partition.vector_count)}"
+                )
+                continue
+            if not kmeans_acorn_index_is_current(
+                table_name,
+                plan_id=plan_id,
+                partition_id=str(partition.partition_id),
+                vector_count=int(partition.vector_count),
+                expected_index_kind=expected_kinds.get(table_name, "hnsw"),
+            ):
+                stale.append(table_name)
+        if stale:
+            preview = ", ".join(stale[:5])
+            suffix = "" if len(stale) <= 5 else f" ... (+{len(stale) - 5} more)"
+            print(f"KMeans ACORN index state is stale: {preview}{suffix}. Rebuilding.", flush=True)
+            drop_indexes_for_materialized_partitions()
+            create_indexes_for_materialized_partitions(index_type=index_type)
+        return
+
     missing = []
     wrong_type = []
     for partition in partitions:
@@ -73,21 +169,10 @@ def _ensure_index_state(partitions, index_type: str) -> None:
         create_indexes_for_materialized_partitions(index_type=index_type)
 
 
-def _skip_index_maintenance() -> bool:
-    return str(os.environ.get("SKIP_INDEX_MAINTENANCE", "")).strip().lower() in {
-        "1",
-        "true",
-        "t",
-        "yes",
-        "y",
-        "on",
-    }
-
-
 def test_kmeans_partition_search(
     iterations=1,
     enable_index=True,
-    index_type="squidhnsw",
+    index_type="hnsw",
     statistics_type="sql",
     generator_type="tree-based",
     record_recall=True,
@@ -97,7 +182,7 @@ def test_kmeans_partition_search(
     private_replication_budget_ratio=0.0,
     embedding_dim=None,
     document_limit=None,
-    ef_search=120,
+    ef_search=None,
     show_progress=True,
     result_tag=None,
     use_ground_truth_cache=False,
@@ -117,7 +202,7 @@ def test_kmeans_partition_search(
     if prepare_before_test:
         build_and_materialize_kmeans_plan(
             private_replication_budget_ratio=float(private_replication_budget_ratio),
-            ef_search=int(ef_search),
+            ef_search=None if ef_search is None else int(ef_search),
             embedding_dim=embedding_dim,
             document_limit=document_limit,
             query_dataset_path=query_dataset_path or DEFAULT_QUERY_DATASET_PATH,
@@ -147,9 +232,7 @@ def test_kmeans_partition_search(
             f"{preview}{suffix}. Run with --prepare true to rebuild the plan and materialized tables."
         )
 
-    if _skip_index_maintenance():
-        pass
-    elif enable_index:
+    if enable_index:
         _ensure_index_state(partitions, index_type)
     else:
         drop_indexes_for_materialized_partitions()
@@ -160,7 +243,8 @@ def test_kmeans_partition_search(
         _sync_efconfig_value("kmeans_ef_search", int(ef_search))
     else:
         _delete_efconfig_value("kmeans_ef_search")
-    default_tag = f"cost_split_b{_ratio_tag(private_replication_budget_ratio)}_ef{int(ef_search)}"
+    ef_tag = "adaptive" if ef_search is None else str(int(ef_search))
+    default_tag = f"cost_split_b{_ratio_tag(private_replication_budget_ratio)}_ef{ef_tag}"
     effective_generator_type = _compose_generator_label(generator_type, result_tag or default_tag)
     run_test(
         queries,
@@ -181,7 +265,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run kmeans tenant-cluster partition benchmark.")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--enable-index", type=_str_to_bool, default=True)
-    parser.add_argument("--index-type", choices=["squidhnsw", "hnsw", "ivfflat"], default="squidhnsw")
+    parser.add_argument("--index-type", choices=["squidhnsw", "hnsw", "ivfflat", "acorn"], default="hnsw")
     parser.add_argument("--statistics-type", choices=["sql", "system"], default="sql")
     parser.add_argument("--generator-type", default="tree-based")
     parser.add_argument("--record-recall", type=_str_to_bool, default=True)
@@ -191,7 +275,7 @@ if __name__ == "__main__":
     parser.add_argument("--private-replication-budget-ratio", type=float, default=0.0)
     parser.add_argument("--embedding-dim", type=int, default=None)
     parser.add_argument("--document-limit", type=int, default=None)
-    parser.add_argument("--ef-search", type=int, default=120)
+    parser.add_argument("--ef-search", type=int, default=None)
     parser.add_argument("--show-progress", type=_str_to_bool, default=True)
     parser.add_argument("--result-tag", default=None)
     parser.add_argument("--use-ground-truth-cache", type=_str_to_bool, default=False)

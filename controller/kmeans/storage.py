@@ -9,13 +9,14 @@ import os
 import time
 from typing import Optional
 
-from psycopg2 import sql
+from psycopg2 import errors, sql
 from psycopg2.extras import execute_values
 from tqdm import tqdm
 
 from controller.dynamic_partition.load_result_to_database import _configure_index_session
 from services.config import get_db_connection, get_document_vector_dimension, get_maintenance_settings
 
+from .acorn import build_kmeans_acorn_indexes, drop_kmeans_acorn_indexes
 from .common import (
     KMEANS_PARTITION_TABLE_PREFIX,
     KMeansPartition,
@@ -25,6 +26,9 @@ from .common import (
     PLAN_TABLE,
     ROUTE_TABLE,
     TenantRoute,
+    UPDATE_ACL_ROLE_TABLE,
+    UPDATE_BATCH_TABLE,
+    UPDATE_TOMBSTONE_TABLE,
 )
 from .hybrid_planner import HybridACLKMeansPlanner
 from .repository import KMeansRepository
@@ -36,6 +40,9 @@ _POSTGRES_IDENTIFIER_LIMIT = 63
 _PARTITION_BATCH_SIZE = 8192
 _DEFAULT_INDEX_MAX_WORKERS = 6
 _MATERIALIZE_ADVISORY_LOCK_KEY = 2026051201
+_ROUTE_LOAD_MAX_RETRIES = 4
+_ROUTE_LOAD_RETRY_SECONDS = 0.02
+_INITIALIZED_SCHEMA_FACTORIES: set[int] = set()
 
 
 def _default_db_connection_factory():
@@ -155,7 +162,8 @@ def _recommended_worker_count(task_count: int, *, max_workers: Optional[int] = N
     if max_workers is not None:
         return max(1, min(int(max_workers), int(task_count)))
     cpu_count = max(1, int(os.cpu_count() or 1))
-    return max(1, min(int(task_count), _DEFAULT_INDEX_MAX_WORKERS, max(1, cpu_count // 4)))
+    environment_limit = max(1, int(os.environ.get("KMEANS_INDEX_MAX_WORKERS", _DEFAULT_INDEX_MAX_WORKERS)))
+    return max(1, min(int(task_count), environment_limit, max(1, cpu_count // 4)))
 
 
 def invalidate_cache() -> None:
@@ -186,6 +194,9 @@ def _release_materialize_lock(conn) -> None:
 
 
 def initialize_schema(*, db_connection_factory=_default_db_connection_factory) -> None:
+    factory_key = id(db_connection_factory)
+    if factory_key in _INITIALIZED_SCHEMA_FACTORIES:
+        return
     conn = db_connection_factory()
     try:
         with conn.cursor() as cur:
@@ -277,7 +288,114 @@ def initialize_schema(*, db_connection_factory=_default_db_connection_factory) -
                 sql.Identifier(f"idx_{PATTERN_TABLE}_tenant_ids"),
                 sql.Identifier(PATTERN_TABLE),
             ))
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {UPDATE_BATCH_TABLE} (
+                    batch_id BIGSERIAL PRIMARY KEY,
+                    update_count INTEGER NOT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {UPDATE_TOMBSTONE_TABLE} (
+                    partition_id TEXT NOT NULL,
+                    block_id BIGINT NOT NULL,
+                    document_id BIGINT NOT NULL,
+                    version BIGINT NOT NULL DEFAULT 0,
+                    pattern_id BIGINT NOT NULL,
+                    batch_id BIGINT REFERENCES {UPDATE_BATCH_TABLE}(batch_id) ON DELETE SET NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (partition_id, block_id, document_id, version)
+                );
+                """
+            )
+            # Migrate existing tombstones and live partition tables to a
+            # versioned physical-row identity.  Old rows are version 0.
+            cur.execute(
+                sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;").format(
+                    sql.Identifier(UPDATE_TOMBSTONE_TABLE)
+                )
+            )
+            cur.execute(
+                """
+                SELECT conname, pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conrelid = %s::regclass AND contype = 'p';
+                """,
+                [UPDATE_TOMBSTONE_TABLE],
+            )
+            tombstone_primary_key = cur.fetchone()
+            if tombstone_primary_key and "version" not in str(tombstone_primary_key[1]).lower():
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} DROP CONSTRAINT {};").format(
+                        sql.Identifier(UPDATE_TOMBSTONE_TABLE),
+                        sql.Identifier(str(tombstone_primary_key[0])),
+                    )
+                )
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ADD PRIMARY KEY (partition_id, block_id, document_id, version);").format(
+                        sql.Identifier(UPDATE_TOMBSTONE_TABLE)
+                    )
+                )
+            cur.execute(
+                """
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname = current_schema()
+                  AND tablename LIKE %s ESCAPE '\\';
+                """,
+                [KMEANS_PARTITION_TABLE_PREFIX.replace("_", "\\_") + "%"],
+            )
+            for (table_name,) in cur.fetchall():
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;").format(
+                        sql.Identifier(str(table_name))
+                    )
+                )
+                cur.execute(
+                    """
+                    SELECT conname, pg_get_constraintdef(oid)
+                    FROM pg_constraint
+                    WHERE conrelid = %s::regclass AND contype = 'p';
+                    """,
+                    [str(table_name)],
+                )
+                partition_primary_key = cur.fetchone()
+                if partition_primary_key and "version" not in str(partition_primary_key[1]).lower():
+                    cur.execute(
+                        sql.SQL("ALTER TABLE {} DROP CONSTRAINT {};").format(
+                            sql.Identifier(str(table_name)),
+                            sql.Identifier(str(partition_primary_key[0])),
+                        )
+                    )
+                    cur.execute(
+                        sql.SQL("ALTER TABLE {} ADD PRIMARY KEY (block_id, document_id, version);").format(
+                            sql.Identifier(str(table_name))
+                        )
+                    )
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {UPDATE_ACL_ROLE_TABLE} (
+                    acl_key TEXT PRIMARY KEY,
+                    tenant_ids BIGINT[] NOT NULL,
+                    role_id BIGINT NOT NULL UNIQUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (document_id);").format(
+                sql.Identifier(f"idx_{UPDATE_TOMBSTONE_TABLE}_document"),
+                sql.Identifier(UPDATE_TOMBSTONE_TABLE),
+            ))
+            cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (partition_id);").format(
+                sql.Identifier(f"idx_{UPDATE_TOMBSTONE_TABLE}_partition"),
+                sql.Identifier(UPDATE_TOMBSTONE_TABLE),
+            ))
         conn.commit()
+        _INITIALIZED_SCHEMA_FACTORIES.add(factory_key)
     finally:
         conn.close()
 
@@ -503,49 +621,62 @@ def load_tenant_routes(tenant_id: int, *, refresh: bool = False, db_connection_f
     tenant_id = int(tenant_id)
     if not refresh and tenant_id in _CACHED_TENANT_ROUTES:
         return _CACHED_TENANT_ROUTES[tenant_id]
-    plan_summary = get_current_plan_summary(refresh=refresh, db_connection_factory=db_connection_factory)
-    if plan_summary is None:
-        _CACHED_TENANT_ROUTES[tenant_id] = []
-        return []
-    conn = db_connection_factory()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                sql.SQL(
-                    """
-                    SELECT
-                        r.tenant_id,
-                        r.partition_id,
-                        r.table_name,
-                        r.route_kind,
-                        r.cluster_id,
-                        r.pattern_ids,
-                        p.vector_count AS partition_vector_count,
-                        COALESCE(SUM(ap.vector_count), 0)::BIGINT AS accessible_vector_count
-                    FROM {} r
-                    JOIN {} p
-                      ON p.plan_id = r.plan_id
-                     AND p.partition_id = r.partition_id
-                    LEFT JOIN {} ap
-                      ON ap.plan_id = r.plan_id
-                     AND ap.pattern_id = ANY(r.pattern_ids)
-                    WHERE r.plan_id = %s
-                      AND r.tenant_id = %s
-                    GROUP BY
-                        r.tenant_id, r.partition_id, r.table_name, r.route_kind,
-                        r.cluster_id, r.pattern_ids, p.vector_count
-                    ORDER BY r.route_kind, r.cluster_id, r.partition_id;
-                    """
-                ).format(
-                    sql.Identifier(ROUTE_TABLE),
-                    sql.Identifier(PARTITION_TABLE),
-                    sql.Identifier(PATTERN_TABLE),
-                ),
-                [int(plan_summary["plan_id"]), int(tenant_id)],
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    rows = None
+    for attempt in range(_ROUTE_LOAD_MAX_RETRIES):
+        conn = db_connection_factory()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        """
+                        SELECT
+                            r.tenant_id,
+                            r.partition_id,
+                            r.table_name,
+                            r.route_kind,
+                            r.cluster_id,
+                            r.pattern_ids,
+                            p.vector_count AS partition_vector_count,
+                            COALESCE(SUM(ap.vector_count), 0)::BIGINT AS accessible_vector_count
+                        FROM {} r
+                        JOIN {} p
+                          ON p.plan_id = r.plan_id
+                         AND p.partition_id = r.partition_id
+                        LEFT JOIN {} ap
+                          ON ap.plan_id = r.plan_id
+                         AND ap.pattern_id = ANY(r.pattern_ids)
+                        WHERE r.plan_id = (
+                                  SELECT plan_id
+                                  FROM {}
+                                  ORDER BY plan_id DESC
+                                  LIMIT 1
+                              )
+                          AND r.tenant_id = %s
+                        GROUP BY
+                            r.tenant_id, r.partition_id, r.table_name, r.route_kind,
+                            r.cluster_id, r.pattern_ids, p.vector_count
+                        ORDER BY r.route_kind, r.cluster_id, r.partition_id;
+                        """
+                    ).format(
+                        sql.Identifier(ROUTE_TABLE),
+                        sql.Identifier(PARTITION_TABLE),
+                        sql.Identifier(PATTERN_TABLE),
+                        sql.Identifier(PLAN_TABLE),
+                    ),
+                    [int(tenant_id)],
+                )
+                rows = cur.fetchall()
+            break
+        except (errors.DeadlockDetected, errors.SerializationFailure):
+            if attempt + 1 >= _ROUTE_LOAD_MAX_RETRIES:
+                raise
+            # Publication replaces the plan catalog in one transaction.  A
+            # reader that loses the short catalog-lock race must retry from a
+            # fresh snapshot instead of surfacing a transient error to a query.
+            time.sleep(_ROUTE_LOAD_RETRY_SECONDS * (2 ** attempt))
+        finally:
+            conn.close()
+    assert rows is not None
     routes = [
         TenantRoute(
             tenant_id=int(row[0]),
@@ -642,9 +773,10 @@ def materialize_partition(partition: KMeansPartition, *, db_connection_factory=_
                         block_id BIGINT NOT NULL,
                         document_id INT NOT NULL REFERENCES Documents(document_id),
                         pattern_id INT NOT NULL,
+                        version BIGINT NOT NULL DEFAULT 0,
                         block_content BYTEA NOT NULL,
                         vector VECTOR({dimension}),
-                        PRIMARY KEY (block_id, document_id)
+                        PRIMARY KEY (block_id, document_id, version)
                     );
                     """
                 ).format(sql.Identifier(partition.table_name), dimension=sql.SQL(str(vector_dimension)))
@@ -670,8 +802,8 @@ def materialize_partition(partition: KMeansPartition, *, db_connection_factory=_
             cur.execute(
                 sql.SQL(
                     """
-                    INSERT INTO {} (block_id, document_id, pattern_id, block_content, vector)
-                    SELECT db.block_id, db.document_id, tkp.pattern_id, db.block_content, db.vector
+                    INSERT INTO {} (block_id, document_id, pattern_id, version, block_content, vector)
+                    SELECT db.block_id, db.document_id, tkp.pattern_id, 0, db.block_content, db.vector
                     FROM documentblocks db
                     JOIN temp_kmeans_partition_document_patterns tkp
                       ON tkp.document_id = db.document_id;
@@ -686,7 +818,10 @@ def materialize_partition(partition: KMeansPartition, *, db_connection_factory=_
 
 def drop_stale_materialized_partitions(valid_table_names: set[str], *, db_connection_factory=_default_db_connection_factory) -> None:
     existing = set(list_materialized_partition_tables(db_connection_factory=db_connection_factory))
-    for table_name in sorted(existing - set(valid_table_names)):
+    stale_table_names = set(existing - set(valid_table_names))
+    if stale_table_names:
+        drop_kmeans_acorn_indexes(stale_table_names)
+    for table_name in sorted(stale_table_names):
         conn = db_connection_factory()
         try:
             with conn.cursor() as cur:
@@ -700,7 +835,7 @@ def materialize_plan(
     plan: KMeansPlan,
     *,
     create_indexes: bool = False,
-    index_type: str = "squidhnsw",
+    index_type: str = "hnsw",
     show_progress: bool = True,
     replace_current: bool = True,
     drop_stale: bool = True,
@@ -743,7 +878,7 @@ def materialize_plan(
 
 def create_index_for_partition(
     table_name: str,
-    index_type: str = "squidhnsw",
+    index_type: str = "hnsw",
     *,
     hnsw_m: int = 16,
     hnsw_ef_construction: int = 64,
@@ -767,7 +902,9 @@ def create_index_for_partition(
                 )
             )
             normalized_index_type = index_type.lower()
-            if normalized_index_type in {"hnsw", "squidhnsw"}:
+            if normalized_index_type == "acorn":
+                pass
+            elif normalized_index_type in {"hnsw", "squidhnsw"}:
                 include_clause = sql.SQL(" INCLUDE (pattern_id)") if normalized_index_type == "squidhnsw" else sql.SQL("")
                 cur.execute(
                     sql.SQL(
@@ -797,6 +934,8 @@ def create_index_for_partition(
         conn.commit()
     finally:
         conn.close()
+    if str(index_type).lower() == "acorn":
+        build_kmeans_acorn_indexes(table_name=str(table_name), force=True)
 
 
 def _create_index_for_partition_timed(table_name: str, index_type: str) -> tuple[str, float]:
@@ -806,7 +945,7 @@ def _create_index_for_partition_timed(table_name: str, index_type: str) -> tuple
 
 
 def create_indexes_for_materialized_partitions(
-    index_type: str = "squidhnsw",
+    index_type: str = "hnsw",
     *,
     parallel: bool = True,
     max_workers: Optional[int] = None,
@@ -818,12 +957,16 @@ def create_indexes_for_materialized_partitions(
         table_names = list_materialized_partition_tables(db_connection_factory=db_connection_factory)
     print(
         "KMeans partition index build: PostgreSQL parameters set: maintenance_work_mem = "
-        f"{maintenance_settings['maintenance_work_mem_gb']}GB, "
+        f"{maintenance_settings.get('maintenance_work_mem', str(maintenance_settings['maintenance_work_mem_gb']) + 'GB')}, "
         f"max_parallel_maintenance_workers = {maintenance_settings['max_parallel_maintenance_workers']}",
         flush=True,
     )
     if not table_names:
         print("KMeans partition index build: no materialized partitions found. Skipping.", flush=True)
+        return
+    if str(index_type).lower() == "acorn":
+        print("KMeans partition index build: creating ACORN/HNSW hybrid FAISS indexes.", flush=True)
+        build_kmeans_acorn_indexes(force=True)
         return
     worker_count = _recommended_worker_count(len(table_names), max_workers=max_workers)
     ordered_table_names = sorted(table_names)
@@ -852,6 +995,7 @@ def drop_indexes_for_materialized_partitions(*, db_connection_factory=_default_d
             table_names = list_current_plan_partition_tables(db_connection_factory=db_connection_factory)
             if not table_names:
                 table_names = list_materialized_partition_tables(db_connection_factory=db_connection_factory)
+            drop_kmeans_acorn_indexes(table_names)
             for table_name in table_names:
                 cur.execute(
                     """
@@ -882,12 +1026,12 @@ def build_and_materialize_kmeans_plan(
     shared_score_ratio: float = 0.10,
     shared_route_limit: int = 3,
     private_replication_budget_ratio: float = 0.0,
-    ef_search: int = 120,
+    ef_search: Optional[int] = None,
     embedding_dim: Optional[int] = None,
     document_limit: Optional[int] = None,
     query_dataset_path: Optional[str] = None,
     create_indexes: bool = False,
-    index_type: str = "squidhnsw",
+    index_type: str = "hnsw",
     show_progress: bool = True,
     enable_split: bool = True,
     private_edge_top_d: int = 32,
@@ -909,7 +1053,7 @@ def build_and_materialize_kmeans_plan(
         f"shared_score_ratio={float(shared_score_ratio):.4f}, "
         f"shared_route_limit={int(shared_route_limit)}, "
         f"private_replication_budget_ratio={float(private_replication_budget_ratio):.4f}, "
-        f"ef_search={int(ef_search)}, "
+        f"ef_search={'adaptive' if ef_search is None else int(ef_search)}, "
         f"enable_split={bool(enable_split)}, "
         f"private_edge_top_d={int(private_edge_top_d)}",
         flush=True,
@@ -921,12 +1065,13 @@ def build_and_materialize_kmeans_plan(
         shared_score_ratio=float(shared_score_ratio),
         shared_route_limit=int(shared_route_limit),
         private_replication_budget_ratio=float(private_replication_budget_ratio),
-        ef_search=int(ef_search),
+        ef_search=None if ef_search is None else int(ef_search),
         embedding_dim=embedding_dim,
         query_dataset_path=query_dataset_path,
         show_progress=show_progress,
         enable_split=bool(enable_split),
         private_edge_top_d=int(private_edge_top_d),
+        index_type=str(index_type),
     )
     plan = _rename_plan_tables(plan, table_prefix)
     print(

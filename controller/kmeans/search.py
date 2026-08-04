@@ -9,9 +9,10 @@ from psycopg2 import sql
 
 from services.config import get_db_connection
 
-from .common import PATTERN_TABLE, TenantRoute
+from .common import PATTERN_TABLE, TenantRoute, UPDATE_TOMBSTONE_TABLE
 from .cost_model import DEFAULT_COST_MODEL, required_base_ef_star
 from .storage import get_current_plan_summary, load_tenant_routes
+from .acorn import search_kmeans_acorn
 
 
 _HNSW_EF_SEARCH_FALLBACK_MAX = int(DEFAULT_COST_MODEL.hnsw_max_ef_search)
@@ -53,8 +54,8 @@ def _configured_ef_min() -> int:
 def _configured_index_type() -> str:
     efconfig = _resolve_efconfig_module()
     if efconfig is None:
-        return "squidhnsw"
-    return str(getattr(efconfig, "kmeans_index_type", "squidhnsw") or "squidhnsw").strip().lower()
+        return "hnsw"
+    return str(getattr(efconfig, "kmeans_index_type", "hnsw") or "hnsw").strip().lower()
 
 
 def _full_table_vector_count() -> int:
@@ -292,11 +293,19 @@ def _build_authorized_query(
                        p.vector <-> %s::vector AS distance
                 FROM {} p
                 WHERE p.pattern_id = ANY(%s)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {} ts
+                      WHERE ts.partition_id = %s
+                        AND ts.block_id = p.block_id
+                        AND ts.document_id = p.document_id
+                        AND ts.version = p.version
+                  )
                 ORDER BY p.vector <-> %s::vector
                 LIMIT %s;
                 """
-            ).format(sql.Identifier(route.table_name)),
-            [query_vector, list(int(pattern_id) for pattern_id in route.pattern_ids), query_vector, int(limit)],
+            ).format(sql.Identifier(route.table_name), sql.Identifier(UPDATE_TOMBSTONE_TABLE)),
+            [query_vector, list(int(pattern_id) for pattern_id in route.pattern_ids), str(route.partition_id), query_vector, int(limit)],
         )
 
     return (
@@ -305,11 +314,19 @@ def _build_authorized_query(
             SELECT p.block_id, p.document_id, p.block_content,
                    p.vector <-> %s::vector AS distance
             FROM {} p
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM {} ts
+                WHERE ts.partition_id = %s
+                  AND ts.block_id = p.block_id
+                  AND ts.document_id = p.document_id
+                  AND ts.version = p.version
+            )
             ORDER BY p.vector <-> %s::vector
             LIMIT %s;
             """
-        ).format(sql.Identifier(route.table_name)),
-        [query_vector, query_vector, int(limit)],
+        ).format(sql.Identifier(route.table_name), sql.Identifier(UPDATE_TOMBSTONE_TABLE)),
+        [query_vector, str(route.partition_id), query_vector, int(limit)],
     )
 
 
@@ -638,13 +655,21 @@ def kmeans_partition_search(user_id: int, query_vector, topk: int = 5, statistic
 def _kmeans_partition_search_impl(user_id: int, query_vector, topk: int, *, collect_sql_time: bool):
     system_started = time.perf_counter() if not collect_sql_time else None
     system_excluded_time = 0.0
-    routes = [route for route in load_tenant_routes(int(user_id)) if route.pattern_ids]
+    # Route plans are switched atomically after their physical tables are ready.
+    # Refresh on every query so a worker cannot keep serving a pre-switch route
+    # from its process-local cache.
+    routes = [route for route in load_tenant_routes(int(user_id), refresh=True) if route.pattern_ids]
     if not routes:
         if system_started is None:
             return [], 0.0
         return [], float(time.perf_counter() - system_started)
 
     connect_started = time.perf_counter() if system_started is not None else None
+    ef_min = _configured_ef_min()
+    index_type = _configured_index_type()
+    if index_type == "acorn":
+        return search_kmeans_acorn(int(user_id), query_vector, int(topk), int(_base_ef(topk=int(topk), ef_min=int(ef_min))))
+
     conn = get_db_connection()
     if connect_started is not None:
         system_excluded_time += time.perf_counter() - connect_started
@@ -654,8 +679,6 @@ def _kmeans_partition_search_impl(user_id: int, query_vector, topk: int, *, coll
     try:
         with conn.cursor() as cur:
             _configure_search_session(cur)
-            ef_min = _configured_ef_min()
-            index_type = _configured_index_type()
             for route in _ordered_search_routes(routes):
                 if index_type == "squidhnsw":
                     route_results, route_time = _search_squidhnsw_route(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import os
 import re
 
@@ -9,11 +10,14 @@ import numpy as np
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_QUERY_DATASET_PATH = os.path.join(PROJECT_ROOT, "basic_benchmark", "query_dataset.json")
 
-KMEANS_PARTITION_TABLE_PREFIX = os.environ.get("KMEANS_PARTITION_TABLE_PREFIX", "kmeans_documentblocks_partition_")
-PLAN_TABLE = os.environ.get("KMEANS_PLAN_TABLE", "kmeans_current_plan")
-PARTITION_TABLE = os.environ.get("KMEANS_PARTITION_TABLE", "kmeans_current_partitions")
-ROUTE_TABLE = os.environ.get("KMEANS_ROUTE_TABLE", "kmeans_current_routes")
-PATTERN_TABLE = os.environ.get("KMEANS_PATTERN_TABLE", "kmeans_current_patterns")
+KMEANS_PARTITION_TABLE_PREFIX = "kmeans_documentblocks_partition_"
+PLAN_TABLE = "kmeans_current_plan"
+PARTITION_TABLE = "kmeans_current_partitions"
+ROUTE_TABLE = "kmeans_current_routes"
+PATTERN_TABLE = "kmeans_current_patterns"
+UPDATE_BATCH_TABLE = "kmeans_update_batches"
+UPDATE_TOMBSTONE_TABLE = "kmeans_update_tombstones"
+UPDATE_ACL_ROLE_TABLE = "kmeans_update_acl_roles"
 
 
 def _parse_vector(raw_value) -> np.ndarray:
@@ -45,7 +49,18 @@ def _sanitize_partition_id(partition_id: str) -> str:
 
 
 def get_partition_table_name(cluster_id: int | str) -> str:
-    return f"{KMEANS_PARTITION_TABLE_PREFIX}{_sanitize_partition_id(str(cluster_id))}"
+    partition_id = _sanitize_partition_id(str(cluster_id))
+    table_name = f"{KMEANS_PARTITION_TABLE_PREFIX}{partition_id}"
+    # PostgreSQL silently truncates identifiers at 63 bytes.  Update shadow
+    # ids are longer than ordinary partition ids; without an explicit digest,
+    # a shadow such as ``private_25__update_1_maintenance`` can collide with
+    # the live ``private_25`` table after truncation.
+    max_identifier_length = 63
+    if len(table_name) <= max_identifier_length:
+        return table_name
+    digest = hashlib.blake2b(partition_id.encode("utf-8"), digest_size=8).hexdigest()
+    available = max_identifier_length - len(KMEANS_PARTITION_TABLE_PREFIX) - len(digest) - 1
+    return f"{KMEANS_PARTITION_TABLE_PREFIX}{partition_id[:max(1, available)]}_{digest}"
 
 
 @dataclass(slots=True)
