@@ -294,7 +294,4 @@ Before building, create `acorn_benchmark/config.json` to point benchmarks at the
 ```
 
 Make sure `/pgsql_data/acorn/` exists ahead of time; both ACORN and dynamic-partition indexes are persisted there.
-=======
-# SQUID
-A prototype for multi-tenant vdb
->>>>>>> origin/main
+
