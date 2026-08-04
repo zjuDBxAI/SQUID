@@ -1,4 +1,4 @@
-# Store Less, Search Better: Access-Controlled Vector Search over Resolved Visibility
+# Store Less, Search Better: Access-Controlled Vector Search over Resolved Visibility[VLDB'27]
 
 We present SQUID, a framework that performs database-internal physical design over resolved visibility for access-controlled vector search.
 SQUID groups vectors with the same visible-user set into policy-independent \emph{Access Atoms}.
