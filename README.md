@@ -93,13 +93,6 @@ python -m spacy download en_core_web_md
 ### Download Dataset
 
 Download the dataset to {project directory}/dataset/:
-```shell
-mkdir dataset
-cd dataset
-sudo apt-get install git-lfs
-git lfs install
-git clone dataset_link
-```
 - [wiki-simple](https://huggingface.co/datasets/timescale/wikipedia-22-12-simple-embeddings)
 ```shell
 mkdir dataset
@@ -143,7 +136,7 @@ If you use the unmodified `setup_db.sh`, the matching defaults are user `x`, pas
 
 ### Prepare Data
 ```sh
-# Load the default Wikipedia dataset
+# Load the default Wiki dataset
 python3 basic_benchmark/common_prepare_pipeline.py --dataset wikipedia-22-12
 
 # Example: load the SIFT 1M benchmark vectors (load-number 0 loads the entire file)
@@ -160,12 +153,13 @@ comming soon
 ```
 
 ### Generate Permission
+services/rbac_generator directory contains various permission generators.
 ```sh
 python3 services/rbac_generator/store_tree_based_rbac_generate_data.py
 ```
 ### Generate Query Workload
 ```sh
-python3 basic_benchmark/generate_queries.py --num_queries 1000 --topk 100 --num_threads 4
+python3 basic_benchmark/generate_queries.py --num_queries 1000 --topk 10 --num_threads 4
 python3 basic_benchmark/compute_ground_truth.py
 ```
 
