@@ -93,13 +93,26 @@ python -m spacy download en_core_web_md
 ### Download Dataset
 
 Download the dataset to {project directory}/dataset/:
-
+```shell
+mkdir dataset
+cd dataset
+sudo apt-get install git-lfs
+git lfs install
+git clone dataset_link
+```
+- [wiki-simple](https://huggingface.co/datasets/timescale/wikipedia-22-12-simple-embeddings)
+```shell
+mkdir dataset
+cd dataset
+sudo apt-get install git-lfs
+git lfs install
+git clone https://huggingface.co/datasets/timescale/wikipedia-22-12-simple-embeddings
+```
 
 - [SIFT1M features](https://people.otago.ac.nz/xipingfu/SIFT10M.html) (Fu et al.)
   - Download `SIFT1M.tar.gz` and place it in the directory pointed to by `dataset_path` (the template defaults to `dataset`).
   - The loader extracts `SIFT1M/SIFT1Mfeatures.mat` automatically on first run, or you can run  
     `tar -xf SIFT1M.tar.gz SIFT1M/SIFT1Mfeatures.mat`.
-
 
 ### Configure Database Access
 
@@ -295,3 +308,5 @@ Before building, create `acorn_benchmark/config.json` to point benchmarks at the
 
 Make sure `/pgsql_data/acorn/` exists ahead of time; both ACORN and dynamic-partition indexes are persisted there.
 
+## Acknowledgements
+The code implementation and README structure of this project are referenced from the open-source repository [rjzhb/VectorSearch-RBAC](https://github.com/rjzhb/VectorSearch-RBAC). We thank the original author Hongbin Zhong for his work.
